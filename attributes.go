@@ -411,6 +411,106 @@ func parseIndexEntries(data []byte) ([]IndexEntry, error) {
 	return entries, nil
 }
 
+func parseDeletedFileNameFromIndexSlack(data []byte, offset int) (*FileName, int) {
+	streamStart := offset + 16
+	if streamStart+66 > len(data) {
+		return nil, 0
+	}
+
+	nameLen := int(data[streamStart+64])
+	if nameLen <= 0 {
+		return nil, 0
+	}
+
+	nameEnd := streamStart + 66 + nameLen*2
+	if nameEnd > len(data) {
+		return nil, 0
+	}
+
+	fn, err := parseFileNameAttribute(data[streamStart:nameEnd])
+	if err != nil || fn.Name == "" {
+		return nil, 0
+	}
+
+	if fn.AllocatedSize < fn.RealSize {
+		return nil, 0
+	}
+
+	consumed := AlignUp(16+66+nameLen*2, 4)
+	return fn, consumed
+}
+
+// parseIndexEntriesRecoverDeleted parses index entries from an entire index entry
+// allocation area and marks entries in slack space as deleted when possible.
+func parseIndexEntriesRecoverDeleted(data []byte, usedLen int) ([]IndexEntry, error) {
+	var entries []IndexEntry
+	if len(data) < 16 {
+		return entries, nil
+	}
+
+	if usedLen < 0 {
+		usedLen = 0
+	}
+	if usedLen > len(data) {
+		usedLen = len(data)
+	}
+
+	offset := 0
+	for offset+16 <= len(data) {
+		r := NewBinaryReader(data[offset:])
+		entry := IndexEntry{}
+
+		entry.FileReference, _ = r.ReadFileReference()
+		entry.SequenceNum, _ = r.ReadUint16()
+		entry.EntryLength, _ = r.ReadUint16()
+		entry.StreamLength, _ = r.ReadUint16()
+		entry.Flags, _ = r.ReadUint8()
+		r.Skip(3)
+
+		entryLen := int(entry.EntryLength)
+		if entryLen < 16 || entryLen%4 != 0 || offset+entryLen > len(data) {
+			offset += 4
+			continue
+		}
+
+		usedBoundaryExceeded := offset+entryLen > usedLen
+		entry.Deleted = usedBoundaryExceeded || entry.StreamLength == 0
+
+		if entry.StreamLength > 0 && int(entry.StreamLength) <= entryLen-16 {
+			streamStart := offset + 16
+			streamEnd := streamStart + int(entry.StreamLength)
+			entry.Stream = make([]byte, entry.StreamLength)
+			copy(entry.Stream, data[streamStart:streamEnd])
+
+			if len(entry.Stream) >= 66 {
+				fn, err := parseFileNameAttribute(entry.Stream)
+				if err == nil {
+					entry.FileName = fn
+				}
+			}
+		} else if fn, consumed := parseDeletedFileNameFromIndexSlack(data, offset); fn != nil {
+			entry.FileName = fn
+			entry.Deleted = true
+			if consumed > entryLen {
+				entry.EntryLength = uint16(consumed)
+				entryLen = consumed
+			}
+		}
+
+		if entry.Flags&IndexFlagNode != 0 && entryLen >= 24 {
+			vcnOffset := offset + entryLen - 8
+			if vcnOffset+8 <= len(data) {
+				entry.SubNodeVCN = ReadUint64LE(data, vcnOffset)
+			}
+		}
+
+		entries = append(entries, entry)
+		offset += entryLen
+	}
+
+	return entries, nil
+}
+
 // parseVolumeInformation parses a $VOLUME_INFORMATION attribute.
 func parseVolumeInformation(data []byte) (*VolumeInformation, error) {
 	if len(data) < 16 {

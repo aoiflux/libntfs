@@ -57,14 +57,18 @@ func main() {
 	fmt.Println("\n=== Statistics ===")
 	fmt.Printf("Directories: %d\n", stats.DirCount)
 	fmt.Printf("Files: %d\n", stats.FileCount)
+	fmt.Printf("Deleted Directories: %d\n", stats.DeletedDirCount)
+	fmt.Printf("Deleted Files: %d\n", stats.DeletedFileCount)
 	fmt.Printf("Total Size: %d bytes (%.2f MB)\n",
 		stats.TotalSize, float64(stats.TotalSize)/(1<<20))
 }
 
 type Stats struct {
-	DirCount  int
-	FileCount int
-	TotalSize uint64
+	DirCount         int
+	FileCount        int
+	DeletedDirCount  int
+	DeletedFileCount int
+	TotalSize        uint64
 }
 
 func traverse(volume *libntfs.Volume, dir *libntfs.File, path string, depth int, stats *Stats) error {
@@ -83,10 +87,22 @@ func traverse(volume *libntfs.Volume, dir *libntfs.File, path string, depth int,
 
 	for _, entry := range entries {
 		fullPath := filepath.Join(path, entry.Name)
+		status := ""
+		if entry.Deleted {
+			status = " [DELETED]"
+		}
 
 		if entry.IsDirectory {
-			stats.DirCount++
-			fmt.Printf("%s[DIR]  %s/\n", indent, entry.Name)
+			if entry.Deleted {
+				stats.DeletedDirCount++
+			} else {
+				stats.DirCount++
+			}
+			fmt.Printf("%s[DIR]  %s/%s\n", indent, entry.Name, status)
+
+			if entry.Deleted {
+				continue
+			}
 
 			// Open subdirectory
 			subdir, err := volume.Open(entry.EntryNum)
@@ -100,9 +116,13 @@ func traverse(volume *libntfs.Volume, dir *libntfs.File, path string, depth int,
 				fmt.Printf("%s  (error traversing: %v)\n", indent, err)
 			}
 		} else {
-			stats.FileCount++
-			stats.TotalSize += entry.Size
-			fmt.Printf("%s[FILE] %s (%d bytes)\n", indent, entry.Name, entry.Size)
+			if entry.Deleted {
+				stats.DeletedFileCount++
+			} else {
+				stats.FileCount++
+				stats.TotalSize += entry.Size
+			}
+			fmt.Printf("%s[FILE] %s (%d bytes)%s\n", indent, entry.Name, entry.Size, status)
 		}
 	}
 

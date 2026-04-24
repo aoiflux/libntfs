@@ -76,6 +76,13 @@ func main() {
 	}
 
 	fmt.Printf("Total entries: %d\n\n", len(entries))
+	var deletedCount int
+	for _, entry := range entries {
+		if entry.Deleted {
+			deletedCount++
+		}
+	}
+	fmt.Printf("Deleted entries: %d\n\n", deletedCount)
 
 	// Print first 30 entries
 	limit := len(entries)
@@ -88,6 +95,9 @@ func main() {
 		typeStr := "[FILE]"
 		if entry.IsDirectory {
 			typeStr = "[DIR] "
+		}
+		if entry.Deleted {
+			typeStr = "[DEL] "
 		}
 		fmt.Printf("%s %-40s %10d bytes\n", typeStr, entry.Name, entry.Size)
 	}

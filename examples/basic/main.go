@@ -60,6 +60,13 @@ func main() {
 	}
 
 	fmt.Printf("Total entries: %d\n\n", len(entries))
+	var deletedCount int
+	for _, entry := range entries {
+		if entry.Deleted {
+			deletedCount++
+		}
+	}
+	fmt.Printf("Deleted entries: %d\n\n", deletedCount)
 
 	// Separate directories and files
 	var dirs, files []libntfs.DirEntry
@@ -75,8 +82,12 @@ func main() {
 	if len(dirs) > 0 {
 		fmt.Printf("Directories (%d):\n", len(dirs))
 		for _, dir := range dirs {
-			fmt.Printf("  [DIR]  %-40s  Modified: %s\n",
-				dir.Name, dir.ModifyTime.Format("2006-01-02 15:04:05"))
+			status := "[DIR]"
+			if dir.Deleted {
+				status = "[DEL]"
+			}
+			fmt.Printf("  %s  %-40s  Modified: %s\n",
+				status, dir.Name, dir.ModifyTime.Format("2006-01-02 15:04:05"))
 		}
 		fmt.Println()
 	}
@@ -90,8 +101,12 @@ func main() {
 		}
 		for i := 0; i < limit; i++ {
 			file := files[i]
-			fmt.Printf("  [FILE] %-40s %10d bytes  Modified: %s\n",
-				file.Name, file.Size, file.ModifyTime.Format("2006-01-02 15:04:05"))
+			status := "[FILE]"
+			if file.Deleted {
+				status = "[DEL ]"
+			}
+			fmt.Printf("  %s %-40s %10d bytes  Modified: %s\n",
+				status, file.Name, file.Size, file.ModifyTime.Format("2006-01-02 15:04:05"))
 		}
 		if len(files) > 20 {
 			fmt.Printf("  ... and %d more files\n", len(files)-20)

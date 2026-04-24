@@ -252,6 +252,7 @@ type IndexEntry struct {
 	EntryLength   uint16 // Length of this entry
 	StreamLength  uint16 // Length of stream data
 	Flags         uint8  // Flags
+	Deleted       bool   // True if entry was recovered from deleted/unallocated index space
 	Reserved      [3]byte
 	Stream        []byte // Stream data (e.g., FileName attribute)
 	SubNodeVCN    uint64 // VCN of sub-node (if IndexFlagNode)

@@ -79,6 +79,8 @@ Implemented:
 - Data run parsing and sparse run handling
 - File and directory access by MFT entry and path
 - Directory index parsing ($INDEX_ROOT and $INDEX_ALLOCATION)
+- Deleted directory entry recovery from index slack (flagged via
+  DirEntry.Deleted)
 - Update sequence (fixup) validation
 - File name namespace handling (DOS/Win32/WinDOS/POSIX)
 - Typed error model with context wrappers (including path traversal errors)
@@ -103,6 +105,9 @@ File-level:
 - (*File).ReadAt(p []byte, off int64) (int, error)
 - (*File).ReadAll() ([]byte, error)
 - (*File).ReadDir() ([]DirEntry, error)
+
+`ReadDir` returns both allocated and recoverable deleted names. Use
+`DirEntry.Deleted` to distinguish deleted entries.
 
 ## Error Handling
 

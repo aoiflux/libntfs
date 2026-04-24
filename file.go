@@ -26,6 +26,7 @@ type DirEntry struct {
 	EntryNum      uint64
 	SequenceNum   uint16
 	IsDirectory   bool
+	Deleted       bool
 	Size          uint64
 	AllocatedSize uint64
 	CreateTime    time.Time
@@ -74,7 +75,7 @@ func normalizeNTFSPath(filePath string) string {
 func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
 	dosIndexByRef map[uint64]int,
 	longSeenByRef map[uint64]bool,
-	seenByName map[string]struct{},
+	seenByName map[string]int,
 	resolveType dirTypeResolver,
 ) []DirEntry {
 	if idxEntry.FileName == nil {
@@ -86,6 +87,7 @@ func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
 		EntryNum:      idxEntry.FileReference,
 		SequenceNum:   idxEntry.SequenceNum,
 		IsDirectory:   resolveDirEntryIsDirectory(idxEntry, resolveType),
+		Deleted:       idxEntry.Deleted,
 		Size:          idxEntry.FileName.RealSize,
 		AllocatedSize: idxEntry.FileName.AllocatedSize,
 		CreateTime:    idxEntry.FileName.CreateTime,
@@ -99,7 +101,10 @@ func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
 	}
 
 	key := strings.ToLower(fmt.Sprintf("%d|%s", entry.EntryNum, entry.Name))
-	if _, exists := seenByName[key]; exists {
+	if existingIdx, exists := seenByName[key]; exists {
+		if entries[existingIdx].Deleted && !entry.Deleted {
+			entries[existingIdx] = entry
+		}
 		return entries
 	}
 
@@ -114,7 +119,7 @@ func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
 
 		entries = append(entries, entry)
 		dosIndexByRef[entry.EntryNum] = len(entries) - 1
-		seenByName[key] = struct{}{}
+		seenByName[key] = len(entries) - 1
 		return entries
 	}
 
@@ -122,13 +127,115 @@ func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
 	if dosIdx, exists := dosIndexByRef[entry.EntryNum]; exists {
 		entries[dosIdx] = entry
 		delete(dosIndexByRef, entry.EntryNum)
-		seenByName[key] = struct{}{}
+		seenByName[key] = dosIdx
 		return entries
 	}
 
 	entries = append(entries, entry)
-	seenByName[key] = struct{}{}
+	seenByName[key] = len(entries) - 1
 	return entries
+}
+
+func mftParentLookupSequences(dirEntry *MFTEntry) []uint16 {
+	seqs := []uint16{dirEntry.SequenceNum}
+	if !dirEntry.IsInUse() && dirEntry.SequenceNum > 0 {
+		seqs = append(seqs, dirEntry.SequenceNum-1)
+	}
+	return seqs
+}
+
+func (v *Volume) maxMFTEntries() uint64 {
+	if v.mftRecordSize == 0 {
+		return 0
+	}
+
+	var totalMFTBytes uint64
+	for _, run := range v.mftDataRuns {
+		totalMFTBytes += run.LengthClusters * uint64(v.bytesPerCluster)
+	}
+
+	return totalMFTBytes / uint64(v.mftRecordSize)
+}
+
+func (v *Volume) ensureMFTParentMap() {
+	v.mftParentMapMu.RLock()
+	if v.mftParentMapInit {
+		v.mftParentMapMu.RUnlock()
+		return
+	}
+	v.mftParentMapMu.RUnlock()
+
+	v.mftParentMapMu.Lock()
+	defer v.mftParentMapMu.Unlock()
+	if v.mftParentMapInit {
+		return
+	}
+
+	parentMap := make(map[uint64]map[uint16][]IndexEntry)
+	maxEntries := v.maxMFTEntries()
+
+	for entryNum := uint64(0); entryNum < maxEntries; entryNum++ {
+		entry, err := v.GetMFTEntry(entryNum)
+		if err != nil {
+			continue
+		}
+
+		fnAttrs := entry.FindAllAttributes(AttrTypeFileName)
+		if len(fnAttrs) == 0 {
+			continue
+		}
+
+		for _, attr := range fnAttrs {
+			if attr.Resident == nil {
+				continue
+			}
+
+			fn, err := parseFileNameAttribute(attr.Resident.Value)
+			if err != nil || fn.Name == "" {
+				continue
+			}
+
+			byParentSeq, ok := parentMap[fn.ParentDirectory]
+			if !ok {
+				byParentSeq = make(map[uint16][]IndexEntry)
+				parentMap[fn.ParentDirectory] = byParentSeq
+			}
+
+			idxEntry := IndexEntry{
+				FileReference: entryNum,
+				SequenceNum:   entry.SequenceNum,
+				Deleted:       !entry.IsInUse(),
+				FileName:      fn,
+			}
+
+			byParentSeq[fn.ParentSeqNum] = append(byParentSeq[fn.ParentSeqNum], idxEntry)
+		}
+	}
+
+	v.mftParentMap = parentMap
+	v.mftParentMapInit = true
+}
+
+func (v *Volume) getMFTParentCandidates(parentEntryNum uint64, parentEntry *MFTEntry) []IndexEntry {
+	v.ensureMFTParentMap()
+
+	v.mftParentMapMu.RLock()
+	defer v.mftParentMapMu.RUnlock()
+
+	byParentSeq, ok := v.mftParentMap[parentEntryNum]
+	if !ok {
+		return nil
+	}
+
+	seqs := mftParentLookupSequences(parentEntry)
+	var out []IndexEntry
+	for _, seq := range seqs {
+		if candidates, ok := byParentSeq[seq]; ok {
+			out = append(out, candidates...)
+		}
+	}
+
+	return out
 }
 
 // Open opens a file or directory by its MFT entry number.
@@ -226,6 +333,9 @@ func (v *Volume) OpenPath(filePath string) (*File, error) {
 		// Find matching entry
 		found := false
 		for _, entry := range entries {
+			if entry.Deleted {
+				continue
+			}
 			if strings.EqualFold(entry.Name, part) {
 				current, err = v.Open(entry.EntryNum)
 				if err != nil {
@@ -390,7 +500,7 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 	var entries []DirEntry
 	dosIndexByRef := make(map[uint64]int)
 	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]struct{})
+	seenByName := make(map[string]int)
 	resolvedTypeByRef := make(map[uint64]bool)
 
 	resolveType := func(entryNum uint64) (bool, error) {
@@ -408,8 +518,27 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 		return isDir, nil
 	}
 
-	// Process index root entries
-	for _, idxEntry := range indexRoot.Entries {
+	entryListOffset := int(indexRoot.NodeHeader.EntryListOffset)
+	entryListUsedEnd := int(indexRoot.NodeHeader.EntryListEnd)
+	entryListAllocEnd := int(indexRoot.NodeHeader.EntryListAlloc)
+	entriesStart := 16 + entryListOffset
+	entriesUsedEnd := 16 + entryListUsedEnd
+	entriesAllocEnd := 16 + entryListAllocEnd
+
+	if entriesStart < 16 || entriesUsedEnd < entriesStart || entriesAllocEnd < entriesUsedEnd || entriesAllocEnd > len(indexRootAttr.Resident.Value) {
+		return nil, fmt.Errorf("invalid $INDEX_ROOT entry bounds (start=%d usedEnd=%d allocEnd=%d size=%d)",
+			entriesStart, entriesUsedEnd, entriesAllocEnd, len(indexRootAttr.Resident.Value))
+	}
+
+	rootEntriesData := indexRootAttr.Resident.Value[entriesStart:entriesAllocEnd]
+	rootUsedLen := entriesUsedEnd - entriesStart
+	rootEntries, err := parseIndexEntriesRecoverDeleted(rootEntriesData, rootUsedLen)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse $INDEX_ROOT entries: %w", err)
+	}
+
+	// Process index root entries (including recoverable deleted entries in slack)
+	for _, idxEntry := range rootEntries {
 		if idxEntry.Flags&IndexFlagLast != 0 && idxEntry.FileName == nil {
 			// Last entry marker, skip
 			continue
@@ -431,6 +560,11 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 		}
 	}
 
+	// TSK-style fallback: include children inferred from MFT $FILE_NAME parent links.
+	for _, candidate := range f.volume.getMFTParentCandidates(f.entryNum, f.entry) {
+		entries = addIndexDirEntry(entries, candidate, dosIndexByRef, longSeenByRef, seenByName, nil)
+	}
+
 	return entries, nil
 }
 
@@ -439,7 +573,7 @@ func (f *File) readIndexAllocation(
 	attr *NonResidentAttribute,
 	dosIndexByRef map[uint64]int,
 	longSeenByRef map[uint64]bool,
-	seenByName map[string]struct{},
+	seenByName map[string]int,
 	resolveType dirTypeResolver,
 ) ([]DirEntry, error) {
 	var entries []DirEntry
@@ -490,15 +624,17 @@ func (f *File) readIndexAllocation(
 
 		entryListOffset := ReadUint32LE(record, nodeHeaderOffset)
 		entryListEnd := ReadUint32LE(record, nodeHeaderOffset+4)
+		entryListAlloc := ReadUint32LE(record, nodeHeaderOffset+8)
 		entriesStart := nodeHeaderOffset + int(entryListOffset)
-		entriesEnd := nodeHeaderOffset + int(entryListEnd)
+		entriesUsedEnd := nodeHeaderOffset + int(entryListEnd)
+		entriesAllocEnd := nodeHeaderOffset + int(entryListAlloc)
 
-		if entriesStart < nodeHeaderOffset || entriesEnd < entriesStart || entriesEnd > len(record) {
+		if entriesStart < nodeHeaderOffset || entriesUsedEnd < entriesStart || entriesAllocEnd < entriesUsedEnd || entriesAllocEnd > len(record) {
 			continue
 		}
 
-		// Parse entries
-		idxEntries, err := parseIndexEntries(record[entriesStart:entriesEnd])
+		// Parse entries, including slack-space records that can indicate deleted names.
+		idxEntries, err := parseIndexEntriesRecoverDeleted(record[entriesStart:entriesAllocEnd], entriesUsedEnd-entriesStart)
 		if err != nil {
 			continue
 		}

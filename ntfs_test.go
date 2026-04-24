@@ -513,7 +513,7 @@ func TestAddIndexDirEntryPrefersLongOverDOS(t *testing.T) {
 	var entries []DirEntry
 	dosIndexByRef := make(map[uint64]int)
 	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]struct{})
+	seenByName := make(map[string]int)
 
 	dos := IndexEntry{
 		FileReference: 42,
@@ -547,7 +547,7 @@ func TestAddIndexDirEntryKeepsDistinctNamesForSameEntry(t *testing.T) {
 	var entries []DirEntry
 	dosIndexByRef := make(map[uint64]int)
 	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]struct{})
+	seenByName := make(map[string]int)
 
 	nameA := IndexEntry{
 		FileReference: 55,
@@ -584,7 +584,7 @@ func TestAddIndexDirEntryResolverOverridesFileNameType(t *testing.T) {
 	var entries []DirEntry
 	dosIndexByRef := make(map[uint64]int)
 	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]struct{})
+	seenByName := make(map[string]int)
 
 	idx := IndexEntry{
 		FileReference: 77,
@@ -617,7 +617,7 @@ func TestAddIndexDirEntryResolverFallbackOnError(t *testing.T) {
 	var entries []DirEntry
 	dosIndexByRef := make(map[uint64]int)
 	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]struct{})
+	seenByName := make(map[string]int)
 
 	idx := IndexEntry{
 		FileReference: 88,
@@ -641,6 +641,114 @@ func TestAddIndexDirEntryResolverFallbackOnError(t *testing.T) {
 	if entries[0].IsDirectory {
 		t.Fatal("expected fallback to file-name attributes when resolver fails")
 	}
+}
+
+func TestAddIndexDirEntryPrefersAllocatedOverDeletedDuplicate(t *testing.T) {
+	var entries []DirEntry
+	dosIndexByRef := make(map[uint64]int)
+	longSeenByRef := make(map[uint64]bool)
+	seenByName := make(map[string]int)
+
+	deleted := IndexEntry{
+		FileReference: 91,
+		SequenceNum:   2,
+		Deleted:       true,
+		FileName: &FileName{
+			Name:      "report.docx",
+			Namespace: NamespaceWin32,
+		},
+	}
+	allocated := deleted
+	allocated.Deleted = false
+
+	entries = addIndexDirEntry(entries, deleted, dosIndexByRef, longSeenByRef, seenByName, nil)
+	entries = addIndexDirEntry(entries, allocated, dosIndexByRef, longSeenByRef, seenByName, nil)
+
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].Deleted {
+		t.Fatal("expected allocated entry to replace deleted duplicate")
+	}
+}
+
+func TestParseIndexEntriesRecoverDeletedFromSlack(t *testing.T) {
+	name := "gone.txt"
+	nameLen := len(name)
+	entryLen := AlignUp(16+66+nameLen*2, 4)
+	buf := make([]byte, entryLen)
+
+	buf[0] = 123
+	WriteUint16LE(buf, 6, 7)
+	WriteUint16LE(buf, 8, uint16(16)) // typical deleted index entry header length
+	WriteUint16LE(buf, 10, 0)         // deleted entries often have strlen/stream len zeroed
+	buf[12] = 0
+
+	streamStart := 16
+	buf[streamStart] = 5
+	WriteUint16LE(buf, streamStart+6, 3)
+	WriteUint64LE(buf, streamStart+56, uint64(FileAttrArchive))
+	buf[streamStart+64] = uint8(nameLen)
+	buf[streamStart+65] = NamespaceWin32
+
+	nameBytes := utf16LEFromString(name)
+	copy(buf[streamStart+66:], nameBytes)
+
+	entries, err := parseIndexEntriesRecoverDeleted(buf, 16)
+	if err != nil {
+		t.Fatalf("parseIndexEntriesRecoverDeleted failed: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("expected recovered deleted entry")
+	}
+	if entries[0].FileName == nil {
+		t.Fatal("expected recovered FileName")
+	}
+	if !entries[0].Deleted {
+		t.Fatal("expected recovered entry to be marked deleted")
+	}
+	if entries[0].FileName.Name != name {
+		t.Fatalf("unexpected recovered name: got %q want %q", entries[0].FileName.Name, name)
+	}
+}
+
+func TestMFTParentLookupSequences(t *testing.T) {
+	allocated := &MFTEntry{SequenceNum: 9, Flags: MFTFlagInUse | MFTFlagDirectory}
+	got := mftParentLookupSequences(allocated)
+	if !reflect.DeepEqual(got, []uint16{9}) {
+		t.Fatalf("allocated sequence lookup mismatch: got %v", got)
+	}
+
+	deleted := &MFTEntry{SequenceNum: 9, Flags: MFTFlagDirectory}
+	got = mftParentLookupSequences(deleted)
+	if !reflect.DeepEqual(got, []uint16{9, 8}) {
+		t.Fatalf("deleted sequence lookup mismatch: got %v", got)
+	}
+}
+
+func TestVolumeMaxMFTEntries(t *testing.T) {
+	v := &Volume{
+		bytesPerCluster: 4096,
+		mftRecordSize:   1024,
+		mftDataRuns: []DataRun{
+			{LengthClusters: 1},
+			{LengthClusters: 2},
+		},
+	}
+
+	got := v.maxMFTEntries()
+	if got != 12 {
+		t.Fatalf("maxMFTEntries mismatch: got %d want %d", got, 12)
+	}
+}
+
+func utf16LEFromString(s string) []byte {
+	runes := []rune(s)
+	out := make([]byte, len(runes)*2)
+	for i, r := range runes {
+		WriteUint16LE(out, i*2, uint16(r))
+	}
+	return out
 }
 
 func TestWrapPathErrorNil(t *testing.T) {

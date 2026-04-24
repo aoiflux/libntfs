@@ -26,10 +26,13 @@ type Volume struct {
 	mftDataRuns []DataRun
 
 	// Caching and synchronization
-	mu         sync.RWMutex         // Protects the entire volume
-	mftCache   map[uint64]*MFTEntry // Cached MFT entries
-	mftCacheMu sync.RWMutex         // Protects MFT cache
-	bufferPool *sync.Pool           // Pool for reusable buffers
+	mu               sync.RWMutex                       // Protects the entire volume
+	mftCache         map[uint64]*MFTEntry               // Cached MFT entries
+	mftCacheMu       sync.RWMutex                       // Protects MFT cache
+	bufferPool       *sync.Pool                         // Pool for reusable buffers
+	mftParentMap     map[uint64]map[uint16][]IndexEntry // parent MFT -> parent sequence -> child entries
+	mftParentMapMu   sync.RWMutex                       // Protects mftParentMap state
+	mftParentMapInit bool                               // True when mftParentMap has been populated
 
 	// State
 	closed  bool
