@@ -34,6 +34,22 @@ type DirEntry struct {
 	Attributes    uint32
 }
 
+type dirTypeResolver func(entryNum uint64) (bool, error)
+
+func resolveDirEntryIsDirectory(idxEntry IndexEntry, resolveType dirTypeResolver) bool {
+	fromFileName := (idxEntry.FileName.FileAttributes & uint64(FileAttrDirectory)) != 0
+	if resolveType == nil {
+		return fromFileName
+	}
+
+	isDir, err := resolveType(idxEntry.FileReference)
+	if err != nil {
+		return fromFileName
+	}
+
+	return isDir
+}
+
 // normalizeNTFSPath normalizes user input to an NTFS-internal absolute path.
 func normalizeNTFSPath(filePath string) string {
 	filePath = strings.TrimSpace(filePath)
@@ -59,6 +75,7 @@ func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
 	dosIndexByRef map[uint64]int,
 	longSeenByRef map[uint64]bool,
 	seenByName map[string]struct{},
+	resolveType dirTypeResolver,
 ) []DirEntry {
 	if idxEntry.FileName == nil {
 		return entries
@@ -68,7 +85,7 @@ func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
 		Name:          idxEntry.FileName.Name,
 		EntryNum:      idxEntry.FileReference,
 		SequenceNum:   idxEntry.SequenceNum,
-		IsDirectory:   (idxEntry.FileName.FileAttributes & uint64(FileAttrDirectory)) != 0,
+		IsDirectory:   resolveDirEntryIsDirectory(idxEntry, resolveType),
 		Size:          idxEntry.FileName.RealSize,
 		AllocatedSize: idxEntry.FileName.AllocatedSize,
 		CreateTime:    idxEntry.FileName.CreateTime,
@@ -374,6 +391,22 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 	dosIndexByRef := make(map[uint64]int)
 	longSeenByRef := make(map[uint64]bool)
 	seenByName := make(map[string]struct{})
+	resolvedTypeByRef := make(map[uint64]bool)
+
+	resolveType := func(entryNum uint64) (bool, error) {
+		if isDir, ok := resolvedTypeByRef[entryNum]; ok {
+			return isDir, nil
+		}
+
+		entry, err := f.volume.GetMFTEntry(entryNum)
+		if err != nil {
+			return false, err
+		}
+
+		isDir := entry.IsDirectory()
+		resolvedTypeByRef[entryNum] = isDir
+		return isDir, nil
+	}
 
 	// Process index root entries
 	for _, idxEntry := range indexRoot.Entries {
@@ -382,14 +415,14 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 			continue
 		}
 
-		entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName)
+		entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName, resolveType)
 	}
 
 	// Check if there's an $INDEX_ALLOCATION attribute (for large directories)
 	indexAllocAttr := f.entry.FindAttribute(AttrTypeIndexAllocation, "$I30")
 	if indexAllocAttr != nil && indexAllocAttr.NonResident != nil {
 		// Read index allocation entries
-		allocEntries, err := f.readIndexAllocation(indexAllocAttr.NonResident, dosIndexByRef, longSeenByRef, seenByName)
+		allocEntries, err := f.readIndexAllocation(indexAllocAttr.NonResident, dosIndexByRef, longSeenByRef, seenByName, resolveType)
 		if err != nil {
 			// Log error but continue with what we have
 			// Some corrupted entries shouldn't prevent reading the rest
@@ -407,6 +440,7 @@ func (f *File) readIndexAllocation(
 	dosIndexByRef map[uint64]int,
 	longSeenByRef map[uint64]bool,
 	seenByName map[string]struct{},
+	resolveType dirTypeResolver,
 ) ([]DirEntry, error) {
 	var entries []DirEntry
 
@@ -474,7 +508,7 @@ func (f *File) readIndexAllocation(
 				continue
 			}
 
-			entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName)
+			entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName, resolveType)
 		}
 	}
 

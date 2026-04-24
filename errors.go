@@ -31,6 +31,10 @@ var (
 	// ErrNotFile indicates the entry is not a regular file.
 	ErrNotFile = errors.New("not a regular file")
 
+	// ErrInputIsDirectory indicates the provided input reader points to a directory,
+	// but a volume device or image file was expected.
+	ErrInputIsDirectory = errors.New("input is a directory")
+
 	// ErrFileNotFound indicates the requested file was not found.
 	ErrFileNotFound = errors.New("file not found")
 

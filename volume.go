@@ -3,6 +3,7 @@ package libntfs
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"sync"
 )
 
@@ -40,6 +41,16 @@ type Volume struct {
 func Open(reader io.ReaderAt) (*Volume, error) {
 	if reader == nil {
 		return nil, wrapVolumeError("open", fmt.Errorf("reader is nil"))
+	}
+
+	// If the reader can be stat'ed, reject directory inputs explicitly.
+	type statReader interface {
+		Stat() (fs.FileInfo, error)
+	}
+	if sr, ok := reader.(statReader); ok {
+		if info, err := sr.Stat(); err == nil && info.IsDir() {
+			return nil, wrapVolumeError("open", fmt.Errorf("%w: %s", ErrInputIsDirectory, info.Name()))
+		}
 	}
 
 	v := &Volume{

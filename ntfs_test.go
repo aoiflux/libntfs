@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"reflect"
 	"testing"
 	"time"
@@ -28,6 +29,46 @@ func (m *mockReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+type mockFileInfo struct {
+	name string
+	mode fs.FileMode
+}
+
+func (m mockFileInfo) Name() string       { return m.name }
+func (m mockFileInfo) Size() int64        { return 0 }
+func (m mockFileInfo) Mode() fs.FileMode  { return m.mode }
+func (m mockFileInfo) ModTime() time.Time { return time.Time{} }
+func (m mockFileInfo) IsDir() bool        { return m.mode.IsDir() }
+func (m mockFileInfo) Sys() interface{}   { return nil }
+
+type mockReaderAtWithStat struct {
+	data    []byte
+	info    fs.FileInfo
+	statErr error
+}
+
+func (m *mockReaderAtWithStat) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, io.EOF
+	}
+	if off >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+
+	n := copy(p, m.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (m *mockReaderAtWithStat) Stat() (fs.FileInfo, error) {
+	if m.statErr != nil {
+		return nil, m.statErr
+	}
+	return m.info, nil
+}
+
 // TestNTFSTimeConversion tests NTFS time conversion functions.
 func TestNTFSTimeConversion(t *testing.T) {
 	// Test zero time
@@ -50,6 +91,21 @@ func TestNTFSTimeConversion(t *testing.T) {
 	backToNTFS := TimeToNTFSTime(result)
 	if backToNTFS != ntfsTime {
 		t.Errorf("Round-trip conversion failed: expected %d, got %d", ntfsTime, backToNTFS)
+	}
+}
+
+func TestOpenRejectsDirectoryInput(t *testing.T) {
+	reader := &mockReaderAtWithStat{
+		data: make([]byte, BootSectorSize),
+		info: mockFileInfo{name: "testdir", mode: fs.ModeDir},
+	}
+
+	_, err := Open(reader)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, ErrInputIsDirectory) {
+		t.Fatalf("expected ErrInputIsDirectory, got %v", err)
 	}
 }
 
@@ -476,8 +532,8 @@ func TestAddIndexDirEntryPrefersLongOverDOS(t *testing.T) {
 		},
 	}
 
-	entries = addIndexDirEntry(entries, dos, dosIndexByRef, longSeenByRef, seenByName)
-	entries = addIndexDirEntry(entries, long, dosIndexByRef, longSeenByRef, seenByName)
+	entries = addIndexDirEntry(entries, dos, dosIndexByRef, longSeenByRef, seenByName, nil)
+	entries = addIndexDirEntry(entries, long, dosIndexByRef, longSeenByRef, seenByName, nil)
 
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(entries))
@@ -510,8 +566,8 @@ func TestAddIndexDirEntryKeepsDistinctNamesForSameEntry(t *testing.T) {
 		},
 	}
 
-	entries = addIndexDirEntry(entries, nameA, dosIndexByRef, longSeenByRef, seenByName)
-	entries = addIndexDirEntry(entries, nameB, dosIndexByRef, longSeenByRef, seenByName)
+	entries = addIndexDirEntry(entries, nameA, dosIndexByRef, longSeenByRef, seenByName, nil)
+	entries = addIndexDirEntry(entries, nameB, dosIndexByRef, longSeenByRef, seenByName, nil)
 
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 distinct names, got %d", len(entries))
@@ -521,6 +577,69 @@ func TestAddIndexDirEntryKeepsDistinctNamesForSameEntry(t *testing.T) {
 	wantNames := []string{"alpha.txt", "beta.txt"}
 	if !reflect.DeepEqual(gotNames, wantNames) {
 		t.Fatalf("unexpected names: got %v want %v", gotNames, wantNames)
+	}
+}
+
+func TestAddIndexDirEntryResolverOverridesFileNameType(t *testing.T) {
+	var entries []DirEntry
+	dosIndexByRef := make(map[uint64]int)
+	longSeenByRef := make(map[uint64]bool)
+	seenByName := make(map[string]struct{})
+
+	idx := IndexEntry{
+		FileReference: 77,
+		SequenceNum:   1,
+		FileName: &FileName{
+			Name:           "maybe-dir",
+			Namespace:      NamespaceWin32,
+			FileAttributes: 0,
+		},
+	}
+
+	resolver := func(entryNum uint64) (bool, error) {
+		if entryNum != 77 {
+			t.Fatalf("unexpected entry number: got %d", entryNum)
+		}
+		return true, nil
+	}
+
+	entries = addIndexDirEntry(entries, idx, dosIndexByRef, longSeenByRef, seenByName, resolver)
+
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if !entries[0].IsDirectory {
+		t.Fatal("expected entry to be directory based on resolver")
+	}
+}
+
+func TestAddIndexDirEntryResolverFallbackOnError(t *testing.T) {
+	var entries []DirEntry
+	dosIndexByRef := make(map[uint64]int)
+	longSeenByRef := make(map[uint64]bool)
+	seenByName := make(map[string]struct{})
+
+	idx := IndexEntry{
+		FileReference: 88,
+		SequenceNum:   1,
+		FileName: &FileName{
+			Name:           "known-file",
+			Namespace:      NamespaceWin32,
+			FileAttributes: uint64(FileAttrArchive),
+		},
+	}
+
+	resolver := func(entryNum uint64) (bool, error) {
+		return false, fmt.Errorf("lookup failed")
+	}
+
+	entries = addIndexDirEntry(entries, idx, dosIndexByRef, longSeenByRef, seenByName, resolver)
+
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].IsDirectory {
+		t.Fatal("expected fallback to file-name attributes when resolver fails")
 	}
 }
 
