@@ -346,6 +346,189 @@ func TestErrorWrapping(t *testing.T) {
 	}
 }
 
+func TestNTFSDecompressCompressionUnitSymbolTokens(t *testing.T) {
+	// Compressed sub-block of size 6 bytes:
+	// 2-byte block header (0x8003), token-group header 0x00, symbols A B C.
+	compData := []byte{0x03, 0x80, 0x00, 'A', 'B', 'C'}
+
+	out, err := ntfsDecompressCompressionUnit(compData, 8)
+	if err != nil {
+		t.Fatalf("ntfsDecompressCompressionUnit returned error: %v", err)
+	}
+
+	if string(out[:3]) != "ABC" {
+		t.Fatalf("unexpected decompressed prefix: got %q", string(out[:3]))
+	}
+
+	for i := 3; i < len(out); i++ {
+		if out[i] != 0 {
+			t.Fatalf("expected zero padding at index %d, got %d", i, out[i])
+		}
+	}
+}
+
+func TestFileReadAtCompressedNonResident(t *testing.T) {
+	clusterSize := uint32(8)
+
+	// Cluster 1 contains one compressed block that expands to "ABC" followed by zeros.
+	// Data is laid out as 3 clusters to keep math simple:
+	// - cluster 0: unused
+	// - cluster 1: compressed payload
+	// - cluster 2: unused
+	data := make([]byte, 3*clusterSize)
+	copy(data[int(clusterSize):int(2*clusterSize)], []byte{0x03, 0x80, 0x00, 'A', 'B', 'C', 0x00, 0x00})
+
+	v := &Volume{
+		reader:          &mockReaderAt{data: data},
+		bytesPerCluster: clusterSize,
+		clusterCount:    3,
+	}
+
+	attr := &Attribute{
+		Header: AttributeHeader{Flags: AttrFlagCompressed},
+		NonResident: &NonResidentAttribute{
+			CompressionUnit: 2,
+			RealSize:        3,
+			DataRuns: []DataRun{
+				{LengthClusters: 1, StartCluster: 1, IsSparse: false},
+				{LengthClusters: 1, IsSparse: true},
+			},
+		},
+	}
+
+	f := &File{
+		volume:   v,
+		isDir:    false,
+		size:     3,
+		dataAttr: attr,
+	}
+
+	buf := make([]byte, 3)
+	n, err := f.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt returned unexpected error: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("ReadAt bytes read = %d, want 3", n)
+	}
+	if string(buf) != "ABC" {
+		t.Fatalf("ReadAt data = %q, want %q", string(buf), "ABC")
+	}
+}
+
+func TestFileReadSupport(t *testing.T) {
+	t.Run("resident readable", func(t *testing.T) {
+		f := &File{
+			dataAttr: &Attribute{Resident: &ResidentAttribute{Value: []byte("abc")}},
+		}
+
+		support := f.ReadSupport()
+		if !support.HasData || !support.Resident || !support.Readable {
+			t.Fatalf("unexpected resident support: %+v", support)
+		}
+		if support.BlockingError != nil {
+			t.Fatalf("unexpected blocking error: %v", support.BlockingError)
+		}
+	})
+
+	t.Run("compressed non-resident readable", func(t *testing.T) {
+		f := &File{
+			dataAttr: &Attribute{
+				Header:      AttributeHeader{Flags: AttrFlagCompressed},
+				NonResident: &NonResidentAttribute{},
+			},
+		}
+
+		support := f.ReadSupport()
+		if !support.HasData || !support.NonResident || !support.Compressed || !support.Readable {
+			t.Fatalf("unexpected compressed support: %+v", support)
+		}
+		if support.BlockingError != nil {
+			t.Fatalf("unexpected blocking error: %v", support.BlockingError)
+		}
+	})
+
+	t.Run("encrypted blocked", func(t *testing.T) {
+		f := &File{
+			dataAttr: &Attribute{
+				Header:      AttributeHeader{Flags: AttrFlagEncrypted},
+				NonResident: &NonResidentAttribute{},
+			},
+		}
+
+		support := f.ReadSupport()
+		if support.Readable {
+			t.Fatalf("expected encrypted file to be unreadable: %+v", support)
+		}
+		if !errors.Is(support.BlockingError, ErrEncryptedData) {
+			t.Fatalf("expected ErrEncryptedData, got %v", support.BlockingError)
+		}
+	})
+
+	t.Run("directory blocked", func(t *testing.T) {
+		f := &File{isDir: true}
+
+		support := f.ReadSupport()
+		if support.Readable {
+			t.Fatalf("expected directory to be unreadable as file: %+v", support)
+		}
+		if !errors.Is(support.BlockingError, ErrNotFile) {
+			t.Fatalf("expected ErrNotFile, got %v", support.BlockingError)
+		}
+	})
+}
+
+func TestAttributeReadSupport(t *testing.T) {
+	t.Run("nil attribute", func(t *testing.T) {
+		var attr *Attribute
+		support := attr.ReadSupport()
+		if support.HasData || support.Readable || support.BlockingError != nil {
+			t.Fatalf("unexpected nil attribute support: %+v", support)
+		}
+	})
+
+	t.Run("resident named stream readable", func(t *testing.T) {
+		attr := &Attribute{
+			Header:   AttributeHeader{Type: AttrTypeData},
+			Resident: &ResidentAttribute{Name: "Zone.Identifier", Value: []byte("abc")},
+		}
+
+		support := attr.ReadSupport()
+		if !support.HasData || !support.Resident || !support.Readable {
+			t.Fatalf("unexpected resident attribute support: %+v", support)
+		}
+	})
+
+	t.Run("compressed non-resident named stream readable", func(t *testing.T) {
+		attr := &Attribute{
+			Header: AttributeHeader{Type: AttrTypeData, Flags: AttrFlagCompressed},
+			NonResident: &NonResidentAttribute{
+				Name: "stream",
+			},
+		}
+
+		support := attr.ReadSupport()
+		if !support.HasData || !support.NonResident || !support.Compressed || !support.Readable {
+			t.Fatalf("unexpected compressed attribute support: %+v", support)
+		}
+	})
+
+	t.Run("encrypted attribute blocked", func(t *testing.T) {
+		attr := &Attribute{
+			Header:      AttributeHeader{Type: AttrTypeData, Flags: AttrFlagEncrypted},
+			NonResident: &NonResidentAttribute{},
+		}
+
+		support := attr.ReadSupport()
+		if support.Readable {
+			t.Fatalf("expected encrypted attribute to be unreadable: %+v", support)
+		}
+		if !errors.Is(support.BlockingError, ErrEncryptedData) {
+			t.Fatalf("expected ErrEncryptedData, got %v", support.BlockingError)
+		}
+	})
+}
+
 // TestBufferBounds tests that buffer operations respect boundaries.
 func TestBufferBounds(t *testing.T) {
 	data := []byte{1, 2, 3, 4, 5}

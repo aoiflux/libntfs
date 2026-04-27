@@ -20,6 +20,18 @@ type File struct {
 	dataAttr *Attribute // Primary $DATA attribute
 }
 
+// FileReadSupport summarizes whether and how this file's primary $DATA stream can be read.
+type FileReadSupport struct {
+	HasData       bool
+	Resident      bool
+	NonResident   bool
+	Sparse        bool
+	Compressed    bool
+	Encrypted     bool
+	Readable      bool
+	BlockingError error
+}
+
 // DirEntry represents a directory entry with basic information.
 type DirEntry struct {
 	Name          string
@@ -375,6 +387,45 @@ func (f *File) Size() int64 {
 	return int64(f.size)
 }
 
+// HasData returns true when the file has a primary $DATA attribute.
+func (f *File) HasData() bool {
+	return f.dataAttr != nil
+}
+
+// IsCompressed returns true when the primary $DATA attribute is compressed.
+func (f *File) IsCompressed() bool {
+	return f.dataAttr != nil && f.dataAttr.IsCompressed()
+}
+
+// IsEncrypted returns true when the primary $DATA attribute is encrypted.
+func (f *File) IsEncrypted() bool {
+	return f.dataAttr != nil && f.dataAttr.IsEncrypted()
+}
+
+// IsSparse returns true when the primary $DATA attribute is sparse.
+func (f *File) IsSparse() bool {
+	return f.dataAttr != nil && f.dataAttr.IsSparse()
+}
+
+// ReadSupport reports whether the primary $DATA stream is readable by libntfs.
+func (f *File) ReadSupport() FileReadSupport {
+	support := FileReadSupport{
+		HasData:  f.dataAttr != nil,
+		Readable: !f.isDir,
+	}
+
+	if f.isDir {
+		support.BlockingError = ErrNotFile
+		return support
+	}
+
+	if f.dataAttr == nil {
+		return support
+	}
+
+	return f.dataAttr.ReadSupport()
+}
+
 // Read reads up to len(p) bytes from the file.
 func (f *File) Read(p []byte) (int, error) {
 	return f.ReadAt(p, 0)
@@ -420,9 +471,6 @@ func (f *File) ReadAt(p []byte, offset int64) (int, error) {
 	// Handle non-resident data
 	if f.dataAttr.NonResident != nil {
 		// Check for unsupported features
-		if f.dataAttr.IsCompressed() {
-			return 0, ErrCompressedData
-		}
 		if f.dataAttr.IsEncrypted() {
 			return 0, ErrEncryptedData
 		}
@@ -434,6 +482,17 @@ func (f *File) ReadAt(p []byte, offset int64) (int, error) {
 
 		if bytesToRead <= 0 {
 			return 0, io.EOF
+		}
+
+		if f.dataAttr.IsCompressed() {
+			n, err := f.volume.readCompressedData(f.dataAttr.NonResident, offset, p[:bytesToRead])
+			if err != nil {
+				return n, err
+			}
+			if n < len(p) {
+				return n, io.EOF
+			}
+			return n, nil
 		}
 
 		n, err := f.volume.ReadDataRuns(f.dataAttr.NonResident.DataRuns, offset, p[:bytesToRead])

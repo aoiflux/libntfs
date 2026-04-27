@@ -584,3 +584,27 @@ func (a *Attribute) IsEncrypted() bool {
 func (a *Attribute) IsSparse() bool {
 	return a.Header.Flags&AttrFlagSparse != 0
 }
+
+// ReadSupport reports whether this attribute's content is readable by libntfs.
+// It is intended primarily for $DATA streams, including named streams.
+func (a *Attribute) ReadSupport() FileReadSupport {
+	support := FileReadSupport{}
+	if a == nil {
+		return support
+	}
+
+	support.HasData = true
+	support.Resident = a.Resident != nil
+	support.NonResident = a.NonResident != nil
+	support.Sparse = a.IsSparse()
+	support.Compressed = a.IsCompressed()
+	support.Encrypted = a.IsEncrypted()
+	support.Readable = support.Resident || support.NonResident
+
+	if support.Encrypted {
+		support.Readable = false
+		support.BlockingError = ErrEncryptedData
+	}
+
+	return support
+}

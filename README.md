@@ -87,7 +87,6 @@ Implemented:
 
 Current limitations:
 
-- Compressed file data: detection only (returns ErrCompressedData)
 - Encrypted file data: detection only (returns ErrEncryptedData)
 
 ## API Highlights
@@ -105,9 +104,21 @@ File-level:
 - (*File).ReadAt(p []byte, off int64) (int, error)
 - (*File).ReadAll() ([]byte, error)
 - (*File).ReadDir() ([]DirEntry, error)
+- (*File).ReadSupport() FileReadSupport
+
+Attribute-level:
+
+- (*Attribute).ReadSupport() FileReadSupport
 
 `ReadDir` returns both allocated and recoverable deleted names. Use
 `DirEntry.Deleted` to distinguish deleted entries.
+
+Use `ReadSupport` to check whether the primary `$DATA` stream is readable, and
+whether it is resident, sparse, compressed, or encrypted, before calling `Read`,
+`ReadAt`, or `ReadAll`.
+
+Use `(*Attribute).ReadSupport()` for alternate or named `$DATA` streams when you
+are inspecting attributes directly.
 
 ## Error Handling
 
