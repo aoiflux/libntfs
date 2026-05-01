@@ -49,6 +49,24 @@ as deleted are marked as `[DEL]`.
 windows_drive.exe C
 ```
 
+### 5. bench - End-to-End Performance Benchmark
+
+Measures practical parsing speed on a real disk image/volume by combining:
+
+- directory traversal throughput
+- sampled file read throughput (optional extraction-like reads)
+
+```bash
+# Traverse only (no file-content reads)
+./bench -sample-files=0 disk.img /
+
+# Traverse and read up to 2 MiB from 500 sampled files
+./bench -sample-files=500 -read-bytes=2097152 disk.img /Windows
+
+# Windows raw drive (run as Administrator)
+bench.exe -sample-files=500 -read-bytes=1048576 \\\\.\\C: /
+```
+
 ## Building Examples
 
 ```bash

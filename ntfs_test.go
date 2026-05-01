@@ -1145,3 +1145,68 @@ func BenchmarkNTFSTimeConversion(b *testing.B) {
 		NTFSTimeToTime(ntfsTime)
 	}
 }
+
+func BenchmarkGetMFTEntryOffsetManyRuns(b *testing.B) {
+	const (
+		clusterSize = uint32(4096)
+		runCount    = 4096
+	)
+
+	runs := make([]DataRun, runCount)
+	for i := 0; i < runCount; i++ {
+		runs[i] = DataRun{LengthClusters: 1, StartCluster: int64(i + 100)}
+	}
+
+	v := &Volume{
+		bytesPerCluster: clusterSize,
+		mftRecordSize:   1024,
+		mftDataRuns:     runs,
+	}
+	v.rebuildMFTRunIndex()
+
+	// Pick an entry that lands near the end of the run list.
+	entryNum := (uint64(runCount)*uint64(clusterSize))/uint64(v.mftRecordSize) - 2
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := v.getMFTEntryOffset(entryNum); err != nil {
+			b.Fatalf("getMFTEntryOffset failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkReadDataRunsSmallWindowManyRuns(b *testing.B) {
+	const (
+		clusterSize = uint32(4096)
+		runCount    = 2048
+	)
+
+	data := make([]byte, int(clusterSize)*(runCount+128))
+	for i := range data {
+		data[i] = byte(i)
+	}
+
+	runs := make([]DataRun, runCount)
+	for i := 0; i < runCount; i++ {
+		runs[i] = DataRun{LengthClusters: 1, StartCluster: int64(i + 64)}
+	}
+
+	v := &Volume{
+		reader:          &mockReaderAt{data: data},
+		bytesPerCluster: clusterSize,
+	}
+
+	buf := make([]byte, 4096)
+	offset := int64(int(clusterSize)*(runCount-8) + 128)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n, err := v.ReadDataRuns(runs, offset, buf)
+		if err != nil && !errors.Is(err, io.EOF) {
+			b.Fatalf("ReadDataRuns failed: %v", err)
+		}
+		if n == 0 {
+			b.Fatalf("ReadDataRuns returned 0 bytes")
+		}
+	}
+}

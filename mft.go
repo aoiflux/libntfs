@@ -45,6 +45,26 @@ func fileReferenceRecordNumber(ref uint64) uint64 {
 	return ref & 0x0000FFFFFFFFFFFF
 }
 
+func buildRunEnds(runs []DataRun, bytesPerCluster uint32) []uint64 {
+	if len(runs) == 0 || bytesPerCluster == 0 {
+		return nil
+	}
+
+	runEnds := make([]uint64, len(runs))
+	var cumulative uint64
+	for i, run := range runs {
+		runBytes := run.LengthClusters * uint64(bytesPerCluster)
+		cumulative += runBytes
+		runEnds[i] = cumulative
+	}
+
+	return runEnds
+}
+
+func (v *Volume) rebuildMFTRunIndex() {
+	v.mftDataRunEnds = buildRunEnds(v.mftDataRuns, v.bytesPerCluster)
+}
+
 func parseAttributeListEntries(data []byte) ([]AttributeListEntry, error) {
 	const minEntryLen = 26
 
@@ -325,29 +345,35 @@ func (v *Volume) getMFTEntryOffset(entryNum uint64) (int64, error) {
 	// Calculate which cluster the MFT entry is in
 	entryOffset := entryNum * uint64(v.mftRecordSize)
 
-	// Find the data run that contains this offset
-	currentOffset := uint64(0)
-
-	for _, run := range v.mftDataRuns {
-		runSize := run.LengthClusters * uint64(v.bytesPerCluster)
-
-		if entryOffset < currentOffset+runSize {
-			// This run contains the entry
-			offsetInRun := entryOffset - currentOffset
-
-			if run.IsSparse {
-				return 0, fmt.Errorf("MFT entry %d is in sparse region", entryNum)
-			}
-
-			cluster := uint64(run.StartCluster)
-			clusterOffset := cluster * uint64(v.bytesPerCluster)
-			return int64(clusterOffset + offsetInRun), nil
-		}
-
-		currentOffset += runSize
+	if len(v.mftDataRuns) == 0 {
+		return 0, fmt.Errorf("MFT entry %d beyond MFT size", entryNum)
 	}
 
-	return 0, fmt.Errorf("MFT entry %d beyond MFT size", entryNum)
+	if len(v.mftDataRunEnds) != len(v.mftDataRuns) {
+		v.rebuildMFTRunIndex()
+	}
+
+	runIdx := sort.Search(len(v.mftDataRunEnds), func(i int) bool {
+		return v.mftDataRunEnds[i] > entryOffset
+	})
+	if runIdx >= len(v.mftDataRuns) {
+		return 0, fmt.Errorf("MFT entry %d beyond MFT size", entryNum)
+	}
+
+	run := v.mftDataRuns[runIdx]
+	runStart := uint64(0)
+	if runIdx > 0 {
+		runStart = v.mftDataRunEnds[runIdx-1]
+	}
+	offsetInRun := entryOffset - runStart
+
+	if run.IsSparse {
+		return 0, fmt.Errorf("MFT entry %d is in sparse region", entryNum)
+	}
+
+	cluster := uint64(run.StartCluster)
+	clusterOffset := cluster * uint64(v.bytesPerCluster)
+	return int64(clusterOffset + offsetInRun), nil
 }
 
 // parseMFTEntry parses an MFT entry from raw bytes.
@@ -660,47 +686,69 @@ func (v *Volume) ReadDataRuns(runs []DataRun, offset int64, buf []byte) (int, er
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if offset < 0 {
+		return 0, ErrInvalidOffset
+	}
 
 	bytesRead := 0
-	currentOffset := int64(0)
+	offsetU := uint64(offset)
 
-	for _, run := range runs {
-		runBytes := int64(run.LengthClusters) * int64(v.bytesPerCluster)
+	startRun := 0
+	currentOffset := uint64(0)
+
+	// Fast-path for $MFT runs where cumulative run ends are cached on Volume.
+	if len(runs) > 0 && len(runs) == len(v.mftDataRuns) && len(v.mftDataRunEnds) == len(v.mftDataRuns) {
+		if &runs[0] == &v.mftDataRuns[0] {
+			startRun = sort.Search(len(v.mftDataRunEnds), func(i int) bool {
+				return v.mftDataRunEnds[i] > offsetU
+			})
+			if startRun >= len(runs) {
+				return 0, io.EOF
+			}
+			if startRun > 0 {
+				currentOffset = v.mftDataRunEnds[startRun-1]
+			}
+		}
+	}
+
+	for runIdx := startRun; runIdx < len(runs); runIdx++ {
+		run := runs[runIdx]
+		runBytes := run.LengthClusters * uint64(v.bytesPerCluster)
 
 		// Skip runs before our offset
-		if currentOffset+runBytes <= offset {
+		if currentOffset+runBytes <= offsetU {
 			currentOffset += runBytes
 			continue
 		}
 
 		// Calculate read position within this run
-		offsetInRun := int64(0)
-		if offset > currentOffset {
-			offsetInRun = offset - currentOffset
+		offsetInRun := uint64(0)
+		if offsetU > currentOffset {
+			offsetInRun = offsetU - currentOffset
 		}
 
-		bytesToRead := int64(len(buf) - bytesRead)
+		bytesToRead := uint64(len(buf) - bytesRead)
 		bytesAvailable := runBytes - offsetInRun
 		if bytesToRead > bytesAvailable {
 			bytesToRead = bytesAvailable
 		}
 
+		readLen := int(bytesToRead)
+
 		if run.IsSparse {
 			// Sparse run - fill with zeros
-			for i := int64(0); i < bytesToRead; i++ {
-				buf[bytesRead+int(i)] = 0
-			}
-			bytesRead += int(bytesToRead)
+			clear(buf[bytesRead : bytesRead+readLen])
+			bytesRead += readLen
 		} else {
 			// Read from disk
 			cluster := uint64(run.StartCluster)
-			clusterOffset := int64(cluster) * int64(v.bytesPerCluster)
-			readOffset := clusterOffset + offsetInRun
+			clusterOffset := cluster * uint64(v.bytesPerCluster)
+			readOffset := int64(clusterOffset + offsetInRun)
 
-			n, err := v.reader.ReadAt(buf[bytesRead:bytesRead+int(bytesToRead)], readOffset)
+			n, err := v.reader.ReadAt(buf[bytesRead:bytesRead+readLen], readOffset)
 			bytesRead += n
 			if err != nil {
-				return bytesRead, wrapIOError("read", readOffset, int(bytesToRead), err)
+				return bytesRead, wrapIOError("read", readOffset, readLen, err)
 			}
 		}
 

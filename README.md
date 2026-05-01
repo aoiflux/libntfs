@@ -170,6 +170,7 @@ You can also use disk image files directly on all platforms.
 - examples/traverse: recursive traversal and size statistics
 - examples/extract: extract a file from NTFS to local output
 - examples/windows_drive: Windows-focused raw-drive workflow
+- examples/bench: end-to-end traversal and sampled read throughput benchmark
 
 Run one example:
 

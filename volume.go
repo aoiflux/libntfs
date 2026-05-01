@@ -23,16 +23,18 @@ type Volume struct {
 	volumeSize        uint64
 
 	// MFT information
-	mftDataRuns []DataRun
+	mftDataRuns    []DataRun
+	mftDataRunEnds []uint64 // cumulative byte ends for mftDataRuns
 
 	// Caching and synchronization
-	mu               sync.RWMutex                       // Protects the entire volume
-	mftCache         map[uint64]*MFTEntry               // Cached MFT entries
-	mftCacheMu       sync.RWMutex                       // Protects MFT cache
-	bufferPool       *sync.Pool                         // Pool for reusable buffers
-	mftParentMap     map[uint64]map[uint16][]IndexEntry // parent MFT -> parent sequence -> child entries
-	mftParentMapMu   sync.RWMutex                       // Protects mftParentMap state
-	mftParentMapInit bool                               // True when mftParentMap has been populated
+	mu                   sync.RWMutex                       // Protects the entire volume
+	mftCache             map[uint64]*MFTEntry               // Cached MFT entries
+	mftCacheMu           sync.RWMutex                       // Protects MFT cache
+	bufferPool           *sync.Pool                         // Pool for reusable buffers
+	mftParentMap         map[uint64]map[uint16][]IndexEntry // parent MFT -> parent sequence -> child entries
+	mftParentMapMu       sync.RWMutex                       // Protects mftParentMap state
+	mftParentMapInit     bool                               // True when mftParentMap has been populated
+	useMFTParentFallback bool                               // Enable expensive full-MFT parent-link fallback in ReadDir
 
 	// State
 	closed  bool
@@ -258,6 +260,7 @@ func (v *Volume) initializeMFT() error {
 
 	// Store the data runs for future MFT entry lookups
 	v.mftDataRuns = dataAttr.NonResident.DataRuns
+	v.rebuildMFTRunIndex()
 
 	return nil
 }
@@ -314,6 +317,22 @@ func (v *Volume) PutBuffer(buf *[]byte) {
 	if buf != nil {
 		v.bufferPool.Put(buf)
 	}
+}
+
+// SetMFTParentFallback enables or disables the TSK-style parent-link fallback
+// used by ReadDir when recovering entries missing from the directory index.
+// When enabled, the first fallback query can be expensive on large volumes
+// because it may scan the full MFT to build parent-link caches.
+func (v *Volume) SetMFTParentFallback(enabled bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.useMFTParentFallback = enabled
+}
+
+func (v *Volume) mftParentFallbackEnabled() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.useMFTParentFallback
 }
 
 // GetBootSector returns a copy of the boot sector information.

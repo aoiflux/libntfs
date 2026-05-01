@@ -569,22 +569,6 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 	dosIndexByRef := make(map[uint64]int)
 	longSeenByRef := make(map[uint64]bool)
 	seenByName := make(map[string]int)
-	resolvedTypeByRef := make(map[uint64]bool)
-
-	resolveType := func(entryNum uint64) (bool, error) {
-		if isDir, ok := resolvedTypeByRef[entryNum]; ok {
-			return isDir, nil
-		}
-
-		entry, err := f.volume.GetMFTEntry(entryNum)
-		if err != nil {
-			return false, err
-		}
-
-		isDir := entry.IsDirectory()
-		resolvedTypeByRef[entryNum] = isDir
-		return isDir, nil
-	}
 
 	entryListOffset := int(indexRoot.NodeHeader.EntryListOffset)
 	entryListUsedEnd := int(indexRoot.NodeHeader.EntryListEnd)
@@ -612,14 +596,14 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 			continue
 		}
 
-		entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName, resolveType)
+		entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName, nil)
 	}
 
 	// Check if there's an $INDEX_ALLOCATION attribute (for large directories)
 	indexAllocAttr := f.entry.FindAttribute(AttrTypeIndexAllocation, "$I30")
 	if indexAllocAttr != nil && indexAllocAttr.NonResident != nil {
 		// Read index allocation entries
-		allocEntries, err := f.readIndexAllocation(indexAllocAttr.NonResident, dosIndexByRef, longSeenByRef, seenByName, resolveType)
+		allocEntries, err := f.readIndexAllocation(indexAllocAttr.NonResident, dosIndexByRef, longSeenByRef, seenByName, nil)
 		if err != nil {
 			// Log error but continue with what we have
 			// Some corrupted entries shouldn't prevent reading the rest
@@ -628,9 +612,12 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 		}
 	}
 
-	// TSK-style fallback: include children inferred from MFT $FILE_NAME parent links.
-	for _, candidate := range f.volume.getMFTParentCandidates(f.entryNum, f.entry) {
-		entries = addIndexDirEntry(entries, candidate, dosIndexByRef, longSeenByRef, seenByName, nil)
+	// Optional TSK-style fallback: include children inferred from MFT
+	// $FILE_NAME parent links. This can be expensive on large volumes.
+	if f.volume.mftParentFallbackEnabled() {
+		for _, candidate := range f.volume.getMFTParentCandidates(f.entryNum, f.entry) {
+			entries = addIndexDirEntry(entries, candidate, dosIndexByRef, longSeenByRef, seenByName, nil)
+		}
 	}
 
 	return entries, nil
