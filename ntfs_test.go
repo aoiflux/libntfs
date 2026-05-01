@@ -529,6 +529,93 @@ func TestAttributeReadSupport(t *testing.T) {
 	})
 }
 
+func TestFindPrimaryDataAttributePrefersUnnamed(t *testing.T) {
+	entry := &MFTEntry{
+		Attributes: []*Attribute{
+			{
+				Header:   AttributeHeader{Type: AttrTypeData},
+				Resident: &ResidentAttribute{Name: "Zone.Identifier", Value: []byte("named")},
+			},
+			{
+				Header:      AttributeHeader{Type: AttrTypeData},
+				NonResident: &NonResidentAttribute{Name: "", RealSize: 2048},
+			},
+		},
+	}
+
+	attr := entry.FindPrimaryDataAttribute()
+	if attr == nil {
+		t.Fatal("expected primary data attribute")
+	}
+
+	if attr.NonResident == nil || attr.NonResident.Name != "" {
+		t.Fatal("expected unnamed non-resident stream to be selected")
+	}
+}
+
+func TestFindPrimaryNonResidentDataAttributePrefersUnnamedNonResident(t *testing.T) {
+	entry := &MFTEntry{
+		Attributes: []*Attribute{
+			{
+				Header:      AttributeHeader{Type: AttrTypeData},
+				NonResident: &NonResidentAttribute{Name: "named", RealSize: 1024},
+			},
+			{
+				Header:      AttributeHeader{Type: AttrTypeData},
+				NonResident: &NonResidentAttribute{Name: "", RealSize: 4096},
+			},
+		},
+	}
+
+	attr := entry.FindPrimaryNonResidentDataAttribute()
+	if attr == nil {
+		t.Fatal("expected non-resident primary data attribute")
+	}
+
+	if attr.NonResident == nil || attr.NonResident.Name != "" || attr.NonResident.RealSize != 4096 {
+		t.Fatal("expected unnamed non-resident stream to be selected")
+	}
+}
+
+func TestOpenPrefersUnnamedDataForSize(t *testing.T) {
+	entry := &MFTEntry{
+		Flags: MFTFlagInUse,
+		Attributes: []*Attribute{
+			{
+				Header: AttributeHeader{Type: AttrTypeFileName},
+				Resident: &ResidentAttribute{
+					Value: buildFileNameAttrValue(5, 1, "sample.bin", NamespaceWin32, 8192, 8192, FileAttrArchive),
+				},
+			},
+			{
+				Header:   AttributeHeader{Type: AttrTypeData},
+				Resident: &ResidentAttribute{Name: "Zone.Identifier", Value: []byte("ads")},
+			},
+			{
+				Header:      AttributeHeader{Type: AttrTypeData},
+				NonResident: &NonResidentAttribute{Name: "", RealSize: 8192},
+			},
+		},
+	}
+
+	v := &Volume{
+		mftCache: map[uint64]*MFTEntry{42: entry},
+	}
+
+	f, err := v.Open(42)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if f.Size() != 8192 {
+		t.Fatalf("expected unnamed stream size 8192, got %d", f.Size())
+	}
+
+	if f.dataAttr == nil || f.dataAttr.NonResident == nil || f.dataAttr.NonResident.Name != "" {
+		t.Fatal("expected Open to select unnamed primary data stream")
+	}
+}
+
 // TestBufferBounds tests that buffer operations respect boundaries.
 func TestBufferBounds(t *testing.T) {
 	data := []byte{1, 2, 3, 4, 5}
@@ -932,6 +1019,24 @@ func utf16LEFromString(s string) []byte {
 		WriteUint16LE(out, i*2, uint16(r))
 	}
 	return out
+}
+
+func buildFileNameAttrValue(parentRef uint64, parentSeq uint16, name string, namespace uint8,
+	realSize uint64, allocatedSize uint64, attrs uint64,
+) []byte {
+	nameBytes := utf16LEFromString(name)
+	buf := make([]byte, 66+len(nameBytes))
+
+	WriteUint64LE(buf, 0, parentRef)
+	WriteUint16LE(buf, 8, parentSeq)
+	WriteUint64LE(buf, 40, allocatedSize)
+	WriteUint64LE(buf, 48, realSize)
+	WriteUint64LE(buf, 56, attrs)
+	buf[64] = uint8(len([]rune(name)))
+	buf[65] = namespace
+	copy(buf[66:], nameBytes)
+
+	return buf
 }
 
 func TestWrapPathErrorNil(t *testing.T) {

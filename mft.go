@@ -2,6 +2,8 @@ package libntfs
 
 import (
 	"fmt"
+	"io"
+	"sort"
 )
 
 // GetMFTEntry retrieves an MFT entry by its entry number.
@@ -25,6 +27,10 @@ func (v *Volume) GetMFTEntry(entryNum uint64) (*MFTEntry, error) {
 		return nil, err
 	}
 
+	// Best-effort merge of attributes referenced via $ATTRIBUTE_LIST.
+	// Some system files (for example $LogFile) keep primary $DATA extents in extension records.
+	_ = v.resolveAttributeList(entry, entryNum)
+
 	// Add to cache
 	v.mftCacheMu.Lock()
 	if len(v.mftCache) < DefaultMFTCacheSize {
@@ -33,6 +39,236 @@ func (v *Volume) GetMFTEntry(entryNum uint64) (*MFTEntry, error) {
 	v.mftCacheMu.Unlock()
 
 	return entry, nil
+}
+
+func fileReferenceRecordNumber(ref uint64) uint64 {
+	return ref & 0x0000FFFFFFFFFFFF
+}
+
+func parseAttributeListEntries(data []byte) ([]AttributeListEntry, error) {
+	const minEntryLen = 26
+
+	var entries []AttributeListEntry
+	offset := 0
+
+	for offset < len(data) {
+		if len(data)-offset < minEntryLen {
+			break
+		}
+
+		entry := AttributeListEntry{}
+		entry.AttributeType = ReadUint32LE(data, offset)
+		entry.RecordLength = ReadUint16LE(data, offset+4)
+		entry.NameLength = data[offset+6]
+		entry.NameOffset = data[offset+7]
+		entry.StartingVCN = ReadUint64LE(data, offset+8)
+		entry.BaseFileRef = fileReferenceRecordNumber(ReadUint64LE(data, offset+16))
+		entry.AttributeID = ReadUint16LE(data, offset+24)
+
+		recordLen := int(entry.RecordLength)
+		if recordLen < minEntryLen {
+			return nil, fmt.Errorf("%w: invalid attribute list record length %d", ErrInvalidAttribute, recordLen)
+		}
+		if offset+recordLen > len(data) {
+			return nil, fmt.Errorf("%w: attribute list record exceeds buffer", ErrInvalidAttribute)
+		}
+
+		if entry.NameLength > 0 {
+			nameBytes := int(entry.NameLength) * 2
+			nameStart := offset + int(entry.NameOffset)
+			nameEnd := nameStart + nameBytes
+			if int(entry.NameOffset) < minEntryLen || nameEnd > offset+recordLen {
+				return nil, fmt.Errorf("%w: attribute list name out of bounds", ErrInvalidAttribute)
+			}
+
+			nameReader := NewBinaryReader(data[nameStart:nameEnd])
+			name, err := nameReader.ReadUTF16String(int(entry.NameLength))
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse attribute list name: %w", err)
+			}
+			entry.Name = name
+		}
+
+		entries = append(entries, entry)
+		offset += recordLen
+	}
+
+	return entries, nil
+}
+
+// attrKey identifies a logical NTFS attribute stream by type and name.
+type attrKey struct {
+	attrType uint32
+	name     string
+}
+
+// attrChunk pairs an attribute fragment with its starting VCN for ordering.
+type attrChunk struct {
+	startVCN uint64
+	attr     *Attribute
+}
+
+// resolveAttributeList merges attributes from MFT extension records into the
+// base entry.  For non-resident attributes split across multiple records (e.g.
+// large $INDEX_ALLOCATION, $DATA, $MFT) it stitches the data runs in
+// VCN order so callers see a single, contiguous run-list.
+func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
+	attrList := entry.FindAttribute(AttrTypeAttributeList, "")
+	if attrList == nil {
+		return nil
+	}
+
+	var listData []byte
+	if attrList.Resident != nil {
+		listData = attrList.Resident.Value
+	} else if attrList.NonResident != nil {
+		size := attrList.NonResident.RealSize
+		if size == 0 {
+			return nil
+		}
+
+		const maxAttributeListSize = 64 << 20
+		if size > maxAttributeListSize {
+			return fmt.Errorf("attribute list too large: %d", size)
+		}
+
+		buf := make([]byte, size)
+		n, err := v.ReadDataRuns(attrList.NonResident.DataRuns, 0, buf)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		listData = buf[:n]
+	}
+
+	if len(listData) == 0 {
+		return nil
+	}
+
+	listEntries, err := parseAttributeListEntries(listData)
+	if err != nil {
+		return err
+	}
+
+	// Collect extension-record chunks per logical attribute (type + name).
+	// We keep startVCN from the attribute list entry, not from the attribute
+	// header, because NTFS guarantees the list is sorted by VCN.
+	chunksByKey := make(map[attrKey][]attrChunk)
+
+	// Cache loaded extension entries so each record is read at most once.
+	extCache := make(map[uint64]*MFTEntry)
+
+	for _, listEntry := range listEntries {
+		extNum := listEntry.BaseFileRef
+		if extNum == 0 || extNum == entryNum {
+			// Belongs to base record; attributes already parsed.
+			continue
+		}
+
+		extEntry, ok := extCache[extNum]
+		if !ok {
+			var fetchErr error
+			extEntry, fetchErr = v.readMFTEntry(extNum) // avoid recursive resolveAttributeList
+			if fetchErr != nil {
+				continue
+			}
+			extCache[extNum] = extEntry
+		}
+
+		key := attrKey{listEntry.AttributeType, listEntry.Name}
+		for _, attr := range extEntry.Attributes {
+			if attr.Header.Type != listEntry.AttributeType {
+				continue
+			}
+			if attributeName(attr) != listEntry.Name {
+				continue
+			}
+			chunksByKey[key] = append(chunksByKey[key], attrChunk{
+				startVCN: listEntry.StartingVCN,
+				attr:     attr,
+			})
+			break // one match per attribute-list entry
+		}
+	}
+
+	// Merge each logical attribute's chunks into the base entry.
+	for key, chunks := range chunksByKey {
+		// Sort fragments by starting VCN so run-lists are contiguous.
+		sort.Slice(chunks, func(i, j int) bool {
+			return chunks[i].startVCN < chunks[j].startVCN
+		})
+
+		// Find the base-record attribute for this (type, name) if present.
+		var baseAttr *Attribute
+		for _, attr := range entry.Attributes {
+			if attr.Header.Type == key.attrType && attributeName(attr) == key.name {
+				baseAttr = attr
+				break
+			}
+		}
+
+		if baseAttr != nil && baseAttr.NonResident != nil {
+			// Stitch extension runs onto the base attribute's run-list.
+			for _, chunk := range chunks {
+				if chunk.attr.NonResident == nil {
+					continue
+				}
+				baseAttr.NonResident.DataRuns = append(
+					baseAttr.NonResident.DataRuns,
+					chunk.attr.NonResident.DataRuns...,
+				)
+			}
+			// Take size metadata from the last (highest-VCN) chunk.
+			last := chunks[len(chunks)-1].attr
+			if last.NonResident != nil {
+				baseAttr.NonResident.LastVCN = last.NonResident.LastVCN
+				baseAttr.NonResident.RealSize = last.NonResident.RealSize
+				baseAttr.NonResident.AllocatedSize = last.NonResident.AllocatedSize
+				baseAttr.NonResident.InitializedSize = last.NonResident.InitializedSize
+			}
+		} else {
+			// No base-record attribute exists; expose the first extension chunk
+			// (or all of them for non-resident, stitched together).
+			if len(chunks) == 1 {
+				entry.Attributes = append(entry.Attributes, chunks[0].attr)
+				continue
+			}
+
+			// Multiple chunks with no base: stitch into a synthetic attribute.
+			first := chunks[0].attr
+			if first.NonResident == nil {
+				entry.Attributes = append(entry.Attributes, first)
+				continue
+			}
+
+			merged := &Attribute{
+				Header:      first.Header,
+				NonResident: &NonResidentAttribute{},
+			}
+			*merged.NonResident = *first.NonResident
+			merged.NonResident.DataRuns = make([]DataRun, len(first.NonResident.DataRuns))
+			copy(merged.NonResident.DataRuns, first.NonResident.DataRuns)
+
+			for _, chunk := range chunks[1:] {
+				if chunk.attr.NonResident == nil {
+					continue
+				}
+				merged.NonResident.DataRuns = append(
+					merged.NonResident.DataRuns,
+					chunk.attr.NonResident.DataRuns...,
+				)
+			}
+			last := chunks[len(chunks)-1].attr
+			if last.NonResident != nil {
+				merged.NonResident.LastVCN = last.NonResident.LastVCN
+				merged.NonResident.RealSize = last.NonResident.RealSize
+				merged.NonResident.AllocatedSize = last.NonResident.AllocatedSize
+				merged.NonResident.InitializedSize = last.NonResident.InitializedSize
+			}
+			entry.Attributes = append(entry.Attributes, merged)
+		}
+	}
+
+	return nil
 }
 
 // readMFTEntry reads an MFT entry from disk.
@@ -283,6 +519,68 @@ func (e *MFTEntry) FindAllAttributes(attrType uint32) []*Attribute {
 		}
 	}
 	return results
+}
+
+func attributeName(attr *Attribute) string {
+	if attr == nil {
+		return ""
+	}
+
+	if attr.Resident != nil {
+		return attr.Resident.Name
+	}
+
+	if attr.NonResident != nil {
+		return attr.NonResident.Name
+	}
+
+	return ""
+}
+
+// FindPrimaryDataAttribute returns the best $DATA stream for regular file reads.
+// It prefers unnamed streams to avoid selecting alternate named streams first.
+func (e *MFTEntry) FindPrimaryDataAttribute() *Attribute {
+	dataAttrs := e.FindAllAttributes(AttrTypeData)
+	if len(dataAttrs) == 0 {
+		return nil
+	}
+
+	for _, attr := range dataAttrs {
+		if attributeName(attr) == "" {
+			return attr
+		}
+	}
+
+	return dataAttrs[0]
+}
+
+// FindPrimaryNonResidentDataAttribute returns the best non-resident $DATA stream.
+// It is primarily used for $MFT, which must be located via non-resident data runs.
+func (e *MFTEntry) FindPrimaryNonResidentDataAttribute() *Attribute {
+	dataAttrs := e.FindAllAttributes(AttrTypeData)
+	if len(dataAttrs) == 0 {
+		return nil
+	}
+
+	for _, attr := range dataAttrs {
+		if attr.NonResident != nil && attributeName(attr) == "" {
+			return attr
+		}
+	}
+
+	for _, attr := range dataAttrs {
+		if attr.NonResident != nil {
+			return attr
+		}
+	}
+
+	for _, attr := range dataAttrs {
+		if attributeName(attr) == "" {
+			return attr
+		}
+	}
+
+	return dataAttrs[0]
 }
 
 // GetFileName returns the primary file name for this entry.

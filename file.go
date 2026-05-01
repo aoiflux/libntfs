@@ -276,8 +276,9 @@ func (v *Volume) Open(entryNum uint64) (*File, error) {
 		}
 	}
 
-	// Find primary $DATA attribute
-	dataAttr := entry.FindAttribute(AttrTypeData, "")
+	// Find primary $DATA attribute.
+	// Prefer unnamed stream so ADS ordering does not affect default reads.
+	dataAttr := entry.FindPrimaryDataAttribute()
 
 	file := &File{
 		volume:   v,
@@ -704,6 +705,27 @@ func (f *File) readIndexAllocation(
 			}
 
 			entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName, resolveType)
+		}
+	}
+
+	// $FILE_NAME.RealSize in the directory index is not always updated by Windows
+	// for system metadata files ($LogFile, $AttrDef, $Boot, $UpCase, etc.).
+	// Resolve the actual DATA attribute size for any non-directory entry that
+	// reports 0 bytes so callers see the real on-disk size.
+	for i := range entries {
+		if entries[i].IsDirectory || entries[i].Size != 0 {
+			continue
+		}
+		mftEntry, err := f.volume.GetMFTEntry(entries[i].EntryNum)
+		if err != nil {
+			continue
+		}
+		if dataAttr := mftEntry.FindPrimaryDataAttribute(); dataAttr != nil {
+			if dataAttr.Resident != nil {
+				entries[i].Size = uint64(len(dataAttr.Resident.Value))
+			} else if dataAttr.NonResident != nil {
+				entries[i].Size = dataAttr.NonResident.RealSize
+			}
 		}
 	}
 

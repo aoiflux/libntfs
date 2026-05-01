@@ -241,8 +241,13 @@ func (v *Volume) initializeMFT() error {
 		return fmt.Errorf("failed to read $MFT entry: %w", err)
 	}
 
-	// Find the $DATA attribute which contains the MFT data runs
-	dataAttr := mftEntry.FindAttribute(AttrTypeData, "")
+	// Resolve $ATTRIBUTE_LIST so that fragmented $MFT DATA runs stored in
+	// extension records (common on large volumes) are merged in VCN order.
+	_ = v.resolveAttributeList(mftEntry, 0)
+
+	// Find the non-resident primary $DATA attribute which contains the MFT data runs.
+	// Prefer unnamed stream to avoid selecting alternate data streams first.
+	dataAttr := mftEntry.FindPrimaryNonResidentDataAttribute()
 	if dataAttr == nil {
 		return fmt.Errorf("$MFT entry missing $DATA attribute")
 	}
