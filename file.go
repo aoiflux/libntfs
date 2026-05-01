@@ -5,6 +5,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,8 @@ type File struct {
 	isDir    bool
 	size     uint64
 	dataAttr *Attribute // Primary $DATA attribute
+	readMu   sync.Mutex
+	readPos  int64
 }
 
 // FileReadSupport summarizes whether and how this file's primary $DATA stream can be read.
@@ -429,7 +432,12 @@ func (f *File) ReadSupport() FileReadSupport {
 
 // Read reads up to len(p) bytes from the file.
 func (f *File) Read(p []byte) (int, error) {
-	return f.ReadAt(p, 0)
+	f.readMu.Lock()
+	defer f.readMu.Unlock()
+
+	n, err := f.ReadAt(p, f.readPos)
+	f.readPos += int64(n)
+	return n, err
 }
 
 // ReadAt reads len(p) bytes from the file starting at offset.

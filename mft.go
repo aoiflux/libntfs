@@ -217,13 +217,24 @@ func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
 					chunk.attr.NonResident.DataRuns...,
 				)
 			}
-			// Take size metadata from the last (highest-VCN) chunk.
-			last := chunks[len(chunks)-1].attr
-			if last.NonResident != nil {
-				baseAttr.NonResident.LastVCN = last.NonResident.LastVCN
-				baseAttr.NonResident.RealSize = last.NonResident.RealSize
-				baseAttr.NonResident.AllocatedSize = last.NonResident.AllocatedSize
-				baseAttr.NonResident.InitializedSize = last.NonResident.InitializedSize
+			// Keep the best-known size metadata. Some extension records carry
+			// zeroed size fields, so never blindly overwrite base values.
+			for _, chunk := range chunks {
+				if chunk.attr.NonResident == nil {
+					continue
+				}
+				if chunk.attr.NonResident.LastVCN > baseAttr.NonResident.LastVCN {
+					baseAttr.NonResident.LastVCN = chunk.attr.NonResident.LastVCN
+				}
+				if chunk.attr.NonResident.RealSize > baseAttr.NonResident.RealSize {
+					baseAttr.NonResident.RealSize = chunk.attr.NonResident.RealSize
+				}
+				if chunk.attr.NonResident.AllocatedSize > baseAttr.NonResident.AllocatedSize {
+					baseAttr.NonResident.AllocatedSize = chunk.attr.NonResident.AllocatedSize
+				}
+				if chunk.attr.NonResident.InitializedSize > baseAttr.NonResident.InitializedSize {
+					baseAttr.NonResident.InitializedSize = chunk.attr.NonResident.InitializedSize
+				}
 			}
 		} else {
 			// No base-record attribute exists; expose the first extension chunk
@@ -257,12 +268,22 @@ func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
 					chunk.attr.NonResident.DataRuns...,
 				)
 			}
-			last := chunks[len(chunks)-1].attr
-			if last.NonResident != nil {
-				merged.NonResident.LastVCN = last.NonResident.LastVCN
-				merged.NonResident.RealSize = last.NonResident.RealSize
-				merged.NonResident.AllocatedSize = last.NonResident.AllocatedSize
-				merged.NonResident.InitializedSize = last.NonResident.InitializedSize
+			for _, chunk := range chunks[1:] {
+				if chunk.attr.NonResident == nil {
+					continue
+				}
+				if chunk.attr.NonResident.LastVCN > merged.NonResident.LastVCN {
+					merged.NonResident.LastVCN = chunk.attr.NonResident.LastVCN
+				}
+				if chunk.attr.NonResident.RealSize > merged.NonResident.RealSize {
+					merged.NonResident.RealSize = chunk.attr.NonResident.RealSize
+				}
+				if chunk.attr.NonResident.AllocatedSize > merged.NonResident.AllocatedSize {
+					merged.NonResident.AllocatedSize = chunk.attr.NonResident.AllocatedSize
+				}
+				if chunk.attr.NonResident.InitializedSize > merged.NonResident.InitializedSize {
+					merged.NonResident.InitializedSize = chunk.attr.NonResident.InitializedSize
+				}
 			}
 			entry.Attributes = append(entry.Attributes, merged)
 		}

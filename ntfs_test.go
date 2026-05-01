@@ -416,6 +416,51 @@ func TestFileReadAtCompressedNonResident(t *testing.T) {
 	}
 }
 
+func TestFileReadSequentialResident(t *testing.T) {
+	f := &File{
+		volume: &Volume{},
+		isDir:  false,
+		size:   7,
+		dataAttr: &Attribute{
+			Resident: &ResidentAttribute{Value: []byte("ABCDEFG")},
+		},
+	}
+
+	buf := make([]byte, 3)
+
+	n, err := f.Read(buf)
+	if err != nil {
+		t.Fatalf("first Read returned unexpected error: %v", err)
+	}
+	if n != 3 || string(buf[:n]) != "ABC" {
+		t.Fatalf("first Read = (%d, %q), want (3, %q)", n, string(buf[:n]), "ABC")
+	}
+
+	n, err = f.Read(buf)
+	if err != nil {
+		t.Fatalf("second Read returned unexpected error: %v", err)
+	}
+	if n != 3 || string(buf[:n]) != "DEF" {
+		t.Fatalf("second Read = (%d, %q), want (3, %q)", n, string(buf[:n]), "DEF")
+	}
+
+	n, err = f.Read(buf)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("third Read error = %v, want EOF", err)
+	}
+	if n != 1 || string(buf[:n]) != "G" {
+		t.Fatalf("third Read = (%d, %q), want (1, %q)", n, string(buf[:n]), "G")
+	}
+
+	n, err = f.Read(buf)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("fourth Read error = %v, want EOF", err)
+	}
+	if n != 0 {
+		t.Fatalf("fourth Read bytes = %d, want 0", n)
+	}
+}
+
 func TestFileReadSupport(t *testing.T) {
 	t.Run("resident readable", func(t *testing.T) {
 		f := &File{
