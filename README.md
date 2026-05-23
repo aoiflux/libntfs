@@ -171,6 +171,8 @@ You can also use disk image files directly on all platforms.
 - examples/extract: extract a file from NTFS to local output
 - examples/windows_drive: Windows-focused raw-drive workflow
 - examples/bench: end-to-end traversal and sampled read throughput benchmark
+- examples/finfo: structured metadata for a specific file path (offsets, size,
+  fragments, timestamps)
 
 Run one example:
 

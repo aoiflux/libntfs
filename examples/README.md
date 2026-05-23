@@ -67,6 +67,15 @@ Measures practical parsing speed on a real disk image/volume by combining:
 bench.exe -sample-files=500 -read-bytes=1048576 \\\\.\\C: /
 ```
 
+### 6. finfo - Structured File Information
+
+Shows structured metadata for a specific file path, including size, start/end
+byte offsets, fragmentation, and timestamps.
+
+```bash
+./finfo disk.img /Windows/System32/notepad.exe
+```
+
 ## Building Examples
 
 ```bash
