@@ -82,12 +82,15 @@ Implemented:
 - Deleted directory entry recovery from index slack (flagged via
   DirEntry.Deleted)
 - Update sequence (fixup) validation
+- Standalone $MFT record parsing without a volume
 - File name namespace handling (DOS/Win32/WinDOS/POSIX)
 - Typed error model with context wrappers (including path traversal errors)
 
 Current limitations:
 
 - Encrypted file data: detection only (returns ErrEncryptedData)
+- Standalone $MFT records expose metadata and data run maps, but their content
+  cannot be read: that requires cluster access, which only a Volume provides
 - Write support is limited to in-place overwrite of non-resident, non-sparse,
   non-compressed, non-encrypted streams on writable handles (no resident writes
   and no file growth/truncation)
@@ -100,6 +103,13 @@ Volume-level:
 - (*Volume).Open(entryNum uint64) (*File, error)
 - (*Volume).OpenPath(path string) (*File, error)
 - (*Volume).GetRootDirectory() (*File, error)
+
+MFT-level:
+
+- ParseMFTRecord(buf []byte, entryNum uint64, recordSize uint32) (*MFTEntry, error)
+- (*Volume).GetMFTEntry(entryNum uint64) (*MFTEntry, error)
+- (*Volume).MFTEntryCount() (uint64, error)
+- (*Volume).EachMFTEntry(fn func(entryNum uint64, e *MFTEntry) error) error
 
 File-level:
 
@@ -124,6 +134,63 @@ whether it is resident, sparse, compressed, or encrypted, before calling `Read`,
 
 Use `(*Attribute).ReadSupport()` for alternate or named `$DATA` streams when you
 are inspecting attributes directly.
+
+## Parsing a Standalone $MFT
+
+`ParseMFTRecord` parses one MFT record from a raw buffer with no volume, which
+covers `$MFT` files extracted by tools such as KAPE, FTK Imager, or icat.
+Unparsable records are normal in an extracted table, so skip them and continue.
+
+```go
+mft, err := os.Open("$MFT")
+if err != nil {
+    log.Fatal(err)
+}
+defer mft.Close()
+
+buf := make([]byte, libntfs.DefaultMFTRecordSize)
+for entryNum := uint64(0); ; entryNum++ {
+    if _, err := io.ReadFull(mft, buf); err != nil {
+        break // io.EOF or io.ErrUnexpectedEOF ends the table
+    }
+
+    entry, err := libntfs.ParseMFTRecord(buf, entryNum, libntfs.DefaultMFTRecordSize)
+    if err != nil {
+        continue // Unallocated, bad, or corrupt record
+    }
+
+    name, err := entry.GetFileName()
+    if err != nil {
+        continue
+    }
+
+    si, err := entry.GetStandardInformation()
+    if err != nil {
+        continue
+    }
+
+    fmt.Printf("%d\t%s\t%s\n", entryNum, si.ModifyTime.Format(time.RFC3339), name.Name)
+}
+```
+
+`ParseMFTRecord` applies the update sequence fixups in place, so pass a copy if
+you need the original bytes. Resident attributes parse fully; non-resident
+attributes have their data runs decoded but not resolved, since reading content
+needs the volume the records came from.
+
+To walk the MFT of a live volume instead, use `MFTEntryCount` to get the bound
+and tolerate per-entry errors, or let `EachMFTEntry` do both:
+
+```go
+err := vol.EachMFTEntry(func(entryNum uint64, e *libntfs.MFTEntry) error {
+    name, err := e.GetFileName()
+    if err != nil {
+        return nil // Keep going: no usable $FILE_NAME on this record
+    }
+    fmt.Printf("%d\t%s\n", entryNum, name.Name)
+    return nil
+})
+```
 
 ## Error Handling
 
@@ -180,6 +247,8 @@ You can also use disk image files directly on all platforms.
   fragments, timestamps)
 - examples/overwrite: guarded in-place overwrite at logical file offsets with
   user-supplied end-bound checks
+- examples/mftdump: MFT record timeline from either a standalone $MFT file or a
+  full volume
 
 Run one example:
 

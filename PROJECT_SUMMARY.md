@@ -41,6 +41,7 @@ The implementation is organized in layers:
 - NTFS structure/types/constants: types.go, constants.go
 - Volume lifecycle and metadata: volume.go
 - MFT and data-run resolution: mft.go
+- Volume-free MFT record parsing: mftrecord.go
 - Attribute parsing: attributes.go
 - File and directory API surface: file.go
 - Error model: errors.go

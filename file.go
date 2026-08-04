@@ -755,7 +755,7 @@ func (f *File) readIndexAllocation(
 		// Apply update sequence
 		updateSeqOffset := ReadUint16LE(record, 4)
 		updateSeqSize := ReadUint16LE(record, 6)
-		if err := f.volume.applyUpdateSequence(record, updateSeqOffset, updateSeqSize); err != nil {
+		if err := applyUpdateSequence(record, updateSeqOffset, updateSeqSize); err != nil {
 			continue // Skip corrupted records
 		}
 

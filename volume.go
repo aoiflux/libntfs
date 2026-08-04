@@ -221,7 +221,7 @@ func (v *Volume) parseBootSector() error {
 			ErrInvalidBootSector, v.mftRecordSize, bs.ClustersPerMFTRecord, v.bytesPerCluster)
 	}
 
-	if v.mftRecordSize < 512 || v.mftRecordSize > MaxMFTEntrySize {
+	if v.mftRecordSize < MinMFTEntrySize || v.mftRecordSize > MaxMFTEntrySize {
 		return fmt.Errorf("%w: invalid MFT record size %d (ClustersPerMFTRecord=%d)",
 			ErrInvalidBootSector, v.mftRecordSize, bs.ClustersPerMFTRecord)
 	}

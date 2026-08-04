@@ -1272,6 +1272,718 @@ func TestWrapPathErrorPreservesCauseAndContext(t *testing.T) {
 	}
 }
 
+// Standalone MFT record parsing
+
+// testRecordOpts describes a synthetic MFT record for buildTestMFTRecord.
+type testRecordOpts struct {
+	recordSize    uint32 // 0 means DefaultMFTRecordSize
+	magic         uint32 // 0 means MFTMagicFILE
+	sequenceNum   uint16
+	hardLinkCount uint16
+	flags         uint16
+	name          string
+	namespace     uint8
+	createTime    time.Time
+	modifyTime    time.Time
+	mftChangeTime time.Time
+	accessTime    time.Time
+	extraAttrs    [][]byte // Appended after $STANDARD_INFORMATION and $FILE_NAME
+}
+
+// buildResidentAttr assembles a resident attribute with no attribute name.
+func buildResidentAttr(attrType uint32, attrID uint16, value []byte) []byte {
+	length := AlignUp(ResidentAttributeHeaderSize+len(value), 8)
+	attr := make([]byte, length)
+
+	WriteUint32LE(attr, 0, attrType)
+	WriteUint32LE(attr, 4, uint32(length))
+	attr[8] = 0 // Resident
+	attr[9] = 0 // No attribute name
+	WriteUint16LE(attr, 10, ResidentAttributeHeaderSize)
+	WriteUint16LE(attr, 14, attrID)
+	WriteUint32LE(attr, 16, uint32(len(value)))
+	WriteUint16LE(attr, 20, ResidentAttributeHeaderSize)
+	copy(attr[ResidentAttributeHeaderSize:], value)
+
+	return attr
+}
+
+// buildStandardInfoAttrValue builds a $STANDARD_INFORMATION value including the
+// Windows 2000+ extended fields.
+func buildStandardInfoAttrValue(create, modify, mftChange, access time.Time, fileAttrs uint32) []byte {
+	buf := make([]byte, 72)
+
+	WriteUint64LE(buf, 0, TimeToNTFSTime(create))
+	WriteUint64LE(buf, 8, TimeToNTFSTime(modify))
+	WriteUint64LE(buf, 16, TimeToNTFSTime(mftChange))
+	WriteUint64LE(buf, 24, TimeToNTFSTime(access))
+	WriteUint32LE(buf, 32, fileAttrs)
+
+	return buf
+}
+
+// buildTestMFTRecord assembles a complete, fixup-stamped MFT record holding a
+// $STANDARD_INFORMATION and a $FILE_NAME attribute.
+func buildTestMFTRecord(t *testing.T, opts testRecordOpts) []byte {
+	t.Helper()
+
+	recordSize := opts.recordSize
+	if recordSize == 0 {
+		recordSize = DefaultMFTRecordSize
+	}
+
+	magic := opts.magic
+	if magic == 0 {
+		magic = MFTMagicFILE
+	}
+
+	const usaOffset = MFTEntryHeaderSize
+	usaSize := uint16(recordSize/UpdateSequenceStride) + 1
+	firstAttrOffset := AlignUp(usaOffset+int(usaSize)*2, 8)
+
+	buf := make([]byte, recordSize)
+
+	si := buildResidentAttr(AttrTypeStandardInfo, 0, buildStandardInfoAttrValue(
+		opts.createTime, opts.modifyTime, opts.mftChangeTime, opts.accessTime, 0x20,
+	))
+	fn := buildResidentAttr(AttrTypeFileName, 1, buildFileNameAttrValue(
+		5, 5, opts.name, opts.namespace, 4096, 4096, 0x20,
+	))
+
+	offset := firstAttrOffset
+	for _, attr := range append([][]byte{si, fn}, opts.extraAttrs...) {
+		if offset+len(attr) > len(buf) {
+			t.Fatalf("test record too small for attributes: need %d, have %d", offset+len(attr), len(buf))
+		}
+		copy(buf[offset:], attr)
+		offset += len(attr)
+	}
+
+	WriteUint32LE(buf, offset, 0xFFFFFFFF) // End-of-attributes marker
+	usedSize := AlignUp(offset+4, 8)
+
+	WriteUint32LE(buf, 0, magic)
+	WriteUint16LE(buf, 4, usaOffset)
+	WriteUint16LE(buf, 6, usaSize)
+	WriteUint64LE(buf, 8, 0x1122334455667788) // $LogFile sequence number
+	WriteUint16LE(buf, 16, opts.sequenceNum)
+	WriteUint16LE(buf, 18, opts.hardLinkCount)
+	WriteUint16LE(buf, 20, uint16(firstAttrOffset))
+	WriteUint16LE(buf, 22, opts.flags)
+	WriteUint32LE(buf, 24, uint32(usedSize))
+	WriteUint32LE(buf, 28, recordSize)
+	WriteUint64LE(buf, 32, 0) // Base record reference
+	WriteUint16LE(buf, 40, 2) // Next attribute ID
+
+	// Stamp the update sequence array the way NTFS does: stash the real last two
+	// bytes of every sector in the array, then write the USN in their place.
+	const usn = 0x0A0B
+	WriteUint16LE(buf, usaOffset, usn)
+	for i := 0; i < int(usaSize)-1; i++ {
+		sectorEnd := (i+1)*UpdateSequenceStride - 2
+		WriteUint16LE(buf, usaOffset+2+i*2, ReadUint16LE(buf, sectorEnd))
+		WriteUint16LE(buf, sectorEnd, usn)
+	}
+
+	return buf
+}
+
+// newTestMFTVolume builds an in-memory volume whose $MFT occupies a single
+// cluster run holding the supplied records in order.
+func newTestMFTVolume(t *testing.T, records [][]byte) *Volume {
+	t.Helper()
+
+	const (
+		clusterSize  = 4096
+		recordSize   = DefaultMFTRecordSize
+		startCluster = 10
+	)
+
+	disk := make([]byte, (startCluster+1)*clusterSize)
+	for i, record := range records {
+		offset := startCluster*clusterSize + i*recordSize
+		if offset+len(record) > len(disk) {
+			t.Fatalf("record %d does not fit in the test $MFT run", i)
+		}
+		copy(disk[offset:], record)
+	}
+
+	return &Volume{
+		reader:          &mockReaderAt{data: disk},
+		bytesPerCluster: clusterSize,
+		mftRecordSize:   recordSize,
+		mftDataRuns:     []DataRun{{StartCluster: startCluster, LengthClusters: 1}},
+		mftCache:        make(map[uint64]*MFTEntry, DefaultMFTCacheSize),
+	}
+}
+
+// buildNonResidentDataAttr builds an unnamed non-resident $DATA attribute backed
+// by a single data run. startCluster and clusters must each fit in one byte.
+func buildNonResidentDataAttr(t *testing.T, attrID uint16, startCluster, clusters uint64, clusterSize uint32) []byte {
+	t.Helper()
+
+	if startCluster > 0x7F || clusters > 0x7F {
+		t.Fatalf("test data run needs single-byte fields, got start=%d clusters=%d", startCluster, clusters)
+	}
+
+	// Data run: one length byte, one offset byte, then the list terminator.
+	run := []byte{0x11, byte(clusters), byte(startCluster), 0x00}
+
+	const dataRunOffset = NonResidentAttributeHeaderSize
+	length := AlignUp(dataRunOffset+len(run), 8)
+	attr := make([]byte, length)
+
+	realSize := clusters * uint64(clusterSize)
+
+	WriteUint32LE(attr, 0, AttrTypeData)
+	WriteUint32LE(attr, 4, uint32(length))
+	attr[8] = 1 // Non-resident
+	attr[9] = 0 // No attribute name
+	WriteUint16LE(attr, 10, NonResidentAttributeHeaderSize)
+	WriteUint16LE(attr, 14, attrID)
+	WriteUint64LE(attr, 16, 0)          // Starting VCN
+	WriteUint64LE(attr, 24, clusters-1) // Last VCN
+	WriteUint16LE(attr, 32, dataRunOffset)
+	WriteUint64LE(attr, 40, realSize) // Allocated size
+	WriteUint64LE(attr, 48, realSize) // Real size
+	WriteUint64LE(attr, 56, realSize) // Initialized size
+	copy(attr[dataRunOffset:], run)
+
+	return attr
+}
+
+// buildTestBootSector builds a boot sector describing 1024-byte MFT records and
+// 4096-byte index records.
+func buildTestBootSector(bytesPerSector uint16, sectorsPerCluster uint8, totalSectors, mftCluster uint64) []byte {
+	bs := make([]byte, BootSectorSize)
+
+	bs[0], bs[1], bs[2] = 0xEB, 0x52, 0x90 // Jump instruction
+	copy(bs[3:11], BootSectorOEMNameNTFS)
+	WriteUint16LE(bs, 11, bytesPerSector)
+	bs[13] = sectorsPerCluster
+	WriteUint64LE(bs, 40, totalSectors)
+	WriteUint64LE(bs, 48, mftCluster)
+	WriteUint64LE(bs, 56, mftCluster) // $MFTMirr, unused by these tests
+	bs[64] = 0xF6                     // -10, so 2^10 = 1024-byte MFT records
+	bs[68] = 0xF4                     // -12, so 2^12 = 4096-byte index records
+	WriteUint64LE(bs, 72, 0x1234567890ABCDEF)
+	WriteUint16LE(bs, 510, BootSectorMagic)
+
+	return bs
+}
+
+// buildTestNTFSImage assembles a minimal but genuinely openable NTFS image whose
+// $MFT holds the supplied records. Record 0 is generated as $MFT itself, with a
+// non-resident $DATA run covering the MFT, so Open and initializeMFT work.
+func buildTestNTFSImage(t *testing.T, records [][]byte) []byte {
+	t.Helper()
+
+	const (
+		bytesPerSector    = 512
+		sectorsPerCluster = 8
+		clusterSize       = bytesPerSector * sectorsPerCluster
+		recordSize        = DefaultMFTRecordSize
+		mftCluster        = 4
+		totalClusters     = 16
+	)
+
+	// Records per cluster is exact for these sizes, so the MFT covers every slot.
+	recordsPerCluster := clusterSize / recordSize
+	mftClusters := uint64((len(records) + 1 + recordsPerCluster - 1) / recordsPerCluster)
+	if mftClusters == 0 {
+		mftClusters = 1
+	}
+
+	mftRecord := buildTestMFTRecord(t, testRecordOpts{
+		flags:     MFTFlagInUse,
+		name:      "$MFT",
+		namespace: NamespaceWin32,
+		extraAttrs: [][]byte{
+			buildNonResidentDataAttr(t, 2, mftCluster, mftClusters, clusterSize),
+		},
+	})
+
+	image := make([]byte, totalClusters*clusterSize)
+	copy(image, buildTestBootSector(bytesPerSector, sectorsPerCluster,
+		totalClusters*sectorsPerCluster, mftCluster))
+
+	for i, record := range append([][]byte{mftRecord}, records...) {
+		offset := mftCluster*clusterSize + i*recordSize
+		if offset+len(record) > len(image) {
+			t.Fatalf("record %d does not fit in the test image", i)
+		}
+		copy(image[offset:], record)
+	}
+
+	return image
+}
+
+func TestOpenImageAndWalkMFT(t *testing.T) {
+	good := func(name string) []byte {
+		return buildTestMFTRecord(t, testRecordOpts{
+			flags:     MFTFlagInUse,
+			name:      name,
+			namespace: NamespaceWin32,
+		})
+	}
+
+	bad := good("corrupt.bin")
+	WriteUint32LE(bad, 0, MFTMagicBAAD)
+
+	// Slot 3 is left unallocated, and slot 4 is marked bad. Both sit between
+	// good records so the walk has to step over them, not stop.
+	image := buildTestNTFSImage(t, [][]byte{good("notes.txt"), bad, nil, good("last.dat")})
+
+	vol, err := Open(&mockReaderAt{data: image})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer vol.Close()
+
+	if vol.MFTRecordSize() != DefaultMFTRecordSize {
+		t.Fatalf("MFT record size mismatch: got %d want %d", vol.MFTRecordSize(), DefaultMFTRecordSize)
+	}
+
+	count, err := vol.MFTEntryCount()
+	if err != nil {
+		t.Fatalf("MFTEntryCount failed: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("expected a non-zero MFT entry count")
+	}
+	if _, err := vol.GetMFTEntry(count); err == nil {
+		t.Fatalf("expected entry %d to be out of range", count)
+	}
+
+	var names []string
+	if err := vol.EachMFTEntry(func(entryNum uint64, e *MFTEntry) error {
+		if entryNum >= count {
+			t.Fatalf("walked past the reported bound: entry %d of %d", entryNum, count)
+		}
+		name, err := e.GetFileName()
+		if err != nil {
+			return nil
+		}
+		names = append(names, name.Name)
+		return nil
+	}); err != nil {
+		t.Fatalf("EachMFTEntry failed: %v", err)
+	}
+
+	want := []string{"$MFT", "notes.txt", "last.dat"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("walk mismatch: got %v want %v", names, want)
+	}
+}
+
+func TestParseMFTRecordParityWithOpenedImage(t *testing.T) {
+	const (
+		clusterSize = 4096
+		mftCluster  = 4
+		recordSize  = DefaultMFTRecordSize
+	)
+
+	create := time.Date(2022, 11, 9, 8, 7, 6, 0, time.UTC)
+	record := buildTestMFTRecord(t, testRecordOpts{
+		sequenceNum:   4,
+		hardLinkCount: 2,
+		flags:         MFTFlagInUse,
+		name:          "parity.dat",
+		namespace:     NamespaceWin32,
+		createTime:    create,
+		modifyTime:    create.Add(time.Hour),
+		mftChangeTime: create.Add(2 * time.Hour),
+		accessTime:    create.Add(3 * time.Hour),
+	})
+
+	image := buildTestNTFSImage(t, [][]byte{record})
+
+	vol, err := Open(&mockReaderAt{data: image})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer vol.Close()
+
+	// Entry 1, since the image generates $MFT into entry 0.
+	viaVolume, err := vol.GetMFTEntry(1)
+	if err != nil {
+		t.Fatalf("GetMFTEntry failed: %v", err)
+	}
+
+	// Lift the same record straight out of the image, the way a caller holding
+	// only an extracted $MFT would see it.
+	offset := mftCluster*clusterSize + recordSize
+	raw := make([]byte, recordSize)
+	copy(raw, image[offset:offset+recordSize])
+
+	viaBuffer, err := ParseMFTRecord(raw, 1, vol.MFTRecordSize())
+	if err != nil {
+		t.Fatalf("ParseMFTRecord failed: %v", err)
+	}
+
+	if viaBuffer.Magic != viaVolume.Magic ||
+		viaBuffer.Flags != viaVolume.Flags ||
+		viaBuffer.SequenceNum != viaVolume.SequenceNum ||
+		viaBuffer.HardLinkCount != viaVolume.HardLinkCount ||
+		viaBuffer.UsedSize != viaVolume.UsedSize ||
+		viaBuffer.AllocatedSize != viaVolume.AllocatedSize {
+		t.Fatalf("header mismatch:\nstandalone %+v\nvolume     %+v", viaBuffer, viaVolume)
+	}
+
+	bufName, err := viaBuffer.GetFileName()
+	if err != nil {
+		t.Fatalf("standalone GetFileName failed: %v", err)
+	}
+	volName, err := viaVolume.GetFileName()
+	if err != nil {
+		t.Fatalf("volume GetFileName failed: %v", err)
+	}
+	if !reflect.DeepEqual(bufName, volName) {
+		t.Fatalf("file name mismatch:\nstandalone %+v\nvolume     %+v", bufName, volName)
+	}
+
+	bufSI, err := viaBuffer.GetStandardInformation()
+	if err != nil {
+		t.Fatalf("standalone GetStandardInformation failed: %v", err)
+	}
+	volSI, err := viaVolume.GetStandardInformation()
+	if err != nil {
+		t.Fatalf("volume GetStandardInformation failed: %v", err)
+	}
+	if !reflect.DeepEqual(bufSI, volSI) {
+		t.Fatalf("standard information mismatch:\nstandalone %+v\nvolume     %+v", bufSI, volSI)
+	}
+}
+
+func TestParseMFTRecordRoundTrip(t *testing.T) {
+	create := time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC)
+	modify := time.Date(2024, 2, 3, 4, 5, 6, 0, time.UTC)
+	mftChange := time.Date(2024, 3, 4, 5, 6, 7, 0, time.UTC)
+	access := time.Date(2024, 4, 5, 6, 7, 8, 0, time.UTC)
+
+	record := buildTestMFTRecord(t, testRecordOpts{
+		sequenceNum:   7,
+		hardLinkCount: 2,
+		flags:         MFTFlagInUse | MFTFlagDirectory,
+		name:          "Windows",
+		namespace:     NamespaceWin32,
+		createTime:    create,
+		modifyTime:    modify,
+		mftChangeTime: mftChange,
+		accessTime:    access,
+	})
+
+	entry, err := ParseMFTRecord(record, 42, DefaultMFTRecordSize)
+	if err != nil {
+		t.Fatalf("ParseMFTRecord failed: %v", err)
+	}
+
+	if entry.Magic != MFTMagicFILE {
+		t.Fatalf("magic mismatch: got 0x%X want 0x%X", entry.Magic, MFTMagicFILE)
+	}
+	if entry.RecordNumber != 42 {
+		t.Fatalf("record number mismatch: got %d want 42", entry.RecordNumber)
+	}
+	if entry.SequenceNum != 7 {
+		t.Fatalf("sequence number mismatch: got %d want 7", entry.SequenceNum)
+	}
+	if entry.HardLinkCount != 2 {
+		t.Fatalf("hard link count mismatch: got %d want 2", entry.HardLinkCount)
+	}
+	if !entry.IsInUse() {
+		t.Fatal("expected entry to be in use")
+	}
+	if !entry.IsDirectory() {
+		t.Fatal("expected entry to be a directory")
+	}
+
+	name, err := entry.GetFileName()
+	if err != nil {
+		t.Fatalf("GetFileName failed: %v", err)
+	}
+	if name.Name != "Windows" {
+		t.Fatalf("name mismatch: got %q want %q", name.Name, "Windows")
+	}
+
+	si, err := entry.GetStandardInformation()
+	if err != nil {
+		t.Fatalf("GetStandardInformation failed: %v", err)
+	}
+
+	macTimes := []struct {
+		label string
+		got   time.Time
+		want  time.Time
+	}{
+		{"create", si.CreateTime, create},
+		{"modify", si.ModifyTime, modify},
+		{"mftChange", si.MFTChangeTime, mftChange},
+		{"access", si.AccessTime, access},
+	}
+	for _, tc := range macTimes {
+		want := NTFSTimeToTime(TimeToNTFSTime(tc.want))
+		if !tc.got.Equal(want) {
+			t.Fatalf("%s time mismatch: got %v want %v", tc.label, tc.got, want)
+		}
+	}
+}
+
+func TestParseMFTRecordDefaultRecordSize(t *testing.T) {
+	record := buildTestMFTRecord(t, testRecordOpts{
+		flags:     MFTFlagInUse,
+		name:      "notes.txt",
+		namespace: NamespaceWin32,
+	})
+
+	entry, err := ParseMFTRecord(record, 0, 0)
+	if err != nil {
+		t.Fatalf("ParseMFTRecord with default record size failed: %v", err)
+	}
+
+	if entry.AllocatedSize != DefaultMFTRecordSize {
+		t.Fatalf("allocated size mismatch: got %d want %d", entry.AllocatedSize, DefaultMFTRecordSize)
+	}
+
+	name, err := entry.GetFileName()
+	if err != nil {
+		t.Fatalf("GetFileName failed: %v", err)
+	}
+	if name.Name != "notes.txt" {
+		t.Fatalf("name mismatch: got %q", name.Name)
+	}
+}
+
+func TestParseMFTRecordRejectsBadRecordSize(t *testing.T) {
+	record := buildTestMFTRecord(t, testRecordOpts{name: "a.txt", namespace: NamespaceWin32})
+
+	for _, recordSize := range []uint32{256, MaxMFTEntrySize * 2} {
+		_, err := ParseMFTRecord(record, 0, recordSize)
+		if err == nil {
+			t.Fatalf("expected record size %d to be rejected", recordSize)
+		}
+		if !errors.Is(err, ErrInvalidMFTEntry) {
+			t.Fatalf("record size %d: expected ErrInvalidMFTEntry, got %v", recordSize, err)
+		}
+	}
+}
+
+func TestParseMFTRecordShortBuffer(t *testing.T) {
+	record := buildTestMFTRecord(t, testRecordOpts{name: "a.txt", namespace: NamespaceWin32})
+
+	_, err := ParseMFTRecord(record[:512], 0, DefaultMFTRecordSize)
+	if err == nil {
+		t.Fatal("expected short buffer to be rejected")
+	}
+	if !errors.Is(err, ErrInvalidMFTEntry) {
+		t.Fatalf("expected ErrInvalidMFTEntry, got %v", err)
+	}
+}
+
+func TestParseMFTRecordBadMagic(t *testing.T) {
+	tests := []struct {
+		name  string
+		magic uint32
+	}{
+		{"unallocated", MFTMagicZERO},
+		{"bad", MFTMagicBAAD},
+		{"garbage", 0xDEADBEEF},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			record := buildTestMFTRecord(t, testRecordOpts{name: "a.txt", namespace: NamespaceWin32})
+			WriteUint32LE(record, 0, tc.magic)
+
+			_, err := ParseMFTRecord(record, 0, DefaultMFTRecordSize)
+			if err == nil {
+				t.Fatalf("expected magic 0x%X to be rejected", tc.magic)
+			}
+			if !errors.Is(err, ErrInvalidMFTEntry) {
+				t.Fatalf("expected ErrInvalidMFTEntry, got %v", err)
+			}
+		})
+	}
+}
+
+func TestParseMFTRecordFixupMismatch(t *testing.T) {
+	record := buildTestMFTRecord(t, testRecordOpts{name: "a.txt", namespace: NamespaceWin32})
+
+	// Corrupt the USN stamped at the end of the first sector.
+	WriteUint16LE(record, UpdateSequenceStride-2, 0xFFFF)
+
+	_, err := ParseMFTRecord(record, 0, DefaultMFTRecordSize)
+	if err == nil {
+		t.Fatal("expected fixup mismatch to be rejected")
+	}
+	if !errors.Is(err, ErrUpdateSequence) {
+		t.Fatalf("expected ErrUpdateSequence, got %v", err)
+	}
+}
+
+func TestParseMFTRecordParityWithVolume(t *testing.T) {
+	create := time.Date(2023, 6, 1, 12, 0, 0, 0, time.UTC)
+	record := buildTestMFTRecord(t, testRecordOpts{
+		sequenceNum:   3,
+		hardLinkCount: 1,
+		flags:         MFTFlagInUse,
+		name:          "parity.dat",
+		namespace:     NamespaceWin32,
+		createTime:    create,
+		modifyTime:    create.Add(time.Hour),
+		mftChangeTime: create.Add(2 * time.Hour),
+		accessTime:    create.Add(3 * time.Hour),
+	})
+
+	// Both paths apply fixups in place, so each needs its own copy.
+	standalone := make([]byte, len(record))
+	copy(standalone, record)
+
+	v := newTestMFTVolume(t, [][]byte{record})
+
+	viaVolume, err := v.GetMFTEntry(0)
+	if err != nil {
+		t.Fatalf("GetMFTEntry failed: %v", err)
+	}
+
+	viaBuffer, err := ParseMFTRecord(standalone, 0, v.MFTRecordSize())
+	if err != nil {
+		t.Fatalf("ParseMFTRecord failed: %v", err)
+	}
+
+	if viaBuffer.Magic != viaVolume.Magic ||
+		viaBuffer.Flags != viaVolume.Flags ||
+		viaBuffer.SequenceNum != viaVolume.SequenceNum ||
+		viaBuffer.HardLinkCount != viaVolume.HardLinkCount ||
+		viaBuffer.UsedSize != viaVolume.UsedSize ||
+		viaBuffer.AllocatedSize != viaVolume.AllocatedSize {
+		t.Fatalf("header mismatch:\nstandalone %+v\nvolume     %+v", viaBuffer, viaVolume)
+	}
+
+	if len(viaBuffer.Attributes) != len(viaVolume.Attributes) {
+		t.Fatalf("attribute count mismatch: got %d want %d",
+			len(viaBuffer.Attributes), len(viaVolume.Attributes))
+	}
+	for i := range viaBuffer.Attributes {
+		if viaBuffer.Attributes[i].Header.Type != viaVolume.Attributes[i].Header.Type {
+			t.Fatalf("attribute %d type mismatch: got 0x%X want 0x%X", i,
+				viaBuffer.Attributes[i].Header.Type, viaVolume.Attributes[i].Header.Type)
+		}
+	}
+
+	bufName, err := viaBuffer.GetFileName()
+	if err != nil {
+		t.Fatalf("standalone GetFileName failed: %v", err)
+	}
+	volName, err := viaVolume.GetFileName()
+	if err != nil {
+		t.Fatalf("volume GetFileName failed: %v", err)
+	}
+	if bufName.Name != volName.Name {
+		t.Fatalf("name mismatch: standalone %q volume %q", bufName.Name, volName.Name)
+	}
+
+	bufSI, err := viaBuffer.GetStandardInformation()
+	if err != nil {
+		t.Fatalf("standalone GetStandardInformation failed: %v", err)
+	}
+	volSI, err := viaVolume.GetStandardInformation()
+	if err != nil {
+		t.Fatalf("volume GetStandardInformation failed: %v", err)
+	}
+	if !reflect.DeepEqual(bufSI, volSI) {
+		t.Fatalf("standard information mismatch:\nstandalone %+v\nvolume     %+v", bufSI, volSI)
+	}
+}
+
+func TestMFTEntryCount(t *testing.T) {
+	records := make([][]byte, 4)
+	for i := range records {
+		records[i] = buildTestMFTRecord(t, testRecordOpts{
+			flags:     MFTFlagInUse,
+			name:      fmt.Sprintf("file%d.txt", i),
+			namespace: NamespaceWin32,
+		})
+	}
+
+	v := newTestMFTVolume(t, records)
+
+	count, err := v.MFTEntryCount()
+	if err != nil {
+		t.Fatalf("MFTEntryCount failed: %v", err)
+	}
+	if count != uint64(len(records)) {
+		t.Fatalf("count mismatch: got %d want %d", count, len(records))
+	}
+
+	if _, err := v.GetMFTEntry(count - 1); err != nil {
+		t.Fatalf("last entry should be addressable: %v", err)
+	}
+	if _, err := v.GetMFTEntry(count); err == nil {
+		t.Fatal("expected entry at count to be out of range")
+	}
+}
+
+func TestMFTEntryCountUninitialized(t *testing.T) {
+	empty := &Volume{mftRecordSize: DefaultMFTRecordSize}
+	if _, err := empty.MFTEntryCount(); !errors.Is(err, ErrInvalidMFTEntry) {
+		t.Fatalf("expected ErrInvalidMFTEntry for uninitialized MFT, got %v", err)
+	}
+
+	v := newTestMFTVolume(t, [][]byte{
+		buildTestMFTRecord(t, testRecordOpts{name: "a.txt", namespace: NamespaceWin32}),
+	})
+	if err := v.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if _, err := v.MFTEntryCount(); !errors.Is(err, ErrVolumeClosed) {
+		t.Fatalf("expected ErrVolumeClosed, got %v", err)
+	}
+}
+
+func TestEachMFTEntry(t *testing.T) {
+	good := func(name string) []byte {
+		return buildTestMFTRecord(t, testRecordOpts{
+			flags:     MFTFlagInUse,
+			name:      name,
+			namespace: NamespaceWin32,
+		})
+	}
+
+	bad := good("bad.txt")
+	WriteUint32LE(bad, 0, MFTMagicBAAD)
+
+	// Entry 2 is left as zeros, standing in for an unallocated record.
+	v := newTestMFTVolume(t, [][]byte{good("first.txt"), bad, nil, good("last.txt")})
+
+	var visited []uint64
+	if err := v.EachMFTEntry(func(entryNum uint64, e *MFTEntry) error {
+		if e == nil {
+			t.Fatalf("entry %d: nil entry passed to callback", entryNum)
+		}
+		visited = append(visited, entryNum)
+		return nil
+	}); err != nil {
+		t.Fatalf("EachMFTEntry failed: %v", err)
+	}
+
+	if !reflect.DeepEqual(visited, []uint64{0, 3}) {
+		t.Fatalf("expected to visit entries 0 and 3, visited %v", visited)
+	}
+
+	sentinel := errors.New("stop")
+	var seen int
+	err := v.EachMFTEntry(func(entryNum uint64, e *MFTEntry) error {
+		seen++
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected callback error to propagate, got %v", err)
+	}
+	if seen != 1 {
+		t.Fatalf("expected iteration to stop after the first callback, ran %d times", seen)
+	}
+}
+
 // Benchmark tests
 
 func BenchmarkBinaryReaderUint32(b *testing.B) {

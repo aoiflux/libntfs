@@ -1,6 +1,7 @@
 package libntfs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -39,6 +40,60 @@ func (v *Volume) GetMFTEntry(entryNum uint64) (*MFTEntry, error) {
 	v.mftCacheMu.Unlock()
 
 	return entry, nil
+}
+
+// MFTEntryCount returns the number of addressable MFT records on the volume,
+// that is the total size of the $MFT data divided by the MFT record size.
+//
+// Every entry number in [0, count) is addressable by GetMFTEntry, but individual
+// records may still fail to parse because they are unallocated, marked bad, or
+// fall inside a sparse run. Callers walking the whole table should treat those as
+// per-entry errors to skip rather than a reason to stop. Entry numbers at or
+// above count are out of range.
+//
+// It returns an error only when the volume is closed or its MFT is not
+// initialized; otherwise it always succeeds.
+func (v *Volume) MFTEntryCount() (uint64, error) {
+	if v.IsClosed() {
+		return 0, ErrVolumeClosed
+	}
+
+	if v.mftRecordSize == 0 || len(v.mftDataRuns) == 0 {
+		return 0, fmt.Errorf("%w: MFT not initialized", ErrInvalidMFTEntry)
+	}
+
+	return v.maxMFTEntries(), nil
+}
+
+// EachMFTEntry calls fn for every parsable MFT record on the volume, in entry
+// number order. Records that fail to parse are skipped silently, so a corrupt or
+// unallocated entry does not end the walk. If fn returns a non-nil error,
+// iteration stops and that error is returned to the caller.
+//
+// Entries visited here pass through the MFT cache, which is bounded by
+// DefaultMFTCacheSize, so a full-table walk will not grow memory without limit
+// and will not evict its way to a fully cached table either.
+func (v *Volume) EachMFTEntry(fn func(entryNum uint64, e *MFTEntry) error) error {
+	count, err := v.MFTEntryCount()
+	if err != nil {
+		return err
+	}
+
+	for entryNum := uint64(0); entryNum < count; entryNum++ {
+		entry, err := v.GetMFTEntry(entryNum)
+		if err != nil {
+			if errors.Is(err, ErrVolumeClosed) {
+				return err
+			}
+			continue // Skip unallocated, bad, or otherwise unparsable records
+		}
+
+		if err := fn(entryNum, entry); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func fileReferenceRecordNumber(ref uint64) uint64 {
@@ -378,7 +433,16 @@ func (v *Volume) getMFTEntryOffset(entryNum uint64) (int64, error) {
 
 // parseMFTEntry parses an MFT entry from raw bytes.
 func (v *Volume) parseMFTEntry(buf []byte, entryNum uint64) (*MFTEntry, error) {
-	if len(buf) < int(v.mftRecordSize) {
+	return parseMFTRecordCore(buf, entryNum, v.mftRecordSize)
+}
+
+// parseMFTRecordCore parses an MFT entry from raw bytes without requiring a Volume.
+// recordSize is the on-disk MFT record size; it replaces the volume-scoped value so
+// the same parser serves both volume-backed reads and standalone $MFT buffers.
+//
+// buf is modified in place by the update sequence (fixup) array.
+func parseMFTRecordCore(buf []byte, entryNum uint64, recordSize uint32) (*MFTEntry, error) {
+	if len(buf) < int(recordSize) {
 		return nil, ErrInvalidMFTEntry
 	}
 
@@ -411,13 +475,13 @@ func (v *Volume) parseMFTEntry(buf []byte, entryNum uint64) (*MFTEntry, error) {
 	}
 
 	// Validate sizes
-	if entry.UsedSize > entry.AllocatedSize || entry.AllocatedSize > v.mftRecordSize {
+	if entry.UsedSize > entry.AllocatedSize || entry.AllocatedSize > recordSize {
 		return nil, fmt.Errorf("%w: invalid sizes (used=%d, allocated=%d, max=%d)",
-			ErrInvalidMFTEntry, entry.UsedSize, entry.AllocatedSize, v.mftRecordSize)
+			ErrInvalidMFTEntry, entry.UsedSize, entry.AllocatedSize, recordSize)
 	}
 
 	// Apply update sequence array (fixup)
-	if err := v.applyUpdateSequence(buf, entry.UpdateSeqOffset, entry.UpdateSeqSize); err != nil {
+	if err := applyUpdateSequence(buf, entry.UpdateSeqOffset, entry.UpdateSeqSize); err != nil {
 		return nil, fmt.Errorf("update sequence failed: %w", err)
 	}
 
@@ -427,7 +491,7 @@ func (v *Volume) parseMFTEntry(buf []byte, entryNum uint64) (*MFTEntry, error) {
 			ErrInvalidMFTEntry, entry.FirstAttrOffset)
 	}
 
-	attrs, err := v.parseAttributes(buf, int(entry.FirstAttrOffset), int(entry.UsedSize))
+	attrs, err := parseAttributes(buf, int(entry.FirstAttrOffset), int(entry.UsedSize))
 	if err != nil {
 		return nil, fmt.Errorf("parse attributes failed: %w", err)
 	}
@@ -438,7 +502,7 @@ func (v *Volume) parseMFTEntry(buf []byte, entryNum uint64) (*MFTEntry, error) {
 
 // applyUpdateSequence applies the update sequence array to fix torn writes.
 // The update sequence array is NTFS's mechanism for detecting incomplete writes.
-func (v *Volume) applyUpdateSequence(buf []byte, offset, size uint16) error {
+func applyUpdateSequence(buf []byte, offset, size uint16) error {
 	if size == 0 {
 		return nil // No update sequence
 	}
@@ -477,7 +541,7 @@ func (v *Volume) applyUpdateSequence(buf []byte, offset, size uint16) error {
 }
 
 // parseAttributes parses all attributes in an MFT entry.
-func (v *Volume) parseAttributes(buf []byte, startOffset, endOffset int) ([]*Attribute, error) {
+func parseAttributes(buf []byte, startOffset, endOffset int) ([]*Attribute, error) {
 	var attrs []*Attribute
 	offset := startOffset
 
@@ -494,7 +558,7 @@ func (v *Volume) parseAttributes(buf []byte, startOffset, endOffset int) ([]*Att
 		}
 
 		// Parse attribute
-		attr, err := v.parseAttribute(buf, offset)
+		attr, err := parseAttribute(buf, offset)
 		if err != nil {
 			// Some attributes may be partially damaged; continue if possible
 			return attrs, fmt.Errorf("at offset %d: %w", offset, err)
@@ -516,7 +580,7 @@ func (v *Volume) parseAttributes(buf []byte, startOffset, endOffset int) ([]*Att
 }
 
 // parseAttribute parses a single attribute (calls attributes.go functions).
-func (v *Volume) parseAttribute(buf []byte, offset int) (*Attribute, error) {
+func parseAttribute(buf []byte, offset int) (*Attribute, error) {
 	// This will be implemented in attributes.go
 	// For now, provide a stub that reads the header
 	return parseAttributeHeader(buf, offset)

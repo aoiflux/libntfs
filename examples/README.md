@@ -88,6 +88,30 @@ On Windows raw volume paths (`\\.\\C:` style), this example attempts
 ./overwrite disk.img /notes.txt 0x10 HELLO 0x40
 ```
 
+### 8. mftdump - MFT Record Timeline
+
+Lists MFT records as a flat timeline. Accepts either a standalone `$MFT` file,
+as extracted by KAPE, FTK Imager, or icat, or a full volume or disk image. The
+input type is detected from the first four bytes and can be forced with
+`-standalone`.
+
+Unallocated and corrupt records are skipped rather than ending the walk, so a
+damaged table still yields everything readable around the damage.
+
+```bash
+# Extracted $MFT file, first 100 allocated records
+./mftdump -limit 100 ./\$MFT
+
+# Include records no longer marked in use
+./mftdump -deleted ./\$MFT
+
+# Whole volume or image
+./mftdump disk.img
+
+# Windows raw drive (run as Administrator)
+mftdump.exe \\.\C:
+```
+
 ## Building Examples
 
 ```bash

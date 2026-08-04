@@ -5,6 +5,29 @@ All notable changes to the libntfs project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+### Added
+- `ParseMFTRecord` parses a single MFT FILE record from a raw buffer with no
+  Volume, for standalone `$MFT` files extracted with KAPE, FTK Imager, or icat.
+  Resident attributes parse fully; non-resident data runs are decoded but not
+  resolved, since reading content requires cluster access.
+- `(*Volume).MFTEntryCount` reports the number of addressable MFT records, so
+  callers can iterate the table with a known bound and skip per-entry errors
+  rather than stopping at the first one.
+- `(*Volume).EachMFTEntry` walks every parsable record in order, skipping
+  unallocated and corrupt entries and stopping when the callback returns an
+  error.
+- `DefaultMFTRecordSize` and `MinMFTEntrySize` constants.
+- `examples/mftdump`, which lists MFT records as a timeline from either a
+  standalone `$MFT` file or a full volume.
+
+### Changed
+- The MFT record parser is now volume-independent internally. Record parsing,
+  fixup application, and attribute parsing moved from `*Volume` methods to
+  package-level functions, and `(*Volume).parseMFTEntry` delegates to the shared
+  core. No exported API changed and volume-backed parsing behaves identically.
+
 ## [0.1.0] - 2025-10-18
 
 ### Added

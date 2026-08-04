@@ -11,6 +11,7 @@ const (
 
 	// MFT constants
 	MFTEntryHeaderSize = 48   // Size of MFT entry header (without attributes)
+	MinMFTEntrySize    = 512  // Minimum MFT entry size
 	MaxMFTEntrySize    = 4096 // Maximum MFT entry size
 
 	// Attribute constants
