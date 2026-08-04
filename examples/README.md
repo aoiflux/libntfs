@@ -108,6 +108,9 @@ damaged table still yields everything readable around the damage.
 # Whole volume or image
 ./mftdump disk.img
 
+# JSON Lines for piping; the preamble goes to stderr, records to stdout
+./mftdump -json ./\$MFT | jq -r '.name'
+
 # Windows raw drive (run as Administrator)
 mftdump.exe \\.\C:
 ```

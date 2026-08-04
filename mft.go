@@ -433,21 +433,36 @@ func (v *Volume) getMFTEntryOffset(entryNum uint64) (int64, error) {
 
 // parseMFTEntry parses an MFT entry from raw bytes.
 func (v *Volume) parseMFTEntry(buf []byte, entryNum uint64) (*MFTEntry, error) {
-	return parseMFTRecordCore(buf, entryNum, v.mftRecordSize)
-}
-
-// parseMFTRecordCore parses an MFT entry from raw bytes without requiring a Volume.
-// recordSize is the on-disk MFT record size; it replaces the volume-scoped value so
-// the same parser serves both volume-backed reads and standalone $MFT buffers.
-//
-// buf is modified in place by the update sequence (fixup) array.
-func parseMFTRecordCore(buf []byte, entryNum uint64, recordSize uint32) (*MFTEntry, error) {
-	if len(buf) < int(recordSize) {
-		return nil, ErrInvalidMFTEntry
+	entry := &MFTEntry{}
+	if err := parseMFTRecordCore(entry, buf, entryNum, v.mftRecordSize); err != nil {
+		return nil, err
 	}
 
+	return entry, nil
+}
+
+// parseMFTRecordCore parses an MFT entry from raw bytes into entry, without
+// requiring a Volume. recordSize is the on-disk MFT record size; it replaces the
+// volume-scoped value so the same parser serves both volume-backed reads and
+// standalone $MFT buffers.
+//
+// entry is reset first, so a caller may reuse one across many records. On error
+// its contents are undefined.
+//
+// buf is modified in place by the update sequence (fixup) array.
+func parseMFTRecordCore(entry *MFTEntry, buf []byte, entryNum uint64, recordSize uint32) error {
+	if len(buf) < int(recordSize) {
+		return ErrInvalidMFTEntry
+	}
+
+	// Reset the fields the header parse below does not assign, and keep the
+	// attribute slice's backing array so reuse avoids regrowing it.
+	entry.Reserved = 0
+	entry.UpdateSeqArray = entry.UpdateSeqArray[:0]
+	entry.Attributes = entry.Attributes[:0]
+	entry.RecordNumber = uint32(entryNum)
+
 	r := NewBinaryReader(buf)
-	entry := &MFTEntry{}
 
 	// Parse MFT entry header
 	entry.Magic, _ = r.ReadUint32()
@@ -466,38 +481,39 @@ func parseMFTRecordCore(buf []byte, entryNum uint64, recordSize uint32) (*MFTEnt
 	// Validate magic number
 	if entry.Magic != MFTMagicFILE {
 		if entry.Magic == MFTMagicBAAD {
-			return nil, fmt.Errorf("%w: entry marked as bad (BAAD)", ErrInvalidMFTEntry)
+			return fmt.Errorf("%w: entry marked as bad (BAAD)", ErrInvalidMFTEntry)
 		}
 		if entry.Magic == MFTMagicZERO {
-			return nil, fmt.Errorf("%w: entry not allocated", ErrInvalidMFTEntry)
+			return fmt.Errorf("%w: entry not allocated", ErrInvalidMFTEntry)
 		}
-		return nil, fmt.Errorf("%w: invalid magic 0x%X", ErrInvalidMFTEntry, entry.Magic)
+		return fmt.Errorf("%w: invalid magic 0x%X", ErrInvalidMFTEntry, entry.Magic)
 	}
 
 	// Validate sizes
 	if entry.UsedSize > entry.AllocatedSize || entry.AllocatedSize > recordSize {
-		return nil, fmt.Errorf("%w: invalid sizes (used=%d, allocated=%d, max=%d)",
+		return fmt.Errorf("%w: invalid sizes (used=%d, allocated=%d, max=%d)",
 			ErrInvalidMFTEntry, entry.UsedSize, entry.AllocatedSize, recordSize)
 	}
 
 	// Apply update sequence array (fixup)
 	if err := applyUpdateSequence(buf, entry.UpdateSeqOffset, entry.UpdateSeqSize); err != nil {
-		return nil, fmt.Errorf("update sequence failed: %w", err)
+		return fmt.Errorf("update sequence failed: %w", err)
 	}
 
 	// Parse attributes
 	if entry.FirstAttrOffset < MFTEntryHeaderSize || uint32(entry.FirstAttrOffset) >= entry.UsedSize {
-		return nil, fmt.Errorf("%w: invalid first attribute offset %d",
+		return fmt.Errorf("%w: invalid first attribute offset %d",
 			ErrInvalidMFTEntry, entry.FirstAttrOffset)
 	}
 
-	attrs, err := parseAttributes(buf, int(entry.FirstAttrOffset), int(entry.UsedSize))
+	attrs, err := parseAttributesInto(entry.Attributes, buf,
+		int(entry.FirstAttrOffset), int(entry.UsedSize))
 	if err != nil {
-		return nil, fmt.Errorf("parse attributes failed: %w", err)
+		return fmt.Errorf("parse attributes failed: %w", err)
 	}
 	entry.Attributes = attrs
 
-	return entry, nil
+	return nil
 }
 
 // applyUpdateSequence applies the update sequence array to fix torn writes.
@@ -541,8 +557,10 @@ func applyUpdateSequence(buf []byte, offset, size uint16) error {
 }
 
 // parseAttributes parses all attributes in an MFT entry.
-func parseAttributes(buf []byte, startOffset, endOffset int) ([]*Attribute, error) {
-	var attrs []*Attribute
+// parseAttributesInto appends the parsed attributes to dst, which may be nil or
+// a zero-length slice retained from an earlier parse so its capacity is reused.
+func parseAttributesInto(dst []*Attribute, buf []byte, startOffset, endOffset int) ([]*Attribute, error) {
+	attrs := dst[:0]
 	offset := startOffset
 
 	for offset < endOffset {

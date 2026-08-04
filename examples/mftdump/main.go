@@ -6,6 +6,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,12 +23,17 @@ func main() {
 	recordSize := flag.Uint("record-size", 0, "MFT record size for standalone mode (0 = detect)")
 	standalone := flag.Bool("standalone", false, "force standalone $MFT parsing")
 	showUnused := flag.Bool("deleted", false, "include records not marked in use")
+	asJSON := flag.Bool("json", false, "emit one JSON object per record instead of a table")
 	flag.Usage = usage
 	flag.Parse()
 
 	if flag.NArg() != 1 {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if *asJSON {
+		jsonEnc = json.NewEncoder(os.Stdout)
 	}
 
 	path := flag.Arg(0)
@@ -62,6 +68,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  ./mftdump -limit 100 ./$MFT           # Extracted $MFT file")
 	fmt.Fprintln(os.Stderr, "  ./mftdump -deleted ./$MFT             # Include unallocated records")
 	fmt.Fprintln(os.Stderr, "  ./mftdump disk.img                    # Disk image")
+	fmt.Fprintln(os.Stderr, "  ./mftdump -json ./$MFT | jq .         # JSON Lines for piping")
 	fmt.Fprintln(os.Stderr, "  mftdump.exe \\\\.\\C:                    # Windows (requires Administrator)")
 	fmt.Fprintln(os.Stderr, "\nFlags:")
 	flag.PrintDefaults()
@@ -171,12 +178,35 @@ func dumpVolume(r io.ReaderAt, limit int, showUnused bool) error {
 	return nil
 }
 
+// timelineRecord is the -json shape, emitted as one object per line so the
+// output streams into jq or a timeline tool without buffering the whole table.
+type timelineRecord struct {
+	Entry      uint64     `json:"entry"`
+	Name       string     `json:"name"`
+	InUse      bool       `json:"in_use"`
+	Directory  bool       `json:"directory"`
+	Size       uint64     `json:"size"`
+	Sequence   uint16     `json:"sequence"`
+	HardLinks  uint16     `json:"hard_links"`
+	Created    *time.Time `json:"created,omitempty"`
+	Modified   *time.Time `json:"modified,omitempty"`
+	MFTChanged *time.Time `json:"mft_changed,omitempty"`
+	Accessed   *time.Time `json:"accessed,omitempty"`
+}
+
+// jsonEnc is non-nil when -json is set, which also suppresses the text header.
+var jsonEnc *json.Encoder
+
 func printHeader() {
+	if jsonEnc != nil {
+		return
+	}
+
 	fmt.Printf("%-10s %-6s %-5s %12s  %-19s  %s\n",
 		"ENTRY", "STATE", "TYPE", "SIZE", "MODIFIED", "NAME")
 }
 
-// printEntry writes one timeline row and reports whether it printed anything.
+// printEntry writes one timeline row and reports whether it emitted anything.
 func printEntry(entryNum uint64, entry *libntfs.MFTEntry, showUnused bool) bool {
 	if !entry.IsInUse() && !showUnused {
 		return false
@@ -187,23 +217,47 @@ func printEntry(entryNum uint64, entry *libntfs.MFTEntry, showUnused bool) bool 
 		return false // Extension records and $MFT metafiles without $FILE_NAME
 	}
 
+	rec := timelineRecord{
+		Entry:     entryNum,
+		Name:      name.Name,
+		InUse:     entry.IsInUse(),
+		Directory: entry.IsDirectory(),
+		Size:      dataSize(entry),
+		Sequence:  entry.SequenceNum,
+		HardLinks: entry.HardLinkCount,
+	}
+
+	if si, err := entry.GetStandardInformation(); err == nil {
+		rec.Created = &si.CreateTime
+		rec.Modified = &si.ModifyTime
+		rec.MFTChanged = &si.MFTChangeTime
+		rec.Accessed = &si.AccessTime
+	}
+
+	if jsonEnc != nil {
+		if err := jsonEnc.Encode(rec); err != nil {
+			log.Fatalf("Failed to encode record %d: %v", entryNum, err)
+		}
+		return true
+	}
+
 	state := "alloc"
-	if !entry.IsInUse() {
+	if !rec.InUse {
 		state = "del"
 	}
 
 	kind := "file"
-	if entry.IsDirectory() {
+	if rec.Directory {
 		kind = "dir"
 	}
 
 	modified := "-"
-	if si, err := entry.GetStandardInformation(); err == nil {
-		modified = si.ModifyTime.Format(time.DateTime)
+	if rec.Modified != nil {
+		modified = rec.Modified.Format(time.DateTime)
 	}
 
 	fmt.Printf("%-10d %-6s %-5s %12d  %-19s  %s\n",
-		entryNum, state, kind, dataSize(entry), modified, name.Name)
+		rec.Entry, state, kind, rec.Size, modified, rec.Name)
 
 	return true
 }

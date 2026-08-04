@@ -5,9 +5,18 @@ All notable changes to the libntfs project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.1.5]
 
 ### Added
+- Limited write support for in-place overwrites: `(*File).Write`,
+  `(*File).WriteAt`, `(*Volume).WriteAt`, `(*Volume).WriteDataRuns`, and
+  `(*Volume).IsWritable`. Restricted to non-resident, non-sparse,
+  non-compressed, non-encrypted streams on writable handles. No resident
+  writes, no file growth, no truncation.
+- `ErrReadOnlyVolume`, `ErrWriteUnsupported`, and `ErrWriteOutOfRange`.
+- `examples/overwrite`, a guarded in-place overwrite at logical file offsets
+  with caller-supplied end-bound checks. On Windows raw volume paths it
+  attempts `FSCTL_LOCK_VOLUME` before writing and unlocks on exit.
 - `ParseMFTRecord` parses a single MFT FILE record from a raw buffer with no
   Volume, for standalone `$MFT` files extracted with KAPE, FTK Imager, or icat.
   Resident attributes parse fully; non-resident data runs are decoded but not
@@ -18,17 +27,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `(*Volume).EachMFTEntry` walks every parsable record in order, skipping
   unallocated and corrupt entries and stopping when the callback returns an
   error.
+- `ParseMFTRecordInto` parses into a caller-supplied `MFTEntry` so a sweep over a
+  large `$MFT` stops allocating one per record. Roughly 9 allocations per record
+  instead of 13. Each call invalidates the previous call's results.
 - `DefaultMFTRecordSize` and `MinMFTEntrySize` constants.
 - `examples/mftdump`, which lists MFT records as a timeline from either a
-  standalone `$MFT` file or a full volume.
+  standalone `$MFT` file or a full volume, with a `-json` mode emitting one JSON
+  object per record for piping into `jq` or a timeline tool.
 
 ### Changed
+- `MFTEntry.RecordNumber` is now populated with the entry number by every parse
+  path, including `(*Volume).GetMFTEntry`, which previously always left it 0.
 - The MFT record parser is now volume-independent internally. Record parsing,
   fixup application, and attribute parsing moved from `*Volume` methods to
   package-level functions, and `(*Volume).parseMFTEntry` delegates to the shared
   core. No exported API changed and volume-backed parsing behaves identically.
 
-## [0.1.0] - 2025-10-18
+### Fixed
+- The `Version` constant had been left at `0.1.1` while 0.1.2, 0.1.3, and 0.1.4
+  shipped. It now tracks the release.
+- The package documentation example called `volume.Open(root.RecordNumber)` on
+  the `*File` returned by `GetRootDirectory`, which has no such field.
+
+## [0.1.4]
+
+### Added
+- `(*Volume).Report` and the supporting `report.go`, producing a structured
+  volume report rather than ad-hoc printed output.
+- `examples/report` and `examples/finfo`, the latter showing per-file metadata
+  including size, start and end byte offsets, fragmentation, and timestamps.
+
+## [0.1.3]
+
+### Added
+- `(*Volume).SetMFTParentFallback` to opt into the expensive full-MFT
+  parent-link fallback during directory reads.
+- `examples/bench`, an end-to-end traversal and sampled read throughput
+  benchmark.
+
+### Changed
+- MFT entry lookup now uses a cached index of cumulative data run ends with
+  binary search instead of a linear scan, which matters on fragmented volumes.
+- Reworked file extraction and data run reading.
+
+## [0.1.2]
+
+### Added
+- `(*MFTEntry).FindPrimaryDataAttribute` and
+  `(*MFTEntry).FindPrimaryNonResidentDataAttribute`, which prefer the unnamed
+  `$DATA` stream so alternate data streams are not selected by accident.
+
+### Changed
+- `$ATTRIBUTE_LIST` resolution now merges attributes from MFT extension records
+  and stitches split data runs in VCN order, so large fragmented streams present
+  as a single run list.
+- Improved file, attribute, and file size detection parity with The Sleuth Kit.
+- Reworked the traverse example.
+
+## [0.1.1]
+
+### Added
+- Compressed file support in `compression.go`, decompressing NTFS compression
+  units so compressed streams can be read and extracted.
+- Stream capability inspection: `(*File).ReadSupport`, `(*Attribute).ReadSupport`,
+  `(*File).HasData`, `(*File).IsCompressed`, `(*File).IsEncrypted`, and
+  `(*File).IsSparse`, so callers can check whether a stream is readable and how
+  it is stored before reading.
+
+## [0.1.0]
 
 ### Added
 - Initial release of libntfs
@@ -182,21 +248,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## Roadmap
 
-### Planned Features
-- [ ] Compression support (LZNT1)
-- [ ] Encryption support (EFS)
+### Features
+- [x] Compression support (read path, delivered in 0.1.1)
+- [x] Write support (limited to in-place overwrite, delivered in 0.1.5)
+- [ ] Encryption support (EFS) — currently detection only
+- [ ] Resident writes, file growth, and truncation
 - [ ] USN Journal full support
 - [ ] Security descriptor parsing
 - [ ] Alternate data stream enumeration
 - [ ] Enhanced caching strategies
 - [ ] Memory-mapped I/O option
-- [ ] Write support (future major version)
 
-### Planned Improvements
+### Improvements
+- [x] Integration tests against a synthetic volume image (delivered in 0.1.5)
 - [ ] More comprehensive test coverage
-- [ ] Integration tests with test volumes
 - [ ] Performance profiling and optimization
 - [ ] Additional examples
 - [ ] Extended documentation
@@ -206,10 +273,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Version History
 
-- **0.1.0** (2025-10-18) - Initial release
+- **0.1.5** - Limited write support, volume-free MFT record parsing, bounded MFT
+  iteration
+- **0.1.4** - Structured volume reporting
+- **0.1.3** - MFT lookup speedups and parent-link fallback control
+- **0.1.2** - $ATTRIBUTE_LIST resolution and Sleuth Kit parity
+- **0.1.1** - Compressed file support and stream capability checks
+- **0.1.0** - Initial release
 
 ## Links
 
-- [GitHub Repository](https://github.com/yourusername/libntfs)
-- [Issue Tracker](https://github.com/yourusername/libntfs/issues)
-- [Documentation](https://pkg.go.dev/github.com/yourusername/libntfs)
+- [GitHub Repository](https://github.com/aoiflux/libntfs)
+- [Issue Tracker](https://github.com/aoiflux/libntfs/issues)
+- [Documentation](https://pkg.go.dev/github.com/aoiflux/libntfs)

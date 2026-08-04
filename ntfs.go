@@ -25,12 +25,7 @@
 //		log.Fatal(err)
 //	}
 //
-//	rootFile, err := volume.Open(root.RecordNumber)
-//	if err != nil {
-//		log.Fatal(err)
-//	}
-//
-//	entries, err := rootFile.ReadDir()
+//	entries, err := root.ReadDir()
 //	if err != nil {
 //		log.Fatal(err)
 //	}
@@ -43,7 +38,7 @@ package libntfs
 // Version information
 const (
 	// Version is the current library version
-	Version = "0.1.4"
+	Version = "0.1.5"
 
 	// Author information
 	Author = "libntfs contributors"

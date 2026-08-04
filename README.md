@@ -107,6 +107,7 @@ Volume-level:
 MFT-level:
 
 - ParseMFTRecord(buf []byte, entryNum uint64, recordSize uint32) (*MFTEntry, error)
+- ParseMFTRecordInto(entry *MFTEntry, buf []byte, entryNum uint64, recordSize uint32) error
 - (*Volume).GetMFTEntry(entryNum uint64) (*MFTEntry, error)
 - (*Volume).MFTEntryCount() (uint64, error)
 - (*Volume).EachMFTEntry(fn func(entryNum uint64, e *MFTEntry) error) error
@@ -177,6 +178,25 @@ for entryNum := uint64(0); ; entryNum++ {
 you need the original bytes. Resident attributes parse fully; non-resident
 attributes have their data runs decoded but not resolved, since reading content
 needs the volume the records came from.
+
+For a multi-million-record sweep, `ParseMFTRecordInto` parses into an entry you
+own, so the loop stops allocating a fresh one per record:
+
+```go
+entry := &libntfs.MFTEntry{}
+for entryNum := uint64(0); ; entryNum++ {
+    if _, err := io.ReadFull(mft, buf); err != nil {
+        break
+    }
+    if err := libntfs.ParseMFTRecordInto(entry, buf, entryNum, libntfs.DefaultMFTRecordSize); err != nil {
+        continue
+    }
+    // Consume entry before the next iteration overwrites it.
+}
+```
+
+Each call invalidates the previous one's results, so copy anything you intend to
+keep.
 
 To walk the MFT of a live volume instead, use `MFTEntryCount` to get the bound
 and tolerate per-entry errors, or let `EachMFTEntry` do both:

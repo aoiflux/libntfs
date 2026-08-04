@@ -1324,7 +1324,7 @@ func buildStandardInfoAttrValue(create, modify, mftChange, access time.Time, fil
 
 // buildTestMFTRecord assembles a complete, fixup-stamped MFT record holding a
 // $STANDARD_INFORMATION and a $FILE_NAME attribute.
-func buildTestMFTRecord(t *testing.T, opts testRecordOpts) []byte {
+func buildTestMFTRecord(t testing.TB, opts testRecordOpts) []byte {
 	t.Helper()
 
 	recordSize := opts.recordSize
@@ -1390,7 +1390,7 @@ func buildTestMFTRecord(t *testing.T, opts testRecordOpts) []byte {
 
 // newTestMFTVolume builds an in-memory volume whose $MFT occupies a single
 // cluster run holding the supplied records in order.
-func newTestMFTVolume(t *testing.T, records [][]byte) *Volume {
+func newTestMFTVolume(t testing.TB, records [][]byte) *Volume {
 	t.Helper()
 
 	const (
@@ -1419,7 +1419,7 @@ func newTestMFTVolume(t *testing.T, records [][]byte) *Volume {
 
 // buildNonResidentDataAttr builds an unnamed non-resident $DATA attribute backed
 // by a single data run. startCluster and clusters must each fit in one byte.
-func buildNonResidentDataAttr(t *testing.T, attrID uint16, startCluster, clusters uint64, clusterSize uint32) []byte {
+func buildNonResidentDataAttr(t testing.TB, attrID uint16, startCluster, clusters uint64, clusterSize uint32) []byte {
 	t.Helper()
 
 	if startCluster > 0x7F || clusters > 0x7F {
@@ -1475,7 +1475,7 @@ func buildTestBootSector(bytesPerSector uint16, sectorsPerCluster uint8, totalSe
 // buildTestNTFSImage assembles a minimal but genuinely openable NTFS image whose
 // $MFT holds the supplied records. Record 0 is generated as $MFT itself, with a
 // non-resident $DATA run covering the MFT, so Open and initializeMFT work.
-func buildTestNTFSImage(t *testing.T, records [][]byte) []byte {
+func buildTestNTFSImage(t testing.TB, records [][]byte) []byte {
 	t.Helper()
 
 	const (
@@ -1984,7 +1984,174 @@ func TestEachMFTEntry(t *testing.T) {
 	}
 }
 
+func TestParseMFTRecordIntoReuse(t *testing.T) {
+	// Three attributes, so reusing this entry for a two-attribute record has to
+	// shrink the slice rather than leave the third behind.
+	withData := buildTestMFTRecord(t, testRecordOpts{
+		flags:      MFTFlagInUse,
+		name:       "first.dat",
+		namespace:  NamespaceWin32,
+		extraAttrs: [][]byte{buildResidentAttr(AttrTypeData, 2, []byte("payload"))},
+	})
+	withoutData := buildTestMFTRecord(t, testRecordOpts{
+		flags:         MFTFlagInUse | MFTFlagDirectory,
+		name:          "second",
+		namespace:     NamespaceWin32,
+		hardLinkCount: 3,
+	})
+
+	entry := &MFTEntry{}
+
+	if err := ParseMFTRecordInto(entry, withData, 7, DefaultMFTRecordSize); err != nil {
+		t.Fatalf("first ParseMFTRecordInto failed: %v", err)
+	}
+	if len(entry.Attributes) != 3 {
+		t.Fatalf("expected 3 attributes, got %d", len(entry.Attributes))
+	}
+	if entry.RecordNumber != 7 {
+		t.Fatalf("record number mismatch: got %d want 7", entry.RecordNumber)
+	}
+	if entry.IsDirectory() {
+		t.Fatal("first record should not be a directory")
+	}
+
+	if err := ParseMFTRecordInto(entry, withoutData, 9, DefaultMFTRecordSize); err != nil {
+		t.Fatalf("second ParseMFTRecordInto failed: %v", err)
+	}
+	if len(entry.Attributes) != 2 {
+		t.Fatalf("reused entry kept a stale attribute: got %d want 2", len(entry.Attributes))
+	}
+	if entry.RecordNumber != 9 {
+		t.Fatalf("record number mismatch: got %d want 9", entry.RecordNumber)
+	}
+	if !entry.IsDirectory() {
+		t.Fatal("second record should be a directory")
+	}
+	if entry.HardLinkCount != 3 {
+		t.Fatalf("hard link count mismatch: got %d want 3", entry.HardLinkCount)
+	}
+	if entry.FindAttribute(AttrTypeData, "") != nil {
+		t.Fatal("reused entry still exposes the previous record's $DATA attribute")
+	}
+
+	name, err := entry.GetFileName()
+	if err != nil {
+		t.Fatalf("GetFileName failed: %v", err)
+	}
+	if name.Name != "second" {
+		t.Fatalf("name mismatch: got %q want %q", name.Name, "second")
+	}
+}
+
+func TestParseMFTRecordIntoMatchesParseMFTRecord(t *testing.T) {
+	record := buildTestMFTRecord(t, testRecordOpts{
+		flags:      MFTFlagInUse,
+		name:       "same.bin",
+		namespace:  NamespaceWin32,
+		createTime: time.Date(2021, 5, 4, 3, 2, 1, 0, time.UTC),
+		extraAttrs: [][]byte{buildResidentAttr(AttrTypeData, 2, []byte("abc"))},
+	})
+
+	forValue := make([]byte, len(record))
+	copy(forValue, record)
+
+	want, err := ParseMFTRecord(forValue, 11, DefaultMFTRecordSize)
+	if err != nil {
+		t.Fatalf("ParseMFTRecord failed: %v", err)
+	}
+
+	got := &MFTEntry{}
+	if err := ParseMFTRecordInto(got, record, 11, DefaultMFTRecordSize); err != nil {
+		t.Fatalf("ParseMFTRecordInto failed: %v", err)
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("entry mismatch:\ninto  %+v\nvalue %+v", got, want)
+	}
+}
+
+func TestParseMFTRecordIntoRejectsNilEntry(t *testing.T) {
+	record := buildTestMFTRecord(t, testRecordOpts{name: "a.txt", namespace: NamespaceWin32})
+
+	err := ParseMFTRecordInto(nil, record, 0, DefaultMFTRecordSize)
+	if err == nil {
+		t.Fatal("expected a nil destination entry to be rejected")
+	}
+	if !errors.Is(err, ErrInvalidMFTEntry) {
+		t.Fatalf("expected ErrInvalidMFTEntry, got %v", err)
+	}
+}
+
+func TestGetMFTEntrySetsRecordNumber(t *testing.T) {
+	image := buildTestNTFSImage(t, [][]byte{
+		buildTestMFTRecord(t, testRecordOpts{
+			flags:     MFTFlagInUse,
+			name:      "numbered.txt",
+			namespace: NamespaceWin32,
+		}),
+	})
+
+	vol, err := Open(&mockReaderAt{data: image})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer vol.Close()
+
+	for _, entryNum := range []uint64{0, 1} {
+		entry, err := vol.GetMFTEntry(entryNum)
+		if err != nil {
+			t.Fatalf("GetMFTEntry(%d) failed: %v", entryNum, err)
+		}
+		if uint64(entry.RecordNumber) != entryNum {
+			t.Fatalf("entry %d: record number mismatch, got %d", entryNum, entry.RecordNumber)
+		}
+	}
+}
+
 // Benchmark tests
+
+// benchmarkRecord returns a pristine record plus a scratch buffer, since parsing
+// applies fixups in place and a record can only be parsed once.
+func benchmarkRecord(b *testing.B) (pristine, scratch []byte) {
+	pristine = buildTestMFTRecord(b, testRecordOpts{
+		flags:      MFTFlagInUse,
+		name:       "benchmark.dat",
+		namespace:  NamespaceWin32,
+		createTime: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
+		extraAttrs: [][]byte{buildResidentAttr(AttrTypeData, 2, make([]byte, 64))},
+	})
+
+	return pristine, make([]byte, len(pristine))
+}
+
+func BenchmarkParseMFTRecord(b *testing.B) {
+	pristine, scratch := benchmarkRecord(b)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		copy(scratch, pristine)
+		entry, err := ParseMFTRecord(scratch, uint64(i), DefaultMFTRecordSize)
+		if err != nil {
+			b.Fatalf("ParseMFTRecord failed: %v", err)
+		}
+		_ = entry
+	}
+}
+
+func BenchmarkParseMFTRecordInto(b *testing.B) {
+	pristine, scratch := benchmarkRecord(b)
+	entry := &MFTEntry{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		copy(scratch, pristine)
+		if err := ParseMFTRecordInto(entry, scratch, uint64(i), DefaultMFTRecordSize); err != nil {
+			b.Fatalf("ParseMFTRecordInto failed: %v", err)
+		}
+	}
+}
 
 func BenchmarkBinaryReaderUint32(b *testing.B) {
 	data := make([]byte, 1024)
