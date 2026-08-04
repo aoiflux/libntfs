@@ -65,6 +65,15 @@ var (
 	// ErrVolumeClosed indicates the volume has been closed.
 	ErrVolumeClosed = errors.New("volume is closed")
 
+	// ErrReadOnlyVolume indicates the underlying volume handle does not support writes.
+	ErrReadOnlyVolume = errors.New("volume is read-only")
+
+	// ErrWriteUnsupported indicates the requested write operation is unsupported.
+	ErrWriteUnsupported = errors.New("write operation not supported")
+
+	// ErrWriteOutOfRange indicates a write extends beyond the current file bounds.
+	ErrWriteOutOfRange = errors.New("write out of range")
+
 	// ErrInvalidIndex indicates an index structure is invalid.
 	ErrInvalidIndex = errors.New("invalid index structure")
 

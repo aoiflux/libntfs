@@ -1,6 +1,7 @@
 package libntfs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 // Volume represents an NTFS volume with thread-safe access.
 type Volume struct {
 	reader io.ReaderAt // Underlying storage (disk, image file, etc.)
+	writer io.WriterAt // Optional writable storage for in-place updates
 
 	// Boot sector information
 	bootSector        *BootSector
@@ -67,6 +69,10 @@ func Open(reader io.ReaderAt) (*Volume, error) {
 				return &buf
 			},
 		},
+	}
+
+	if writer, ok := reader.(io.WriterAt); ok {
+		v.writer = writer
 	}
 
 	// Parse boot sector
@@ -282,7 +288,131 @@ func (v *Volume) ReadAt(p []byte, offset int64) (int, error) {
 		return 0, ErrVolumeClosed
 	}
 
+	if offset < 0 {
+		return 0, ErrInvalidOffset
+	}
+
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	sectorSize := int64(v.bytesPerSector)
+	if sectorSize > 0 {
+		unalignedOffset := offset%sectorSize != 0
+		unalignedLength := int64(len(p))%sectorSize != 0
+		if unalignedOffset || unalignedLength {
+			return v.readAtSectorAligned(p, offset, sectorSize)
+		}
+	}
+
 	return v.reader.ReadAt(p, offset)
+}
+
+func (v *Volume) readAtSectorAligned(p []byte, offset, sectorSize int64) (int, error) {
+	alignedStart := offset - (offset % sectorSize)
+	alignedEnd := alignUpInt64(offset+int64(len(p)), sectorSize)
+	if alignedEnd <= alignedStart {
+		return 0, ErrInvalidOffset
+	}
+
+	bufLen := alignedEnd - alignedStart
+	buf := make([]byte, bufLen)
+
+	n, err := v.reader.ReadAt(buf, alignedStart)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return 0, wrapIOError("read", alignedStart, len(buf), err)
+	}
+
+	start := offset - alignedStart
+	readLen := copy(p, buf[start:])
+	if readLen < len(p) {
+		return readLen, io.EOF
+	}
+	if err != nil {
+		return readLen, io.EOF
+	}
+
+	_ = n
+	return readLen, nil
+}
+
+// WriteAt writes len(p) bytes to the volume at the specified absolute offset.
+// This method is thread-safe and requires the underlying handle to implement io.WriterAt.
+func (v *Volume) WriteAt(p []byte, offset int64) (int, error) {
+	if v.IsClosed() {
+		return 0, ErrVolumeClosed
+	}
+
+	if v.writer == nil {
+		return 0, ErrReadOnlyVolume
+	}
+
+	if offset < 0 {
+		return 0, ErrInvalidOffset
+	}
+
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	sectorSize := int64(v.bytesPerSector)
+	if sectorSize > 0 {
+		unalignedOffset := offset%sectorSize != 0
+		unalignedLength := int64(len(p))%sectorSize != 0
+		if unalignedOffset || unalignedLength {
+			return v.writeAtSectorAligned(p, offset, sectorSize)
+		}
+	}
+
+	n, err := v.writer.WriteAt(p, offset)
+	if err != nil {
+		return n, wrapIOError("write", offset, len(p), err)
+	}
+
+	return n, nil
+}
+
+func (v *Volume) writeAtSectorAligned(p []byte, offset, sectorSize int64) (int, error) {
+	alignedStart := offset - (offset % sectorSize)
+	alignedEnd := alignUpInt64(offset+int64(len(p)), sectorSize)
+	if alignedEnd <= alignedStart {
+		return 0, ErrInvalidOffset
+	}
+
+	bufLen := alignedEnd - alignedStart
+	buf := make([]byte, bufLen)
+
+	if _, err := v.reader.ReadAt(buf, alignedStart); err != nil {
+		return 0, wrapIOError("read", alignedStart, len(buf), err)
+	}
+
+	copy(buf[offset-alignedStart:], p)
+
+	n, err := v.writer.WriteAt(buf, alignedStart)
+	if err != nil {
+		return 0, wrapIOError("write", alignedStart, len(buf), err)
+	}
+	if n != len(buf) {
+		return 0, wrapIOError("write", alignedStart, len(buf), io.ErrShortWrite)
+	}
+
+	return len(p), nil
+}
+
+func alignUpInt64(v, align int64) int64 {
+	if align <= 0 {
+		return v
+	}
+	rem := v % align
+	if rem == 0 {
+		return v
+	}
+	return v + (align - rem)
+}
+
+// IsWritable reports whether this volume supports in-place writes.
+func (v *Volume) IsWritable() bool {
+	return v.writer != nil
 }
 
 // ReadClusters reads the specified number of clusters starting at the given cluster.

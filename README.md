@@ -88,6 +88,9 @@ Implemented:
 Current limitations:
 
 - Encrypted file data: detection only (returns ErrEncryptedData)
+- Write support is limited to in-place overwrite of non-resident, non-sparse,
+  non-compressed, non-encrypted streams on writable handles (no resident writes
+  and no file growth/truncation)
 
 ## API Highlights
 
@@ -102,6 +105,8 @@ File-level:
 
 - (*File).Read(p []byte) (int, error)
 - (*File).ReadAt(p []byte, off int64) (int, error)
+- (*File).Write(p []byte) (int, error)
+- (*File).WriteAt(p []byte, off int64) (int, error)
 - (*File).ReadAll() ([]byte, error)
 - (*File).ReadDir() ([]DirEntry, error)
 - (*File).ReadSupport() FileReadSupport
@@ -173,6 +178,8 @@ You can also use disk image files directly on all platforms.
 - examples/bench: end-to-end traversal and sampled read throughput benchmark
 - examples/finfo: structured metadata for a specific file path (offsets, size,
   fragments, timestamps)
+- examples/overwrite: guarded in-place overwrite at logical file offsets with
+  user-supplied end-bound checks
 
 Run one example:
 

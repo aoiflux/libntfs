@@ -745,10 +745,10 @@ func (v *Volume) ReadDataRuns(runs []DataRun, offset int64, buf []byte) (int, er
 			clusterOffset := cluster * uint64(v.bytesPerCluster)
 			readOffset := int64(clusterOffset + offsetInRun)
 
-			n, err := v.reader.ReadAt(buf[bytesRead:bytesRead+readLen], readOffset)
+			n, err := v.ReadAt(buf[bytesRead:bytesRead+readLen], readOffset)
 			bytesRead += n
 			if err != nil {
-				return bytesRead, wrapIOError("read", readOffset, readLen, err)
+				return bytesRead, err
 			}
 		}
 
@@ -760,4 +760,83 @@ func (v *Volume) ReadDataRuns(runs []DataRun, offset int64, buf []byte) (int, er
 	}
 
 	return bytesRead, nil
+}
+
+// WriteDataRuns writes data into non-resident data runs at the logical stream offset.
+//
+// This method performs in-place overwrites only. It does not allocate clusters,
+// update metadata, or support sparse/compressed/encrypted streams.
+func (v *Volume) WriteDataRuns(runs []DataRun, offset int64, buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if offset < 0 {
+		return 0, ErrInvalidOffset
+	}
+
+	if !v.IsWritable() {
+		return 0, ErrReadOnlyVolume
+	}
+
+	bytesWritten := 0
+	offsetU := uint64(offset)
+	currentOffset := uint64(0)
+
+	for _, run := range runs {
+		runBytes := run.LengthClusters * uint64(v.bytesPerCluster)
+
+		// Skip runs before our offset.
+		if currentOffset+runBytes <= offsetU {
+			currentOffset += runBytes
+			continue
+		}
+
+		// Calculate write position within this run.
+		offsetInRun := uint64(0)
+		if offsetU > currentOffset {
+			offsetInRun = offsetU - currentOffset
+		}
+
+		bytesToWrite := uint64(len(buf) - bytesWritten)
+		bytesAvailable := runBytes - offsetInRun
+		if bytesToWrite > bytesAvailable {
+			bytesToWrite = bytesAvailable
+		}
+
+		writeLen := int(bytesToWrite)
+
+		if run.IsSparse {
+			return bytesWritten, fmt.Errorf("%w: %v", ErrWriteUnsupported, ErrSparseData)
+		}
+
+		if run.StartCluster < 0 {
+			return bytesWritten, fmt.Errorf("%w: negative start cluster %d", ErrInvalidDataRun, run.StartCluster)
+		}
+
+		cluster := uint64(run.StartCluster)
+		clusterOffset := cluster * uint64(v.bytesPerCluster)
+		writeOffset := int64(clusterOffset + offsetInRun)
+
+		n, err := v.WriteAt(buf[bytesWritten:bytesWritten+writeLen], writeOffset)
+		bytesWritten += n
+		if err != nil {
+			return bytesWritten, err
+		}
+
+		if n != writeLen {
+			return bytesWritten, io.ErrShortWrite
+		}
+
+		currentOffset += runBytes
+
+		if bytesWritten >= len(buf) {
+			break
+		}
+	}
+
+	if bytesWritten < len(buf) {
+		return bytesWritten, io.EOF
+	}
+
+	return bytesWritten, nil
 }

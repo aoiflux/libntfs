@@ -76,6 +76,18 @@ byte offsets, fragmentation, and timestamps.
 ./finfo disk.img /Windows/System32/notepad.exe
 ```
 
+### 7. overwrite - Guarded In-Place File Overwrite
+
+Writes bytes to a file at a logical offset, with a caller-provided end boundary
+to prevent accidental out-of-range writes.
+
+On Windows raw volume paths (`\\.\\C:` style), this example attempts
+`FSCTL_LOCK_VOLUME` before writing and unlocks on exit.
+
+```bash
+./overwrite disk.img /notes.txt 0x10 HELLO 0x40
+```
+
 ## Building Examples
 
 ```bash
@@ -211,6 +223,8 @@ Many NTFS disk images are available for testing:
 ## Security Notes
 
 - **Administrator/Root Access**: Required for raw drive access
-- **Read-Only**: This library only reads data; it cannot modify NTFS volumes
+- **Write Safety**: Write support is intentionally limited and only supports
+  in-place overwrite of non-resident, non-sparse, non-compressed, non-encrypted
+  streams on writable handles
 - **Mounted Volumes**: Be careful accessing mounted volumes; prefer unmounted
   for consistency

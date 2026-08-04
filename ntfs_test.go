@@ -29,6 +29,40 @@ func (m *mockReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+type mockReadWriterAt struct {
+	data []byte
+}
+
+func (m *mockReadWriterAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, io.EOF
+	}
+	if off >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+
+	n := copy(p, m.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (m *mockReadWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, io.EOF
+	}
+	if off >= int64(len(m.data)) {
+		return 0, io.EOF
+	}
+
+	n := copy(m.data[off:], p)
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
 type mockFileInfo struct {
 	name string
 	mode fs.FileMode
@@ -106,6 +140,52 @@ func TestOpenRejectsDirectoryInput(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInputIsDirectory) {
 		t.Fatalf("expected ErrInputIsDirectory, got %v", err)
+	}
+}
+
+func TestVolumeWriteAtSectorAlignedFallback(t *testing.T) {
+	backend := &mockReadWriterAt{data: []byte("0123456789ABCDEF")}
+	v := &Volume{
+		reader:         backend,
+		writer:         backend,
+		bytesPerSector: 8,
+	}
+
+	n, err := v.WriteAt([]byte("XY"), 3)
+	if err != nil {
+		t.Fatalf("WriteAt returned unexpected error: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("WriteAt bytes written = %d, want 2", n)
+	}
+
+	got := string(backend.data)
+	want := "012XY56789ABCDEF"
+	if got != want {
+		t.Fatalf("backend after write = %q, want %q", got, want)
+	}
+}
+
+func TestVolumeWriteAtAlignedPassthrough(t *testing.T) {
+	backend := &mockReadWriterAt{data: []byte("0123456789ABCDEF")}
+	v := &Volume{
+		reader:         backend,
+		writer:         backend,
+		bytesPerSector: 8,
+	}
+
+	n, err := v.WriteAt([]byte("WXYZ1234"), 8)
+	if err != nil {
+		t.Fatalf("WriteAt returned unexpected error: %v", err)
+	}
+	if n != 8 {
+		t.Fatalf("WriteAt bytes written = %d, want 8", n)
+	}
+
+	got := string(backend.data)
+	want := "01234567WXYZ1234"
+	if got != want {
+		t.Fatalf("backend after write = %q, want %q", got, want)
 	}
 }
 
@@ -521,6 +601,83 @@ func TestFileReadSupport(t *testing.T) {
 			t.Fatalf("expected ErrNotFile, got %v", support.BlockingError)
 		}
 	})
+}
+
+func TestFileWriteAtAcrossNonResidentRuns(t *testing.T) {
+	const clusterSize = uint32(8)
+	backend := &mockReadWriterAt{data: make([]byte, 64)}
+
+	v := &Volume{
+		reader:          backend,
+		writer:          backend,
+		bytesPerCluster: clusterSize,
+	}
+
+	f := &File{
+		volume: v,
+		size:   16,
+		dataAttr: &Attribute{
+			NonResident: &NonResidentAttribute{
+				RealSize: 16,
+				DataRuns: []DataRun{
+					{LengthClusters: 1, StartCluster: 1},
+					{LengthClusters: 1, StartCluster: 3},
+				},
+			},
+		},
+	}
+
+	n, err := f.WriteAt([]byte("WXYZ"), 6)
+	if err != nil {
+		t.Fatalf("WriteAt returned unexpected error: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("WriteAt bytes written = %d, want 4", n)
+	}
+
+	if got := backend.data[14]; got != 'W' {
+		t.Fatalf("byte at offset 14 = %q, want 'W'", got)
+	}
+	if got := backend.data[15]; got != 'X' {
+		t.Fatalf("byte at offset 15 = %q, want 'X'", got)
+	}
+	if got := backend.data[24]; got != 'Y' {
+		t.Fatalf("byte at offset 24 = %q, want 'Y'", got)
+	}
+	if got := backend.data[25]; got != 'Z' {
+		t.Fatalf("byte at offset 25 = %q, want 'Z'", got)
+	}
+}
+
+func TestFileWriteAtReadOnlyVolume(t *testing.T) {
+	f := &File{
+		volume: &Volume{reader: &mockReaderAt{data: make([]byte, 64)}, bytesPerCluster: 8},
+		size:   8,
+		dataAttr: &Attribute{
+			NonResident: &NonResidentAttribute{DataRuns: []DataRun{{LengthClusters: 1, StartCluster: 1}}},
+		},
+	}
+
+	_, err := f.WriteAt([]byte("A"), 0)
+	if !errors.Is(err, ErrReadOnlyVolume) {
+		t.Fatalf("expected ErrReadOnlyVolume, got %v", err)
+	}
+}
+
+func TestFileWriteAtResidentUnsupported(t *testing.T) {
+	backend := &mockReadWriterAt{data: make([]byte, 64)}
+	f := &File{
+		volume: &Volume{reader: backend, writer: backend},
+		size:   4,
+		dataAttr: &Attribute{
+			Resident: &ResidentAttribute{Value: []byte("ABCD")},
+		},
+	}
+
+	_, err := f.WriteAt([]byte("Z"), 0)
+	if !errors.Is(err, ErrWriteUnsupported) {
+		t.Fatalf("expected ErrWriteUnsupported, got %v", err)
+	}
 }
 
 func TestAttributeReadSupport(t *testing.T) {

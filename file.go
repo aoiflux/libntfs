@@ -518,6 +518,94 @@ func (f *File) ReadAt(p []byte, offset int64) (int, error) {
 	return 0, fmt.Errorf("no data in $DATA attribute")
 }
 
+// Write writes len(p) bytes to the file at the current file offset.
+// The current offset is advanced by the number of bytes written.
+func (f *File) Write(p []byte) (int, error) {
+	f.readMu.Lock()
+	defer f.readMu.Unlock()
+
+	n, err := f.WriteAt(p, f.readPos)
+	f.readPos += int64(n)
+	return n, err
+}
+
+// WriteAt writes len(p) bytes to the file starting at the logical file offset.
+//
+// Current write support is intentionally narrow to avoid unsafe NTFS metadata edits:
+// - Requires writable underlying handle (io.WriterAt)
+// - Requires non-resident primary $DATA stream
+// - Refuses sparse, compressed, and encrypted streams
+// - Does not extend file size
+func (f *File) WriteAt(p []byte, offset int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	if f.volume.IsClosed() {
+		return 0, ErrVolumeClosed
+	}
+
+	if !f.volume.IsWritable() {
+		return 0, ErrReadOnlyVolume
+	}
+
+	if f.isDir {
+		return 0, ErrNotFile
+	}
+
+	if offset < 0 {
+		return 0, ErrInvalidOffset
+	}
+
+	if f.dataAttr == nil {
+		return 0, ErrWriteUnsupported
+	}
+
+	if offset >= int64(f.size) {
+		return 0, io.EOF
+	}
+
+	if f.dataAttr.Resident != nil {
+		return 0, fmt.Errorf("%w: resident $DATA stream", ErrWriteUnsupported)
+	}
+
+	if f.dataAttr.NonResident == nil {
+		return 0, ErrWriteUnsupported
+	}
+
+	if f.dataAttr.IsEncrypted() {
+		return 0, fmt.Errorf("%w: %v", ErrWriteUnsupported, ErrEncryptedData)
+	}
+
+	if f.dataAttr.IsCompressed() {
+		return 0, fmt.Errorf("%w: %v", ErrWriteUnsupported, ErrCompressedData)
+	}
+
+	if f.dataAttr.IsSparse() {
+		return 0, fmt.Errorf("%w: %v", ErrWriteUnsupported, ErrSparseData)
+	}
+
+	bytesToWrite := len(p)
+	if offset+int64(bytesToWrite) > int64(f.size) {
+		bytesToWrite = int(int64(f.size) - offset)
+	}
+
+	if bytesToWrite <= 0 {
+		return 0, io.EOF
+	}
+
+	n, err := f.volume.WriteDataRuns(f.dataAttr.NonResident.DataRuns, offset, p[:bytesToWrite])
+	if err != nil {
+		return n, err
+	}
+
+	if bytesToWrite < len(p) {
+		return n, io.EOF
+	}
+
+	return n, nil
+}
+
 // ReadAll reads the entire file contents.
 func (f *File) ReadAll() ([]byte, error) {
 	if f.isDir {
