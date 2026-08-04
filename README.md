@@ -83,6 +83,9 @@ Implemented:
   DirEntry.Deleted)
 - Update sequence (fixup) validation
 - Standalone $MFT record parsing without a volume
+- Alternate data stream enumeration and reading
+- Security descriptor parsing with $Secure lookup (owner, group, DACL, SACL)
+- USN change journal parsing from a volume or an extracted $J file
 - File name namespace handling (DOS/Win32/WinDOS/POSIX)
 - Typed error model with context wrappers (including path traversal errors)
 
@@ -91,9 +94,9 @@ Current limitations:
 - Encrypted file data: detection only (returns ErrEncryptedData)
 - Standalone $MFT records expose metadata and data run maps, but their content
   cannot be read: that requires cluster access, which only a Volume provides
-- Write support is limited to in-place overwrite of non-resident, non-sparse,
-  non-compressed, non-encrypted streams on writable handles (no resident writes
-  and no file growth/truncation)
+- Write support is limited to in-place overwrite on writable handles: no file
+  growth or truncation, no sparse, compressed, or encrypted streams, and a
+  resident value cannot change length
 
 ## API Highlights
 
@@ -122,6 +125,26 @@ File-level:
 - (*File).ReadDir() ([]DirEntry, error)
 - (*File).ReadSupport() FileReadSupport
 
+Stream-level:
+
+- (*File).Streams() []StreamInfo
+- (*File).OpenStream(name string) (*File, error)
+- (*MFTEntry).DataStreams() []*Attribute
+
+Journal-level:
+
+- ParseUSNRecord(buf []byte) (*USNRecord, int, error)
+- EachUSNRecord(buf []byte, fn func(*USNRecord) error) error
+- (*Volume).OpenUSNJournal() (*File, error)
+- (*Volume).EachUSNRecord(fn func(*USNRecord) error) error
+
+Security-level:
+
+- ParseSecurityDescriptor(buf []byte) (*SecurityDescriptor, error)
+- (*File).SecurityDescriptor() (*SecurityDescriptor, error)
+- (*Volume).SecurityDescriptorByID(securityID uint32) (*SecurityDescriptor, error)
+- (*Volume).EachSecurityDescriptor(fn func(uint32, *SecurityDescriptor) error) error
+
 Attribute-level:
 
 - (*Attribute).ReadSupport() FileReadSupport
@@ -132,6 +155,13 @@ Attribute-level:
 Use `ReadSupport` to check whether the primary `$DATA` stream is readable, and
 whether it is resident, sparse, compressed, or encrypted, before calling `Read`,
 `ReadAt`, or `ReadAll`.
+
+`WriteAt` overwrites both non-resident and resident streams in place. A
+non-resident stream is written to its clusters; a resident one, whose content
+sits inside the MFT record, is patched by rewriting that record with its update
+sequence reapplied and evicting the cached entry. Neither path changes a file's
+length, and a resident value cannot grow, since that would mean resizing the
+attribute and shifting every attribute after it in the record.
 
 Use `(*Attribute).ReadSupport()` for alternate or named `$DATA` streams when you
 are inspecting attributes directly.
@@ -212,6 +242,95 @@ err := vol.EachMFTEntry(func(entryNum uint64, e *libntfs.MFTEntry) error {
 })
 ```
 
+## Alternate Data Streams and Access Control
+
+Every `$DATA` stream on a file is reachable, not just the default one. Because
+`OpenStream` hands back a `File`, the ordinary read API works on an alternate
+stream, compression and sparse handling included.
+
+```go
+f, err := vol.OpenPath("/Users/bob/download.exe")
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, s := range f.Streams() {
+    name := s.Name
+    if name == "" {
+        name = "(unnamed)"
+    }
+    fmt.Printf("%-20s %d bytes\n", name, s.Size)
+}
+
+zone, err := f.OpenStream("Zone.Identifier")
+if err == nil {
+    data, _ := zone.ReadAll()
+    fmt.Printf("%s", data)
+}
+```
+
+Security descriptors resolve through `$Secure`, so a file answers who could
+reach it:
+
+```go
+sd, err := f.SecurityDescriptor()
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("owner: %s\n", sd.Owner)
+if sd.DACL == nil {
+    // An absent DACL grants everyone full access; an empty one denies everyone.
+    fmt.Println("dacl: absent (grants everyone)")
+} else {
+    for _, ace := range sd.DACL.ACEs {
+        fmt.Printf("%s %s %v\n", ace.TypeName(), ace.Trustee, ace.RightsNames())
+    }
+}
+```
+
+`(*SID).WellKnownName` maps the common SIDs to names such as
+`BUILTIN\Administrators`. `$Secure:$SDS` is read and indexed on first use and
+cached for the life of the volume, so per-file lookups are cheap.
+
+## USN Change Journal
+
+The journal records every create, delete, rename, and write, which makes it the
+densest activity timeline on a volume. Read it from a volume:
+
+```go
+err := vol.EachUSNRecord(func(r *libntfs.USNRecord) error {
+    fmt.Printf("%d\t%s\t%s\t%v\n",
+        r.USN, r.Timestamp.Format(time.RFC3339), r.Name, r.ReasonNames())
+    return nil
+})
+```
+
+`$J` is routinely gigabytes, so the volume walk reads it in chunks and skips the
+sparse region at its front using the stream's data runs rather than scanning
+through it.
+
+An extracted `$J` file parses with no volume at all:
+
+```go
+data, err := os.ReadFile("$J")
+if err != nil {
+    log.Fatal(err)
+}
+
+err = libntfs.EachUSNRecord(data, func(r *libntfs.USNRecord) error {
+    if r.Reason&libntfs.USNReasonFileDelete != 0 {
+        fmt.Printf("deleted: %s (entry %d)\n", r.Name, r.FileReference)
+    }
+    return nil
+})
+```
+
+Zero-filled and malformed regions are skipped rather than ending the walk, so a
+partially damaged journal still yields the records around the damage. Version 4
+extent records carry no timestamp or file name and report that rather than
+inventing one.
+
 ## Error Handling
 
 libntfs uses standard wrapping semantics so errors.Is and errors.As work
@@ -269,6 +388,9 @@ You can also use disk image files directly on all platforms.
   user-supplied end-bound checks
 - examples/mftdump: MFT record timeline from either a standalone $MFT file or a
   full volume
+- examples/streams: data streams and access control for a path or MFT entry,
+  with alternate-stream hunting and extraction
+- examples/usnjrnl: USN change journal timeline from a volume or an extracted $J
 
 Run one example:
 

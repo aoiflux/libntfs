@@ -38,7 +38,7 @@ package libntfs
 // Version information
 const (
 	// Version is the current library version
-	Version = "0.1.5"
+	Version = "0.2.0"
 
 	// Author information
 	Author = "libntfs contributors"

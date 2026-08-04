@@ -38,6 +38,11 @@ type Volume struct {
 	mftParentMapInit     bool                               // True when mftParentMap has been populated
 	useMFTParentFallback bool                               // Enable expensive full-MFT parent-link fallback in ReadDir
 
+	securityMap  map[uint32]*SecurityDescriptor // $Secure:$SDS descriptors keyed by security ID
+	securityMu   sync.RWMutex                   // Protects securityMap state
+	securityInit bool                           // True when securityMap has been populated
+	securityErr  error                          // Sticky error from the $SDS load
+
 	// State
 	closed  bool
 	closeMu sync.RWMutex

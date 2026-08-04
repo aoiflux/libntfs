@@ -511,6 +511,14 @@ func parseMFTRecordCore(entry *MFTEntry, buf []byte, entryNum uint64, recordSize
 	if err != nil {
 		return fmt.Errorf("parse attributes failed: %w", err)
 	}
+
+	// Record which MFT entry these attribute bytes came from, so an in-place
+	// edit knows which record to write back.
+	for _, attr := range attrs {
+		attr.sourceRecord = entryNum
+		attr.sourceKnown = true
+	}
+
 	entry.Attributes = attrs
 
 	return nil

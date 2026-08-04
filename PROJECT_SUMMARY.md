@@ -42,6 +42,10 @@ The implementation is organized in layers:
 - Volume lifecycle and metadata: volume.go
 - MFT and data-run resolution: mft.go
 - Volume-free MFT record parsing: mftrecord.go
+- Data stream access including alternates: streams.go
+- Security descriptors and $Secure lookup: security.go, secure.go
+- USN change journal parsing: usn.go
+- MFT record write-back and resident writes: mftwrite.go
 - Attribute parsing: attributes.go
 - File and directory API surface: file.go
 - Error model: errors.go

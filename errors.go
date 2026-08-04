@@ -79,6 +79,15 @@ var (
 
 	// ErrCacheFull indicates the cache is full.
 	ErrCacheFull = errors.New("cache is full")
+
+	// ErrInvalidSecurityDescriptor indicates a malformed security descriptor.
+	ErrInvalidSecurityDescriptor = errors.New("invalid or malformed security descriptor")
+
+	// ErrSecurityDescriptorNotFound indicates no descriptor exists for a security ID.
+	ErrSecurityDescriptorNotFound = errors.New("security descriptor not found")
+
+	// ErrInvalidUSNRecord indicates a malformed USN change journal record.
+	ErrInvalidUSNRecord = errors.New("invalid or malformed USN record")
 )
 
 // VolumeError wraps errors specific to volume operations.

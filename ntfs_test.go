@@ -664,7 +664,11 @@ func TestFileWriteAtReadOnlyVolume(t *testing.T) {
 	}
 }
 
-func TestFileWriteAtResidentUnsupported(t *testing.T) {
+// TestFileWriteAtResidentWithoutSourceRecord covers a resident attribute whose
+// originating MFT record is unknown, which is how merged $ATTRIBUTE_LIST
+// attributes arrive. Patching one would write to the wrong record, so it is
+// refused even though resident writes are otherwise supported.
+func TestFileWriteAtResidentWithoutSourceRecord(t *testing.T) {
 	backend := &mockReadWriterAt{data: make([]byte, 64)}
 	f := &File{
 		volume: &Volume{reader: backend, writer: backend},
@@ -1287,6 +1291,7 @@ type testRecordOpts struct {
 	modifyTime    time.Time
 	mftChangeTime time.Time
 	accessTime    time.Time
+	securityID    uint32   // $STANDARD_INFORMATION security ID, indexing $Secure
 	extraAttrs    [][]byte // Appended after $STANDARD_INFORMATION and $FILE_NAME
 }
 
@@ -1310,7 +1315,9 @@ func buildResidentAttr(attrType uint32, attrID uint16, value []byte) []byte {
 
 // buildStandardInfoAttrValue builds a $STANDARD_INFORMATION value including the
 // Windows 2000+ extended fields.
-func buildStandardInfoAttrValue(create, modify, mftChange, access time.Time, fileAttrs uint32) []byte {
+func buildStandardInfoAttrValue(create, modify, mftChange, access time.Time,
+	fileAttrs, securityID uint32,
+) []byte {
 	buf := make([]byte, 72)
 
 	WriteUint64LE(buf, 0, TimeToNTFSTime(create))
@@ -1318,6 +1325,7 @@ func buildStandardInfoAttrValue(create, modify, mftChange, access time.Time, fil
 	WriteUint64LE(buf, 16, TimeToNTFSTime(mftChange))
 	WriteUint64LE(buf, 24, TimeToNTFSTime(access))
 	WriteUint32LE(buf, 32, fileAttrs)
+	WriteUint32LE(buf, 52, securityID)
 
 	return buf
 }
@@ -1344,7 +1352,7 @@ func buildTestMFTRecord(t testing.TB, opts testRecordOpts) []byte {
 	buf := make([]byte, recordSize)
 
 	si := buildResidentAttr(AttrTypeStandardInfo, 0, buildStandardInfoAttrValue(
-		opts.createTime, opts.modifyTime, opts.mftChangeTime, opts.accessTime, 0x20,
+		opts.createTime, opts.modifyTime, opts.mftChangeTime, opts.accessTime, 0x20, opts.securityID,
 	))
 	fn := buildResidentAttr(AttrTypeFileName, 1, buildFileNameAttrValue(
 		5, 5, opts.name, opts.namespace, 4096, 4096, 0x20,
@@ -1478,6 +1486,20 @@ func buildTestBootSector(bytesPerSector uint16, sectorsPerCluster uint8, totalSe
 func buildTestNTFSImage(t testing.TB, records [][]byte) []byte {
 	t.Helper()
 
+	byEntry := make(map[uint64][]byte, len(records))
+	for i, record := range records {
+		byEntry[uint64(i)+1] = record // Entry 0 is generated as $MFT
+	}
+
+	return buildTestNTFSImageAt(t, byEntry)
+}
+
+// buildTestNTFSImageAt is buildTestNTFSImage with records placed at explicit
+// entry numbers, so fixtures can populate well-known entries such as $Secure.
+// Entry 0 is always generated as $MFT and must not be supplied.
+func buildTestNTFSImageAt(t testing.TB, records map[uint64][]byte) []byte {
+	t.Helper()
+
 	const (
 		bytesPerSector    = 512
 		sectorsPerCluster = 8
@@ -1487,9 +1509,20 @@ func buildTestNTFSImage(t testing.TB, records [][]byte) []byte {
 		totalClusters     = 16
 	)
 
+	if _, exists := records[0]; exists {
+		t.Fatal("entry 0 is generated as $MFT and must not be supplied")
+	}
+
+	var highest uint64
+	for entryNum := range records {
+		if entryNum > highest {
+			highest = entryNum
+		}
+	}
+
 	// Records per cluster is exact for these sizes, so the MFT covers every slot.
-	recordsPerCluster := clusterSize / recordSize
-	mftClusters := uint64((len(records) + 1 + recordsPerCluster - 1) / recordsPerCluster)
+	recordsPerCluster := uint64(clusterSize / recordSize)
+	mftClusters := (highest + 1 + recordsPerCluster - 1) / recordsPerCluster
 	if mftClusters == 0 {
 		mftClusters = 1
 	}
@@ -1507,15 +1540,81 @@ func buildTestNTFSImage(t testing.TB, records [][]byte) []byte {
 	copy(image, buildTestBootSector(bytesPerSector, sectorsPerCluster,
 		totalClusters*sectorsPerCluster, mftCluster))
 
-	for i, record := range append([][]byte{mftRecord}, records...) {
-		offset := mftCluster*clusterSize + i*recordSize
+	place := func(entryNum uint64, record []byte) {
+		offset := mftCluster*clusterSize + int(entryNum)*recordSize
 		if offset+len(record) > len(image) {
-			t.Fatalf("record %d does not fit in the test image", i)
+			t.Fatalf("record %d does not fit in the test image", entryNum)
 		}
 		copy(image[offset:], record)
 	}
 
+	place(0, mftRecord)
+	for entryNum, record := range records {
+		place(entryNum, record)
+	}
+
 	return image
+}
+
+// buildNamedResidentAttr builds a resident attribute carrying an attribute name,
+// which is how alternate data streams and $Secure's $SDS stream are stored.
+func buildNamedResidentAttr(attrType uint32, attrID uint16, name string, value []byte) []byte {
+	nameBytes := utf16LEFromString(name)
+	nameOffset := ResidentAttributeHeaderSize
+	valueOffset := AlignUp(nameOffset+len(nameBytes), 8)
+	length := AlignUp(valueOffset+len(value), 8)
+
+	attr := make([]byte, length)
+
+	WriteUint32LE(attr, 0, attrType)
+	WriteUint32LE(attr, 4, uint32(length))
+	attr[8] = 0 // Resident
+	attr[9] = uint8(len([]rune(name)))
+	WriteUint16LE(attr, 10, uint16(nameOffset))
+	WriteUint16LE(attr, 14, attrID)
+	WriteUint32LE(attr, 16, uint32(len(value)))
+	WriteUint16LE(attr, 20, uint16(valueOffset))
+	copy(attr[nameOffset:], nameBytes)
+	copy(attr[valueOffset:], value)
+
+	return attr
+}
+
+// buildNamedNonResidentDataAttr builds a named non-resident $DATA attribute
+// backed by a single data run, for alternate data streams held outside the MFT.
+func buildNamedNonResidentDataAttr(t testing.TB, attrID uint16, name string,
+	startCluster, clusters uint64, clusterSize uint32, realSize uint64,
+) []byte {
+	t.Helper()
+
+	if startCluster > 0x7F || clusters > 0x7F {
+		t.Fatalf("test data run needs single-byte fields, got start=%d clusters=%d", startCluster, clusters)
+	}
+
+	nameBytes := utf16LEFromString(name)
+	nameOffset := NonResidentAttributeHeaderSize
+	dataRunOffset := AlignUp(nameOffset+len(nameBytes), 8)
+
+	run := []byte{0x11, byte(clusters), byte(startCluster), 0x00}
+	length := AlignUp(dataRunOffset+len(run), 8)
+	attr := make([]byte, length)
+
+	WriteUint32LE(attr, 0, AttrTypeData)
+	WriteUint32LE(attr, 4, uint32(length))
+	attr[8] = 1 // Non-resident
+	attr[9] = uint8(len([]rune(name)))
+	WriteUint16LE(attr, 10, uint16(nameOffset))
+	WriteUint16LE(attr, 14, attrID)
+	WriteUint64LE(attr, 16, 0)          // Starting VCN
+	WriteUint64LE(attr, 24, clusters-1) // Last VCN
+	WriteUint16LE(attr, 32, uint16(dataRunOffset))
+	WriteUint64LE(attr, 40, clusters*uint64(clusterSize)) // Allocated size
+	WriteUint64LE(attr, 48, realSize)                     // Real size
+	WriteUint64LE(attr, 56, realSize)                     // Initialized size
+	copy(attr[nameOffset:], nameBytes)
+	copy(attr[dataRunOffset:], run)
+
+	return attr
 }
 
 func TestOpenImageAndWalkMFT(t *testing.T) {
@@ -1653,6 +1752,97 @@ func TestParseMFTRecordParityWithOpenedImage(t *testing.T) {
 	if !reflect.DeepEqual(bufSI, volSI) {
 		t.Fatalf("standard information mismatch:\nstandalone %+v\nvolume     %+v", bufSI, volSI)
 	}
+}
+
+// buildSparseThenDataAttr builds a named non-resident $DATA attribute whose
+// first run is sparse, the shape the USN journal's $J stream has on a real
+// volume. Sparse runs carry no offset, so the following run's offset is
+// absolute rather than relative.
+func buildSparseThenDataAttr(t testing.TB, attrID uint16, name string,
+	sparseClusters, startCluster, dataClusters uint64, clusterSize uint32, realSize uint64,
+) []byte {
+	t.Helper()
+
+	if startCluster > 0x7F || dataClusters > 0x7F || sparseClusters > 0x7F {
+		t.Fatalf("test data runs need single-byte fields")
+	}
+
+	nameBytes := utf16LEFromString(name)
+	nameOffset := NonResidentAttributeHeaderSize
+	dataRunOffset := AlignUp(nameOffset+len(nameBytes), 8)
+
+	runs := []byte{
+		0x01, byte(sparseClusters), // Sparse run: length only, no offset
+		0x11, byte(dataClusters), byte(startCluster),
+		0x00,
+	}
+
+	length := AlignUp(dataRunOffset+len(runs), 8)
+	attr := make([]byte, length)
+
+	totalClusters := sparseClusters + dataClusters
+
+	WriteUint32LE(attr, 0, AttrTypeData)
+	WriteUint32LE(attr, 4, uint32(length))
+	attr[8] = 1 // Non-resident
+	attr[9] = uint8(len([]rune(name)))
+	WriteUint16LE(attr, 10, uint16(nameOffset))
+	WriteUint16LE(attr, 14, attrID)
+	WriteUint64LE(attr, 16, 0)               // Starting VCN
+	WriteUint64LE(attr, 24, totalClusters-1) // Last VCN
+	WriteUint16LE(attr, 32, uint16(dataRunOffset))
+	WriteUint64LE(attr, 40, totalClusters*uint64(clusterSize)) // Allocated size
+	WriteUint64LE(attr, 48, realSize)                          // Real size
+	WriteUint64LE(attr, 56, realSize)                          // Initialized size
+	copy(attr[nameOffset:], nameBytes)
+	copy(attr[dataRunOffset:], runs)
+
+	return attr
+}
+
+// buildIndexEntry builds a directory index entry pointing at an MFT entry.
+func buildIndexEntry(entryNum uint64, sequence uint16, stream []byte) []byte {
+	length := AlignUp(16+len(stream), 8)
+	buf := make([]byte, length)
+
+	// The file reference is 48 bits of entry number plus a 16-bit sequence.
+	WriteUint64LE(buf, 0, entryNum|uint64(sequence)<<48)
+	WriteUint16LE(buf, 8, uint16(length))
+	WriteUint16LE(buf, 10, uint16(len(stream)))
+	copy(buf[16:], stream)
+
+	return buf
+}
+
+// buildIndexRootValue builds an $INDEX_ROOT value holding the supplied entries
+// followed by the end-of-list marker every NTFS index terminates with.
+func buildIndexRootValue(indexBlockSize uint32, entries ...[]byte) []byte {
+	last := make([]byte, 16)
+	WriteUint16LE(last, 8, 16) // Entry length
+	last[12] = IndexFlagLast
+
+	var body []byte
+	for _, entry := range entries {
+		body = append(body, entry...)
+	}
+	body = append(body, last...)
+
+	buf := make([]byte, 32+len(body))
+
+	WriteUint32LE(buf, 0, AttrTypeFileName)
+	WriteUint32LE(buf, 4, CollationFileName)
+	WriteUint32LE(buf, 8, indexBlockSize)
+	buf[12] = 1 // Clusters per index record
+
+	// Node header offsets are relative to the node header itself, at byte 16.
+	WriteUint32LE(buf, 16, 16)                   // Entry list offset
+	WriteUint32LE(buf, 20, uint32(16+len(body))) // Entry list end
+	WriteUint32LE(buf, 24, uint32(16+len(body))) // Entry list allocated
+	WriteUint32LE(buf, 28, 0)                    // Leaf node
+
+	copy(buf[32:], body)
+
+	return buf
 }
 
 func TestParseMFTRecordRoundTrip(t *testing.T) {
@@ -2128,8 +2318,8 @@ func BenchmarkParseMFTRecord(b *testing.B) {
 	pristine, scratch := benchmarkRecord(b)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for i := 0; b.Loop(); i++ {
 		copy(scratch, pristine)
 		entry, err := ParseMFTRecord(scratch, uint64(i), DefaultMFTRecordSize)
 		if err != nil {
@@ -2144,8 +2334,8 @@ func BenchmarkParseMFTRecordInto(b *testing.B) {
 	entry := &MFTEntry{}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for i := 0; b.Loop(); i++ {
 		copy(scratch, pristine)
 		if err := ParseMFTRecordInto(entry, scratch, uint64(i), DefaultMFTRecordSize); err != nil {
 			b.Fatalf("ParseMFTRecordInto failed: %v", err)
@@ -2159,8 +2349,7 @@ func BenchmarkBinaryReaderUint32(b *testing.B) {
 		data[i] = byte(i)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		r := NewBinaryReader(data)
 		for r.Offset < len(data)-4 {
 			r.ReadUint32()
@@ -2169,15 +2358,15 @@ func BenchmarkBinaryReaderUint32(b *testing.B) {
 }
 
 func BenchmarkAlignUp(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		AlignUp(i%1000, 8)
 	}
 }
 
 func BenchmarkNTFSTimeConversion(b *testing.B) {
 	ntfsTime := uint64(132231936000000000)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		NTFSTimeToTime(ntfsTime)
 	}
 }
@@ -2203,8 +2392,7 @@ func BenchmarkGetMFTEntryOffsetManyRuns(b *testing.B) {
 	// Pick an entry that lands near the end of the run list.
 	entryNum := (uint64(runCount)*uint64(clusterSize))/uint64(v.mftRecordSize) - 2
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := v.getMFTEntryOffset(entryNum); err != nil {
 			b.Fatalf("getMFTEntryOffset failed: %v", err)
 		}
@@ -2235,8 +2423,7 @@ func BenchmarkReadDataRunsSmallWindowManyRuns(b *testing.B) {
 	buf := make([]byte, 4096)
 	offset := int64(int(clusterSize)*(runCount-8) + 128)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		n, err := v.ReadDataRuns(runs, offset, buf)
 		if err != nil && !errors.Is(err, io.EOF) {
 			b.Fatalf("ReadDataRuns failed: %v", err)

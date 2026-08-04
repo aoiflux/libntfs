@@ -5,6 +5,60 @@ All notable changes to the libntfs project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0]
+
+### Added
+- Alternate data stream access. `(*File).Streams` lists every `$DATA` stream on a
+  file with its size, storage, and readability; `(*File).OpenStream` returns a
+  `File` reading a named stream, so the whole existing read API — including
+  compressed and sparse handling — works on alternate streams unchanged.
+  `(*MFTEntry).DataStreams` enumerates streams with no Volume, composing with
+  `ParseMFTRecord` for standalone `$MFT` analysis.
+- Security descriptor parsing. `ParseSecurityDescriptor` decodes a self-relative
+  descriptor into owner and group `SID`s and DACL/SACL `ACE`s, with
+  `(*SID).String`, `(*SID).WellKnownName`, `(ACE).TypeName`, and
+  `(ACE).RightsNames` rendering them readably.
+- `$Secure` lookup. `(*Volume).SecurityDescriptorByID` and
+  `(*Volume).EachSecurityDescriptor` read and index `$Secure:$SDS` once per
+  volume, and `(*File).SecurityDescriptor` resolves a file's descriptor through
+  its own `$SECURITY_DESCRIPTOR` attribute when present, otherwise through
+  `StandardInformation.SecurityID`.
+- `ErrInvalidSecurityDescriptor` and `ErrSecurityDescriptorNotFound`.
+- `examples/streams`, reporting the streams and access control of a path or MFT
+  entry, with `-ads-only` to hunt for alternate data streams and `-dump` to
+  extract one.
+- USN change journal parsing. `ParseUSNRecord` and `EachUSNRecord` decode records
+  from a raw buffer with no Volume, for `$J` files extracted with KAPE or FTK
+  Imager. Versions 2, 3, and 4 are decoded; V4 extent records carry no timestamp
+  or name, and report that rather than mis-parsing one.
+- `(*Volume).OpenUSNJournal` resolves `\$Extend\$UsnJrnl:$J`, and
+  `(*Volume).EachUSNRecord` walks it. The journal is read in ~1 MiB chunks rather
+  than loaded whole, since `$J` routinely runs to gigabytes, and its sparse
+  leading region is skipped outright using the stream's data runs.
+- `(*USNRecord).ReasonNames` decodes the change reason bitmask, and
+  `(*USNRecord).IsDirectory` reports the record's target type.
+- `USNReason*` constants covering the documented change reasons, plus
+  `ErrInvalidUSNRecord`.
+- `examples/usnjrnl`, printing the journal as a timeline from either an
+  extracted `$J` or a full volume, with `-reason` and `-name` filters and a
+  `-json` mode.
+- Resident write support. `(*File).WriteAt` and `(*File).Write` now overwrite
+  resident `$DATA` streams, whose content lives inside the MFT record, by
+  rewriting that record with its update sequence reapplied. The MFT cache entry
+  is evicted so later reads see the new bytes. Existing callers need no changes:
+  `examples/overwrite` handles resident files with no modification.
+- `AttributeHeader.RecordOffset` reports where an attribute sits within its MFT
+  record, which locates it for in-place edits and for forensic reporting.
+
+### Changed
+- `(*File).WriteAt` no longer returns `ErrWriteUnsupported` for every resident
+  stream. It still refuses writes that would change a resident value's length,
+  since growing one would require resizing the attribute and shifting every
+  later attribute in the record, and refuses attributes merged in from an
+  extension record, whose bytes belong to a different MFT record.
+- Zero-filled and malformed regions of `$J` are skipped rather than ending the
+  walk, so damage in one region does not hide the records after it.
+
 ## [0.1.5]
 
 ### Added
@@ -253,11 +307,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 - [x] Compression support (read path, delivered in 0.1.1)
 - [x] Write support (limited to in-place overwrite, delivered in 0.1.5)
+- [x] Security descriptor parsing (delivered in 0.2.0)
+- [x] Alternate data stream enumeration (delivered in 0.2.0)
+- [x] USN Journal support (delivered in 0.2.0)
+- [x] Resident writes (same-length overwrite, delivered in 0.2.0)
 - [ ] Encryption support (EFS) — currently detection only
-- [ ] Resident writes, file growth, and truncation
-- [ ] USN Journal full support
-- [ ] Security descriptor parsing
-- [ ] Alternate data stream enumeration
+- [ ] File growth, truncation, and resident-to-non-resident conversion
 - [ ] Enhanced caching strategies
 - [ ] Memory-mapped I/O option
 
@@ -273,6 +328,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Version History
 
+- **0.2.0** - Alternate data streams, security descriptors, USN change journal,
+  and resident stream writes
 - **0.1.5** - Limited write support, volume-free MFT record parsing, bounded MFT
   iteration
 - **0.1.4** - Structured volume reporting

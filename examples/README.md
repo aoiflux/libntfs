@@ -79,7 +79,8 @@ byte offsets, fragmentation, and timestamps.
 ### 7. overwrite - Guarded In-Place File Overwrite
 
 Writes bytes to a file at a logical offset, with a caller-provided end boundary
-to prevent accidental out-of-range writes.
+to prevent accidental out-of-range writes. Works on both non-resident streams,
+written to their clusters, and resident streams, patched inside the MFT record.
 
 On Windows raw volume paths (`\\.\\C:` style), this example attempts
 `FSCTL_LOCK_VOLUME` before writing and unlocks on exit.
@@ -113,6 +114,47 @@ damaged table still yields everything readable around the damage.
 
 # Windows raw drive (run as Administrator)
 mftdump.exe \\.\C:
+```
+
+### 9. streams - Data Streams and Access Control
+
+Reports every `$DATA` stream on a file, including alternate data streams, along
+with the owner, group, and DACL resolved through `$Secure`.
+
+Target a path, or an MFT entry number when no directory index is available.
+
+```bash
+# Streams and access control for one file
+./streams disk.img /Users/bob/download.exe
+
+# Hunt for alternate data streams beneath a directory
+./streams -r -ads-only disk.img /Users
+
+# Extract one stream's contents
+./streams -dump Zone.Identifier disk.img /Users/bob/download.exe
+
+# Target by MFT entry number instead of a path
+./streams -entry 42 disk.img
+```
+
+### 10. usnjrnl - USN Change Journal Timeline
+
+Prints the change journal, which records every create, delete, rename, and
+write. Accepts either an extracted `$J` file or a full volume, detected from the
+input, and can be forced with `-standalone`.
+
+```bash
+# Extracted journal file
+./usnjrnl ./\$J
+
+# Whole volume, deletions only
+./usnjrnl -reason Delete disk.img
+
+# Executables, first 50 records
+./usnjrnl -name .exe -limit 50 disk.img
+
+# JSON Lines for piping
+./usnjrnl -json disk.img | jq -r 'select(.reasons[] == "FileDelete") | .name'
 ```
 
 ## Building Examples

@@ -533,9 +533,14 @@ func (f *File) Write(p []byte) (int, error) {
 //
 // Current write support is intentionally narrow to avoid unsafe NTFS metadata edits:
 // - Requires writable underlying handle (io.WriterAt)
-// - Requires non-resident primary $DATA stream
 // - Refuses sparse, compressed, and encrypted streams
 // - Does not extend file size
+//
+// Non-resident streams are written directly to their clusters. Resident streams,
+// whose content lives inside the MFT record, are patched by rewriting that record
+// with its fixups reapplied; the value cannot change length, and an attribute
+// merged in from an extension record is refused rather than risking a write to
+// the wrong record.
 func (f *File) WriteAt(p []byte, offset int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -566,7 +571,7 @@ func (f *File) WriteAt(p []byte, offset int64) (int, error) {
 	}
 
 	if f.dataAttr.Resident != nil {
-		return 0, fmt.Errorf("%w: resident $DATA stream", ErrWriteUnsupported)
+		return f.writeResidentAt(f.dataAttr, p, offset)
 	}
 
 	if f.dataAttr.NonResident == nil {

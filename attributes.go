@@ -12,6 +12,7 @@ func parseAttributeHeader(buf []byte, offset int) (*Attribute, error) {
 
 	r := NewBinaryReader(buf[offset:])
 	attr := &Attribute{}
+	attr.Header.RecordOffset = offset
 
 	// Parse common header
 	attr.Header.Type, _ = r.ReadUint32()

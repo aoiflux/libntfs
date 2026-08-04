@@ -92,6 +92,10 @@ type AttributeHeader struct {
 	NameOffset  uint16 // Offset to attribute name
 	Flags       uint16 // Attribute flags
 	AttributeID uint16 // Unique attribute ID within MFT entry
+
+	// RecordOffset is the attribute's byte offset within the MFT record it was
+	// parsed from, which locates it for in-place edits and for reporting.
+	RecordOffset int
 }
 
 // Attribute flags
@@ -139,6 +143,13 @@ type Attribute struct {
 	Header      AttributeHeader
 	Resident    *ResidentAttribute
 	NonResident *NonResidentAttribute
+
+	// sourceRecord is the MFT entry the attribute was parsed from, which is not
+	// necessarily the entry holding it once $ATTRIBUTE_LIST merging has run.
+	// sourceKnown is false for attributes synthesised by merging, whose bytes
+	// exist in no single record.
+	sourceRecord uint64
+	sourceKnown  bool
 }
 
 // Attribute types
