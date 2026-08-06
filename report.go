@@ -32,12 +32,6 @@ type NTFSFile struct {
 	Fragments    []FileFragment `json:"fragments"`
 }
 
-// FileFragment describes a contiguous on-disk region belonging to a file.
-type FileFragment struct {
-	StartOffset int64 `json:"start_offset"`
-	EndOffset   int64 `json:"end_offset"`
-}
-
 // Report scans every MFT entry on the volume and returns an NTFSReport with
 // a flat list of all files and directories — including deleted entries and
 // files that are orphaned (no longer linked to any directory index).
@@ -153,7 +147,7 @@ func (v *Volume) Report() (*NTFSReport, error) {
 			} else if dataAttr.NonResident != nil {
 				ntfsFile.Size = int64(dataAttr.NonResident.RealSize)
 				if !meta.isDir {
-					frags := v.dataRunsToFragments(dataAttr.NonResident.DataRuns)
+					frags := v.allocatedFragments(dataAttr)
 					ntfsFile.Fragments = frags
 					ntfsFile.IsFragmented = len(frags) > 1
 				}
@@ -188,20 +182,22 @@ func (v *Volume) getVolumeName() string {
 	return name
 }
 
-// dataRunsToFragments converts data runs to FileFragments with absolute byte
-// offsets within the volume. Sparse runs (holes with no physical location) are
-// omitted.
-func (v *Volume) dataRunsToFragments(runs []DataRun) []FileFragment {
-	frags := make([]FileFragment, 0, len(runs))
-	bpc := int64(v.BytesPerCluster())
+// allocatedFragments returns only the fragments that occupy disk, dropping
+// sparse holes. The report describes physical regions of the volume, so a hole
+// has nothing to contribute to it; callers needing the full stream map, holes
+// included, should use (*File).Fragments.
+func (v *Volume) allocatedFragments(attr *Attribute) []FileFragment {
+	all, err := v.AttributeFragments(attr)
+	if err != nil {
+		return nil
+	}
 
-	for _, run := range runs {
-		if run.IsSparse {
+	frags := make([]FileFragment, 0, len(all))
+	for _, frag := range all {
+		if frag.Sparse {
 			continue
 		}
-		start := run.StartCluster * bpc
-		end := start + int64(run.LengthClusters)*bpc
-		frags = append(frags, FileFragment{StartOffset: start, EndOffset: end})
+		frags = append(frags, frag)
 	}
 
 	return frags

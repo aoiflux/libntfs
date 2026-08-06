@@ -32,11 +32,15 @@ type FileInfoReport struct {
 	Fragments       []FileFragmentReport    `json:"fragments"`
 }
 
-// FileFragmentReport describes one contiguous physical run in bytes.
+// FileFragmentReport describes one contiguous region of the stream, on both the
+// volume and the stream's own offset axis.
 type FileFragmentReport struct {
 	StartOffset int64 `json:"start_offset"`
 	EndOffset   int64 `json:"end_offset"`
+	FileOffset  int64 `json:"file_offset"`
 	LengthBytes int64 `json:"length_bytes"`
+	Sparse      bool  `json:"sparse"`
+	Resident    bool  `json:"resident"`
 }
 
 func main() {
@@ -98,35 +102,37 @@ func main() {
 		report.AccessedAt = info.AccessTime.Format("2006-01-02T15:04:05Z07:00")
 	}
 
-	dataAttr := entry.FindPrimaryDataAttribute()
-	if dataAttr != nil {
-		if dataAttr.Resident != nil {
-			report.ResidentData = true
+	support := ntfsFile.ReadSupport()
+	report.ResidentData = support.Resident
+	report.NonResidentData = support.NonResident
+	report.IsFragmented = ntfsFile.IsFragmented()
+
+	fragments, err := ntfsFile.Fragments()
+	if err != nil {
+		log.Fatalf("failed to map the file's fragments: %v", err)
+	}
+
+	spanStarted := false
+	for _, fragment := range fragments {
+		report.Fragments = append(report.Fragments, FileFragmentReport{
+			StartOffset: fragment.StartOffset,
+			EndOffset:   fragment.EndOffset,
+			FileOffset:  fragment.FileOffset,
+			LengthBytes: fragment.Length,
+			Sparse:      fragment.Sparse,
+			Resident:    fragment.Resident,
+		})
+
+		// The file's overall span covers the regions that occupy disk, so a hole
+		// contributes nothing to it.
+		if fragment.Sparse {
+			continue
 		}
-
-		if dataAttr.NonResident != nil {
-			report.NonResidentData = true
-			bpc := int64(volume.BytesPerCluster())
-			for _, run := range dataAttr.NonResident.DataRuns {
-				if run.IsSparse {
-					continue
-				}
-
-				start := run.StartCluster * bpc
-				end := start + int64(run.LengthClusters)*bpc
-				report.Fragments = append(report.Fragments, FileFragmentReport{
-					StartOffset: start,
-					EndOffset:   end,
-					LengthBytes: end - start,
-				})
-			}
-
-			if len(report.Fragments) > 0 {
-				report.StartOffset = report.Fragments[0].StartOffset
-				report.EndOffset = report.Fragments[len(report.Fragments)-1].EndOffset
-				report.IsFragmented = len(report.Fragments) > 1
-			}
+		if !spanStarted {
+			report.StartOffset = fragment.StartOffset
+			spanStarted = true
 		}
+		report.EndOffset = fragment.EndOffset
 	}
 
 	enc := json.NewEncoder(os.Stdout)

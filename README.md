@@ -84,6 +84,11 @@ Implemented:
 - Update sequence (fixup) validation
 - Standalone $MFT record parsing without a volume
 - Alternate data stream enumeration and reading
+- Fragment mapping on both axes: where a region sits in the stream and where its
+  bytes sit on the volume, holes included
+- Extended attribute parsing ($EA and $EA_INFORMATION), including WSL metadata
+- Reparse point parsing with target resolution for symlinks, junctions, and WSL
+  symlinks
 - Security descriptor parsing with $Secure lookup (owner, group, DACL, SACL)
 - USN change journal parsing from a volume or an extracted $J file
 - File name namespace handling (DOS/Win32/WinDOS/POSIX)
@@ -130,6 +135,23 @@ Stream-level:
 - (*File).Streams() []StreamInfo
 - (*File).OpenStream(name string) (*File, error)
 - (*MFTEntry).DataStreams() []*Attribute
+
+Layout-level:
+
+- (*File).Fragments() ([]FileFragment, error)
+- (*File).IsFragmented() bool
+- (*Volume).AttributeFragments(attr *Attribute) ([]FileFragment, error)
+
+Metadata-level:
+
+- ParseExtendedAttributes(buf []byte) ([]ExtendedAttribute, error)
+- EachExtendedAttribute(buf []byte, fn func(ExtendedAttribute) error) error
+- ParseEAInformation(buf []byte) (*EAInfo, error)
+- (*File).ExtendedAttributes() ([]ExtendedAttribute, error)
+- (*File).EAInformation() (*EAInfo, error)
+- ParseReparsePoint(buf []byte) (*ReparsePoint, error)
+- (*File).ReparsePoint() (*ReparsePoint, error)
+- (*ReparsePoint).Target() (substituteName, printName string, ok bool)
 
 Journal-level:
 
@@ -293,6 +315,111 @@ if sd.DACL == nil {
 `BUILTIN\Administrators`. `$Secure:$SDS` is read and indexed on first use and
 cached for the life of the volume, so per-file lookups are cheap.
 
+## File Layout and Fragmentation
+
+`Fragments` maps a stream onto the volume, reporting both where each region sits
+in the stream and where its bytes sit on disk:
+
+```go
+frags, err := file.Fragments()
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, f := range frags {
+    if f.Sparse {
+        fmt.Printf("hole   stream %d..%d\n", f.FileOffset, f.FileOffset+f.Length)
+        continue
+    }
+    fmt.Printf("extent stream %d..%d -> volume %d..%d\n",
+        f.FileOffset, f.FileOffset+f.Length, f.StartOffset, f.EndOffset)
+}
+```
+
+Fragments tile the stream with no gaps, so a byte range of the file maps onto the
+volume by walking them. Sparse holes are reported rather than dropped, because
+dropping one would silently shift every later fragment's position in the stream.
+The last fragment is clamped to the stream's real size, so allocation slack at
+the tail of the final cluster is not reported as content.
+
+Because the layout comes from the stream the handle was opened on, an alternate
+data stream maps with no extra work:
+
+```go
+ads, err := file.OpenStream("Zone.Identifier")
+if err != nil {
+    log.Fatal(err)
+}
+frags, err := ads.Fragments()
+```
+
+A resident stream, whose content lives inside the MFT record, reports a single
+fragment with `Resident` set and `StartOffset` pointing at those bytes. Read it
+through `ReadAt` rather than off the volume directly: the record carries update
+sequence fixups, so the last two bytes of each sector hold the record's sequence
+number rather than content.
+
+`IsFragmented` reports whether the stream is split across more than one region of
+the volume. A hole is not fragmentation — a file stored in one run with a hole
+punched in it is not scattered across the disk.
+
+For a compressed stream the data runs describe compression units rather than
+decompressed bytes, so the fragments describe physical allocation only. Gate on
+`IsCompressed` before treating fragment offsets as stream offsets.
+
+`(*Volume).AttributeFragments` does the same for any attribute, which is how to
+map streams that are not reachable as a `File` — `$Bitmap`, `$Secure:$SDS`,
+`$UsnJrnl:$J`.
+
+## Extended Attributes and Reparse Points
+
+Extended attributes are where the Windows Subsystem for Linux keeps POSIX
+metadata that no Windows tool surfaces: `LXATTRB` holds mode, owner, and the
+POSIX timestamps, `LXXATTR` holds user extended attributes, and `$LXUID`,
+`$LXGID`, and `$LXMOD` carry those fields for files created by WSL1.
+
+```go
+eas, err := file.ExtendedAttributes()
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, ea := range eas {
+    fmt.Printf("%s: %d bytes (need-EA: %v)\n", ea.Name, len(ea.Value), ea.NeedEA())
+}
+```
+
+A `$EA` is frequently non-resident, and is read through its data runs when it is.
+`ParseExtendedAttributes` and `ParseEAInformation` need no volume, so attribute
+bytes carved out of a standalone `$MFT` parse the same way.
+
+A reparse point turns an ordinary directory entry into a redirection. `Target`
+resolves the ones that name a path — symbolic links, mount points (junctions),
+and WSL symlinks — and reports `ok == false` for the tags that do not, such as
+deduplication, WOF-compressed files, and cloud placeholders:
+
+```go
+reparse, err := file.ReparsePoint()
+if err != nil {
+    log.Fatal(err)
+}
+
+if reparse != nil {
+    if target, _, ok := reparse.Target(); ok {
+        fmt.Printf("%s -> %s\n", reparse.TagName(), target)
+    } else {
+        fmt.Printf("%s (%d bytes of opaque data)\n", reparse.TagName(), len(reparse.Data))
+    }
+}
+```
+
+Both buffer shapes are handled: Microsoft-owned tags, whose data follows the
+header directly, and third-party tags, which carry a 16-byte owner GUID first.
+`Data` holds the tag-specific bytes with the header and any GUID stripped.
+
+libntfs does not follow reparse points. A directory carrying one is reported as a
+directory, and `ReadDir` lists its own index rather than the target's.
+
 ## USN Change Journal
 
 The journal records every create, delete, rename, and write, which makes it the
@@ -384,6 +511,8 @@ You can also use disk image files directly on all platforms.
 - examples/bench: end-to-end traversal and sampled read throughput benchmark
 - examples/finfo: structured metadata for a specific file path (offsets, size,
   fragments, timestamps)
+- examples/attrinfo: extended attributes and reparse point for a path or MFT
+  entry, with a recursive hunt for WSL metadata and links
 - examples/overwrite: guarded in-place overwrite at logical file offsets with
   user-supplied end-bound checks
 - examples/mftdump: MFT record timeline from either a standalone $MFT file or a
@@ -413,6 +542,18 @@ Run checks:
 go test ./...
 go vet ./...
 ```
+
+The attribute parsers are fed bytes lifted straight off a disk image, which in a
+forensic context is untrusted input by definition. Each has a fuzz target:
+
+```bash
+go test -run '^$' -fuzz FuzzParseExtendedAttributes -fuzztime 60s
+go test -run '^$' -fuzz FuzzParseReparsePoint -fuzztime 60s
+go test -run '^$' -fuzz FuzzParseDataRuns -fuzztime 60s
+```
+
+`FuzzParseEAInformation`, `FuzzParseSecurityDescriptor`, and `FuzzParseUSNRecord`
+round out the set.
 
 ## Project Status
 

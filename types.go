@@ -334,10 +334,11 @@ type ObjectID struct {
 
 // ReparsePoint represents the $REPARSE_POINT attribute.
 type ReparsePoint struct {
-	ReparseType uint32 // Type of reparse point
-	DataLength  uint16 // Length of reparse data
-	Reserved    uint16
-	Data        []byte // Reparse point data
+	ReparseType uint32   // Reparse tag identifying who owns the data
+	DataLength  uint16   // Length of reparse data as recorded in the header
+	Reserved    uint16   //
+	GUID        [16]byte // Owner GUID; present only on third-party reparse points
+	Data        []byte   // Tag-specific data, excluding the header and any GUID
 }
 
 // Common reparse point types
@@ -346,6 +347,18 @@ const (
 	ReparsePointMountPoint = 0xA0000003 // Mount point
 	ReparsePointHSM        = 0xC0000004 // Hierarchical Storage Management
 	ReparsePointSIS        = 0x80000007 // Single Instance Storage
+	ReparsePointDFS        = 0x8000000A // Distributed File System
+	ReparsePointDedup      = 0x80000013 // Data deduplication
+	ReparsePointNFS        = 0x80000014 // NFS share
+	ReparsePointWOF        = 0x80000017 // Windows Overlay Filter (compressed file)
+	ReparsePointWCI        = 0x80000018 // Windows Container Isolation
+	ReparsePointAppExec    = 0x8000001B // App execution alias (Store app stub)
+	ReparsePointCloud      = 0x9000001A // Cloud files placeholder (OneDrive)
+	ReparsePointLXSymlink  = 0xA000001D // WSL symbolic link
+	ReparsePointAFUnix     = 0x80000023 // WSL AF_UNIX socket
+	ReparsePointLXFIFO     = 0x80000024 // WSL FIFO
+	ReparsePointLXChr      = 0x80000025 // WSL character device
+	ReparsePointLXBlk      = 0x80000026 // WSL block device
 )
 
 // UpdateSequenceArray is used to detect torn writes and ensure data integrity.

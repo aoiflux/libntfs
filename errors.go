@@ -88,6 +88,12 @@ var (
 
 	// ErrInvalidUSNRecord indicates a malformed USN change journal record.
 	ErrInvalidUSNRecord = errors.New("invalid or malformed USN record")
+
+	// ErrInvalidExtendedAttribute indicates a malformed $EA or $EA_INFORMATION value.
+	ErrInvalidExtendedAttribute = errors.New("invalid or malformed extended attribute")
+
+	// ErrInvalidReparsePoint indicates a malformed $REPARSE_POINT value.
+	ErrInvalidReparsePoint = errors.New("invalid or malformed reparse point")
 )
 
 // VolumeError wraps errors specific to volume operations.

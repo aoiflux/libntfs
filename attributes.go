@@ -609,3 +609,58 @@ func (a *Attribute) ReadSupport() FileReadSupport {
 
 	return support
 }
+
+// readAttributeValue returns an attribute's whole value, reading through data
+// runs when it is non-resident.
+//
+// maxBytes bounds the allocation, since a corrupt RealSize would otherwise size
+// the buffer. A value longer than maxBytes is truncated rather than rejected, so
+// a damaged record still yields the part that parses.
+//
+// This suits the small metadata attributes ($EA, $REPARSE_POINT) that are read
+// whole. Stream-sized attributes should go through File.ReadAt instead.
+func (v *Volume) readAttributeValue(attr *Attribute, maxBytes int64) ([]byte, error) {
+	if attr == nil {
+		return nil, fmt.Errorf("%w: nil attribute", ErrAttributeNotFound)
+	}
+
+	if attr.IsEncrypted() {
+		return nil, ErrEncryptedData
+	}
+
+	if attr.Resident != nil {
+		value := attr.Resident.Value
+		if int64(len(value)) > maxBytes {
+			value = value[:maxBytes]
+		}
+		// Copy so a caller cannot mutate the cached MFT entry's bytes.
+		out := make([]byte, len(value))
+		copy(out, value)
+		return out, nil
+	}
+
+	if attr.NonResident == nil {
+		return nil, fmt.Errorf("%w: attribute is neither resident nor non-resident",
+			ErrInvalidAttribute)
+	}
+
+	if attr.IsCompressed() {
+		return nil, ErrCompressedData
+	}
+
+	size := int64(attr.NonResident.RealSize)
+	if size > maxBytes {
+		size = maxBytes
+	}
+	if size <= 0 {
+		return nil, nil
+	}
+
+	buf := make([]byte, size)
+	n, err := v.ReadDataRuns(attr.NonResident.DataRuns, 0, buf)
+	if err != nil && n == 0 {
+		return nil, err
+	}
+
+	return buf[:n], nil
+}

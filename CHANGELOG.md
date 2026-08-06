@@ -5,6 +5,75 @@ All notable changes to the libntfs project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1]
+
+### Added
+- Fragment mapping. `(*File).Fragments` returns a stream's on-disk layout with
+  both axes a forensic caller needs: where each region sits inside the stream
+  (`FileOffset`, `Length`) and where its bytes sit on the volume (`StartOffset`,
+  `EndOffset`). Fragments tile the stream with no gaps, so a byte range of a file
+  maps onto the volume by walking them. Every example that hand-rolled this
+  calculation over `NonResident.DataRuns` can now call it instead.
+- `(*File).IsFragmented` reports whether a stream is split across more than one
+  region of the volume. A sparse hole is not counted: a file stored in one run
+  with a hole punched in it is not scattered across the disk.
+- `(*Volume).AttributeFragments` maps any attribute, which is how to reach the
+  streams that are not `File`s — `$Bitmap`, `$Secure:$SDS`, `$UsnJrnl:$J`.
+- Fragments follow the stream a handle was opened on, so
+  `OpenStream(name).Fragments()` maps an alternate data stream with no extra
+  work. A resident stream reports one fragment with `Resident` set, locating its
+  bytes inside the MFT record.
+- Extended attribute parsing. `ParseExtendedAttributes`, `EachExtendedAttribute`,
+  and `ParseEAInformation` decode `$EA` and `$EA_INFORMATION` from a raw buffer
+  with no Volume, for attribute bytes carved out of a standalone `$MFT`.
+  `(*File).ExtendedAttributes`, `(*File).EAInformation`, and
+  `(*File).HasExtendedAttributes` read them from a volume, following data runs
+  when `$EA` is non-resident — which is how the Windows Subsystem for Linux's
+  POSIX metadata is usually stored.
+- `EAInfo`, `ExtendedAttribute`, `(ExtendedAttribute).NeedEA`, `EAFlagNeedEA`,
+  and `ErrInvalidExtendedAttribute`.
+- Reparse point parsing. `ParseReparsePoint` decodes both buffer shapes:
+  Microsoft-owned tags, whose data follows the header directly, and third-party
+  tags, which carry a 16-byte owner GUID first. `Data` holds the tag-specific
+  bytes with the header and any GUID stripped, so a caller reading it needs no
+  knowledge of which shape it came from.
+- `(*ReparsePoint).Target` resolves the tags that name a path — symbolic links,
+  mount points, and WSL symlinks — and reports `ok == false` for the tags that do
+  not, such as deduplication, WOF, and cloud placeholders, leaving `Data` to the
+  caller. `(*ReparsePoint).TagName`, `.IsMicrosoft`, and `.IsRelative` render the
+  rest. `(*File).ReparsePoint` and `(*File).IsReparsePoint` read them.
+- `ReparsePoint.GUID`, twelve further `ReparsePoint*` tag constants covering WOF,
+  deduplication, cloud placeholders, app execution aliases, and the WSL types,
+  and `ErrInvalidReparsePoint`.
+- `examples/attrinfo`, reporting the extended attributes and reparse point of a
+  path or MFT entry, with `-r` to walk a tree, `-only` to hunt for WSL metadata
+  and links, and a `-json` mode. It reports junctions rather than descending
+  through them, since the link is not the target.
+- Fuzz targets for the parsers fed untrusted image bytes:
+  `FuzzParseExtendedAttributes`, `FuzzParseEAInformation`,
+  `FuzzParseReparsePoint`, `FuzzParseDataRuns`, `FuzzParseSecurityDescriptor`,
+  and `FuzzParseUSNRecord`.
+
+### Changed
+- `FileFragment` gained `FileOffset`, `Length`, `Sparse`, and `Resident`, so
+  `Report()`'s JSON now carries four more keys per fragment. Existing keys are
+  unchanged. Callers constructing a `FileFragment` with an unkeyed literal need
+  to switch to a keyed one.
+- `examples/finfo` reports fragments through `(*File).Fragments` instead of
+  walking data runs itself, and now emits each fragment's stream offset and
+  whether it is sparse or resident.
+
+### Fixed
+- The last fragment of a file no longer overshoots its content. Run lengths are
+  cluster-granular, and the final run was reported at its full allocated length,
+  claiming up to one cluster of slack as file data. It is now clamped to the
+  stream's real size. This affected `Report()`, `examples/finfo`, and anything
+  else deriving byte ranges from data runs.
+- Sparse runs are no longer dropped from a stream's map. Dropping a hole left
+  every later fragment at a stream position it did not occupy, so a byte range of
+  a sparse file could not be mapped back to disk. `(*File).Fragments` reports
+  holes; `Report()` still filters them out, since it describes physical regions.
+
 ## [0.2.0]
 
 ### Added
