@@ -1,6 +1,9 @@
 package libntfs
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // The parsers below are fed bytes lifted straight off a disk image, which in a
 // forensic context is untrusted input by definition: the image may be damaged,
@@ -151,6 +154,67 @@ func FuzzEachLogRecord(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_ = EachLogRecord(data, func(*LogRecord) error { return nil })
+	})
+}
+
+func FuzzParseLogRestartTable(f *testing.F) {
+	f.Add(buildLogRestartTable(0x28, 4))
+	f.Add(buildLogRestartTable(0x10, 1))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		table, err := ParseLogRestartTable(data)
+		if err != nil {
+			return
+		}
+
+		// Entries are sliced out of the buffer, so a corrupt allocated count
+		// must not conjure them from nowhere.
+		if len(table.Entries)*int(table.EntrySize) > len(data) {
+			t.Fatalf("parsed %d entries of %d bytes from a %d byte table",
+				len(table.Entries), table.EntrySize, len(data))
+		}
+	})
+}
+
+// FuzzParseLinuxExtendedAttributes matters more than most: LXXATTR is not a
+// documented structure, so its layout is inferred from what WSL writes.
+func FuzzParseLinuxExtendedAttributes(f *testing.F) {
+	f.Add(buildLXXATTRValue([2]string{"user.comment", "hello"}))
+	f.Add(buildLXXATTRValue(
+		[2]string{"user.a", "1"},
+		[2]string{"security.capability", "\x01\x00"},
+	))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		attrs, _ := ParseLinuxExtendedAttributes(data)
+
+		for _, attr := range attrs {
+			if len(attr.Name)+len(attr.Value) > len(data) {
+				t.Fatalf("attribute %q claims %d bytes from a %d byte value",
+					attr.Name, len(attr.Name)+len(attr.Value), len(data))
+			}
+		}
+	})
+}
+
+func FuzzParseLinuxAttributes(f *testing.F) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	f.Add(buildLXATTRBValue(0o100644, 1000, 1000, 0, now, now, now))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		attrs, err := ParseLinuxAttributes(data)
+		if err != nil {
+			return
+		}
+
+		// Every accessor must survive whatever the parser produced.
+		_ = attrs.ModeString()
+		_ = attrs.FileType()
+		_ = attrs.Permissions()
+		_ = attrs.String()
 	})
 }
 

@@ -225,6 +225,144 @@ func TestFileLinuxAttributesIgnoresUnrelatedEAs(t *testing.T) {
 	}
 }
 
+// buildLXXATTRValue assembles a WSL LXXATTR value from name/value pairs.
+func buildLXXATTRValue(pairs ...[2]string) []byte {
+	buf := make([]byte, lxxattrHeaderSize)
+	WriteUint16LE(buf, 0, 0) // Flags
+	WriteUint16LE(buf, 2, 1) // Version
+
+	entries := make([][]byte, 0, len(pairs))
+	for _, pair := range pairs {
+		name, value := pair[0], pair[1]
+
+		size := AlignUp(lxxattrEntryHeaderSize+len(name)+1+len(value), 4)
+		entry := make([]byte, size)
+
+		entry[2] = 0 // Flags
+		entry[3] = uint8(len(name))
+		WriteUint16LE(entry, 4, uint16(len(value)))
+		copy(entry[lxxattrEntryHeaderSize:], name)
+		copy(entry[lxxattrEntryHeaderSize+len(name)+1:], value)
+
+		entries = append(entries, entry)
+	}
+
+	for i, entry := range entries {
+		if i == len(entries)-1 {
+			WriteUint16LE(entry, 0, 0)
+		} else {
+			WriteUint16LE(entry, 0, uint16(len(entry)))
+		}
+		buf = append(buf, entry...)
+	}
+
+	return buf
+}
+
+func TestParseLinuxExtendedAttributes(t *testing.T) {
+	value := buildLXXATTRValue(
+		[2]string{"user.comment", "hello"},
+		[2]string{"security.capability", "\x01\x00\x00\x02"},
+	)
+
+	attrs, err := ParseLinuxExtendedAttributes(value)
+	if err != nil {
+		t.Fatalf("ParseLinuxExtendedAttributes failed: %v", err)
+	}
+
+	if len(attrs) != 2 {
+		t.Fatalf("expected 2 attributes, got %d: %+v", len(attrs), attrs)
+	}
+	if attrs[0].Name != "user.comment" || string(attrs[0].Value) != "hello" {
+		t.Errorf("unexpected first attribute: %+v", attrs[0])
+	}
+	if attrs[1].Name != "security.capability" {
+		t.Errorf("unexpected second attribute name %q", attrs[1].Name)
+	}
+	if attrs[0].String() != "user.comment (5 bytes)" {
+		t.Errorf("unexpected String() %q", attrs[0].String())
+	}
+}
+
+func TestParseLinuxExtendedAttributesRejectsBadInput(t *testing.T) {
+	truncated := buildLXXATTRValue([2]string{"user.test", "0123456789"})
+	truncated = truncated[:len(truncated)-8]
+
+	// An offset that does not clear the entry would overlap the next one.
+	overlapping := buildLXXATTRValue([2]string{"user.test", "value"})
+	WriteUint16LE(overlapping, lxxattrHeaderSize, 4)
+
+	tests := []struct {
+		name  string
+		value []byte
+	}{
+		{name: "short header", value: []byte{1, 2}},
+		{name: "truncated value", value: truncated},
+		{name: "non-advancing offset", value: overlapping},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParseLinuxExtendedAttributes(tt.value); !errors.Is(err, ErrInvalidExtendedAttribute) {
+				t.Errorf("expected ErrInvalidExtendedAttribute, got %v", err)
+			}
+		})
+	}
+}
+
+func TestParseLinuxExtendedAttributesEmpty(t *testing.T) {
+	attrs, err := ParseLinuxExtendedAttributes(nil)
+	if err != nil {
+		t.Fatalf("expected no error for an empty value, got %v", err)
+	}
+	if attrs != nil {
+		t.Errorf("expected no attributes, got %+v", attrs)
+	}
+}
+
+func TestFileLinuxExtendedAttributes(t *testing.T) {
+	lxxattr := buildLXXATTRValue([2]string{"user.origin", "downloaded"})
+	value := buildEAValue(buildEAEntry("$LXXATTR", lxxattr, 0, 0))
+
+	_, f := openFragmentTestFile(t, "tagged.txt",
+		buildResidentAttr(AttrTypeEA, 2, value))
+
+	attrs, err := f.LinuxExtendedAttributes()
+	if err != nil {
+		t.Fatalf("LinuxExtendedAttributes failed: %v", err)
+	}
+
+	if len(attrs) != 1 || attrs[0].Name != "user.origin" {
+		t.Fatalf("unexpected attributes: %+v", attrs)
+	}
+	if string(attrs[0].Value) != "downloaded" {
+		t.Errorf("unexpected value %q", attrs[0].Value)
+	}
+}
+
+// TestFileLinuxExtendedAttributesIndependentOfLXATTRB covers a file carrying
+// mode metadata but no POSIX xattrs, which is the common case.
+func TestFileLinuxExtendedAttributesIndependentOfLXATTRB(t *testing.T) {
+	mtime := time.Unix(1_700_000_500, 0).UTC()
+	value := buildEAValue(buildEAEntry("$LXATTRB",
+		buildLXATTRBValue(0o100644, 0, 0, 0, mtime, mtime, mtime), 0, 0))
+
+	_, f := openFragmentTestFile(t, "modeonly.txt",
+		buildResidentAttr(AttrTypeEA, 2, value))
+
+	attrs, err := f.LinuxExtendedAttributes()
+	if err != nil {
+		t.Fatalf("LinuxExtendedAttributes failed: %v", err)
+	}
+	if attrs != nil {
+		t.Errorf("expected no POSIX xattrs, got %+v", attrs)
+	}
+
+	if mode, err := f.LinuxAttributes(); err != nil || mode == nil {
+		t.Errorf("expected LXATTRB still readable, got %+v (%v)", mode, err)
+	}
+}
+
 func TestFileLinuxAttributesAbsent(t *testing.T) {
 	_, f := openFragmentTestFile(t, "plain.txt",
 		buildResidentAttr(AttrTypeData, 2, []byte("no eas")))

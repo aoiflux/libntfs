@@ -428,6 +428,126 @@ func TestCorpusExtendedAttributes(t *testing.T) {
 	}
 }
 
+// TestCorpusLinuxExtendedAttributes is the fixture LXXATTR most needs. The
+// structure is not documented by Microsoft, so libntfs decodes a layout inferred
+// from what WSL writes; every other test of it feeds bytes libntfs itself built,
+// which would agree with a wrong inference. This one does not.
+func TestCorpusLinuxExtendedAttributes(t *testing.T) {
+	vol := openCorpus(t)
+
+	file, err := vol.OpenPath("/wsl-xattr.txt")
+	if err != nil {
+		t.Skipf("the corpus has no file with POSIX extended attributes: %v", err)
+	}
+
+	attrs, err := file.LinuxExtendedAttributes()
+	if err != nil {
+		t.Fatalf("LinuxExtendedAttributes failed: %v", err)
+	}
+	if len(attrs) == 0 {
+		t.Fatal("expected the POSIX extended attribute WSL set")
+	}
+
+	for _, attr := range attrs {
+		if attr.Name == "user.origin" {
+			if string(attr.Value) != "corpus" {
+				t.Errorf("expected user.origin=corpus, got %q", attr.Value)
+			}
+			return
+		}
+	}
+
+	t.Errorf("expected user.origin among %v", attrs)
+}
+
+// TestCorpusLogTransactions groups a real log into transactions, which is where
+// a grouping that looks right against synthetic records meets one that Windows
+// actually wrote.
+func TestCorpusLogTransactions(t *testing.T) {
+	vol := openCorpus(t)
+
+	var records []*LogRecord
+	if err := vol.EachLogRecord(func(r *LogRecord) error {
+		records = append(records, r)
+		return nil
+	}); err != nil {
+		t.Fatalf("EachLogRecord failed: %v", err)
+	}
+
+	if len(records) == 0 {
+		t.Fatal("expected the log to hold records")
+	}
+
+	transactions := GroupLogTransactions(records)
+	if len(transactions) == 0 {
+		t.Fatal("expected the records to group into transactions")
+	}
+
+	committed := 0
+	for _, transaction := range transactions {
+		if transaction.FirstLSN > transaction.LastLSN {
+			t.Errorf("transaction %d spans %d..%d, which is backwards",
+				transaction.ID, transaction.FirstLSN, transaction.LastLSN)
+		}
+		if transaction.Committed {
+			committed++
+		}
+	}
+
+	t.Logf("%d records in %d transactions, %d committed",
+		len(records), len(transactions), committed)
+
+	// A volume that was formatted and populated must have committed something.
+	if committed == 0 {
+		t.Error("expected at least one committed transaction")
+	}
+}
+
+// TestCorpusLogTableDumps decodes the periodic table dumps. Only the table
+// header is decoded, since entry layout varies by NTFS version, so this checks
+// the header is coherent rather than what the entries mean.
+func TestCorpusLogTableDumps(t *testing.T) {
+	vol := openCorpus(t)
+
+	dumps := 0
+
+	if err := vol.EachLogRecord(func(r *LogRecord) error {
+		if !r.IsTableDump() {
+			return nil
+		}
+
+		table, err := r.RestartTable()
+		if err != nil {
+			// A dump whose payload was clipped by the circular log is expected,
+			// so this is reported rather than failed.
+			t.Logf("LSN %d: %s did not decode: %v", r.LSN, r.RedoOperationName(), err)
+			return nil
+		}
+
+		dumps++
+
+		if table.EntrySize == 0 {
+			t.Errorf("LSN %d: table declares a zero entry size", r.LSN)
+		}
+		for i, entry := range table.Entries {
+			if len(entry) != int(table.EntrySize) {
+				t.Fatalf("LSN %d: entry %d is %d bytes, expected %d",
+					r.LSN, i, len(entry), table.EntrySize)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("EachLogRecord failed: %v", err)
+	}
+
+	if dumps == 0 {
+		t.Skip("the log window holds no complete table dumps")
+	}
+
+	t.Logf("%d table dumps decoded", dumps)
+}
+
 // TestCorpusReportIsComplete walks the whole volume, which exercises every
 // parser at once over real structures and is where a crash on unusual metadata
 // would surface.

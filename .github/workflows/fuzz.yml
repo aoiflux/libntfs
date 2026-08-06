@@ -1,0 +1,78 @@
+name: Fuzz
+
+# libntfs parses bytes lifted straight off a disk image, which in a forensic
+# context is untrusted input by definition: the image may be damaged,
+# deliberately malformed, or crafted. Short runs on every change catch gross
+# regressions; finding the inputs that actually break a parser takes minutes per
+# target, which is what this workflow is for.
+
+on:
+  schedule:
+    # Nightly, well outside working hours.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: 'Time to fuzz each target, as a Go duration'
+        required: false
+        default: '10m'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - FuzzParseDataRuns
+          - FuzzParseExtendedAttributes
+          - FuzzParseEAInformation
+          - FuzzParseReparsePoint
+          - FuzzParseSecurityDescriptor
+          - FuzzParseUSNRecord
+          - FuzzParseLogRestartPage
+          - FuzzParseLogRestartTable
+          - FuzzParseLogRecord
+          - FuzzEachLogRecord
+          - FuzzParseLinuxAttributes
+          - FuzzParseLinuxExtendedAttributes
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Carry the corpus each target has already grown between runs, so a
+      # nightly build starts from what previous nights discovered rather than
+      # rediscovering the same inputs.
+      - name: Restore the generated corpus
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build/fuzz
+          key: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-${{ matrix.target }}-
+
+      - name: Fuzz
+        run: |
+          go test -run '^$' \
+            -fuzz '^${{ matrix.target }}$' \
+            -fuzztime '${{ inputs.fuzztime || ''10m'' }}' .
+
+      # A crash writes its input to testdata/fuzz/<target>/, which becomes a
+      # permanent regression case once committed. Upload it so the failure is
+      # reproducible without rerunning the fuzzer.
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashers-${{ matrix.target }}
+          path: testdata/fuzz/
+          if-no-files-found: ignore

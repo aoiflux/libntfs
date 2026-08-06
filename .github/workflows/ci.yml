@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The library parses disk images rather than touching the host file
+        # system, so it should behave identically everywhere. Running all three
+        # is what proves that rather than assuming it.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      # gofmt is deliberately not gated here. Most of the tree predates this
+      # workflow and is stored with CRLF line endings, so gofmt reports every
+      # such file as unformatted regardless of its actual formatting. Gating on
+      # it would fail every run for a reason unrelated to the change under test.
+      # Format new files locally before committing them.
+
+  fuzz-smoke:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # A short run on every change, catching a parser that regressed badly
+      # enough to crash on its own seed corpus. The long runs live in fuzz.yml.
+      - name: Fuzz each target briefly
+        run: |
+          set -euo pipefail
+          targets=$(go test -list 'Fuzz.*' . | grep '^Fuzz')
+          for target in $targets; do
+            echo "::group::$target"
+            go test -run '^$' -fuzz "^${target}$" -fuzztime 20s .
+            echo "::endgroup::"
+          done

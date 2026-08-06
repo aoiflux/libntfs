@@ -90,7 +90,8 @@ Implemented:
 - Reparse point parsing with target resolution for symlinks, junctions, and WSL
   symlinks
 - WSL POSIX metadata decoding (mode, owner, group, POSIX timestamps) from both
-  the WSL2 LXATTRB layout and WSL1's separate attributes
+  the WSL2 LXATTRB layout and WSL1's separate attributes, plus POSIX extended
+  attributes from LXXATTR
 - Security descriptor parsing with $Secure lookup (owner, group, DACL, SACL)
 - USN change journal parsing from a volume or an extracted $J file
 - $LogFile transaction log parsing, including records split across page
@@ -104,6 +105,9 @@ Current limitations:
 - $LogFile is read, not replayed: records are decoded and handed over, but
   reconstructing file content from redo data, undoing to a consistent state, and
   replaying transactions are out of scope
+- $LogFile open attribute table entries are exposed raw rather than decoded,
+  since their layout varies by NTFS version. LogRecord.TargetAttribute is an
+  index into that table, not a resolved file and stream
 - Standalone $MFT records expose metadata and data run maps, but their content
   cannot be read: that requires cluster access, which only a Volume provides
 - Write support is limited to in-place overwrite on writable handles: no file
@@ -161,6 +165,8 @@ Metadata-level:
 - (*ReparsePoint).Target() (substituteName, printName string, ok bool)
 - ParseLinuxAttributes(buf []byte) (*LinuxAttributes, error)
 - (*File).LinuxAttributes() (*LinuxAttributes, error)
+- ParseLinuxExtendedAttributes(buf []byte) ([]LinuxExtendedAttribute, error)
+- (*File).LinuxExtendedAttributes() ([]LinuxExtendedAttribute, error)
 
 Journal-level:
 
@@ -177,6 +183,9 @@ Log-level:
 - (*Volume).OpenLogFile() (*File, error)
 - (*Volume).LogRestartArea() (*LogRestartArea, error)
 - (*Volume).EachLogRecord(fn func(*LogRecord) error) error
+- GroupLogTransactions(records []*LogRecord) []LogTransaction
+- ParseLogRestartTable(buf []byte) (*LogRestartTable, error)
+- (*LogRecord).RestartTable() (*LogRestartTable, error)
 
 Security-level:
 
@@ -466,6 +475,29 @@ WSL2 writes one `LXATTRB` attribute; WSL1 wrote the same fields as separate
 time rather than 1970, so an absent timestamp does not become a 1970 entry in a
 timeline.
 
+POSIX extended attributes — the `user.*` and `security.*` names `getfattr` shows
+— live in a separate `LXXATTR` attribute:
+
+```go
+xattrs, err := file.LinuxExtendedAttributes()
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, x := range xattrs {
+    fmt.Printf("%s = %q\n", x.Name, x.Value)
+}
+```
+
+A file commonly has `LXATTRB` and not `LXXATTR`, so an empty result is the normal
+case rather than a failure.
+
+`LXXATTR` is worth one caveat: it is not a documented structure. The layout
+libntfs decodes matches what WSL writes, but Microsoft publishes no specification
+for it. Every field is bounds-checked against the buffer, so a layout change
+surfaces as a parse error rather than as plausible nonsense — but validate
+against your own corpus before relying on it.
+
 ## USN Change Journal
 
 The journal records every create, delete, rename, and write, which makes it the
@@ -568,6 +600,57 @@ logical byte stream chopped into fixed-size pages, each with its own header and
 update sequence, so a record can start near the end of one page and finish in the
 next. Damaged and uninitialised pages are skipped rather than ending the walk.
 
+### Transactions
+
+A single user-visible action is several log records sharing a transaction ID, and
+reading them individually loses the fact that they belong together.
+`GroupLogTransactions` restores it:
+
+```go
+var records []*libntfs.LogRecord
+err := vol.EachLogRecord(func(r *libntfs.LogRecord) error {
+    records = append(records, r)
+    return nil
+})
+
+for _, t := range libntfs.GroupLogTransactions(records) {
+    fmt.Printf("txn %d  lsn %d..%d  committed=%v  %v\n",
+        t.ID, t.FirstLSN, t.LastLSN, t.Committed, t.Operations())
+}
+```
+
+`Committed` and `Forgotten` say how a transaction ended. Neither being set means
+the log's window does not contain the end of it, which for the oldest
+transactions in a circular log is the normal case rather than a sign of
+interrupted work.
+
+### What is not resolved
+
+`LogRecord.TargetAttribute` is an index into the open attribute table, not a file
+and stream. Resolving it would turn "attribute 0x18" into a named stream on a
+named file, which is what a timeline actually wants — but the per-entry layout of
+that table differs between NTFS versions, and guessing it would produce
+confident, wrong attribution.
+
+So `ParseLogRestartTable` decodes the table *header* from the periodic dump
+records and hands the entries over raw, with `EntrySize` saying how to slice
+them:
+
+```go
+err := vol.EachLogRecord(func(r *libntfs.LogRecord) error {
+    table, err := r.RestartTable() // nil unless r.IsTableDump()
+    if err != nil || table == nil {
+        return nil
+    }
+    fmt.Printf("%s: %d entries of %d bytes\n",
+        r.RedoOperationName(), len(table.Entries), table.EntrySize)
+    return nil
+})
+```
+
+A caller who knows which NTFS version wrote the volume can decode those entries.
+libntfs does not guess.
+
 ## Error Handling
 
 libntfs uses standard wrapping semantics so errors.Is and errors.As work
@@ -631,7 +714,7 @@ You can also use disk image files directly on all platforms.
   with alternate-stream hunting and extraction
 - examples/usnjrnl: USN change journal timeline from a volume or an extracted $J
 - examples/logdump: $LogFile transaction log from a volume or an extracted
-  $LogFile, with operation filtering and LSN sorting
+  $LogFile, with operation filtering, LSN sorting, and transaction grouping
 
 Run one example:
 
@@ -664,9 +747,9 @@ go test -run '^$' -fuzz FuzzParseReparsePoint -fuzztime 60s
 go test -run '^$' -fuzz FuzzParseDataRuns -fuzztime 60s
 ```
 
-`FuzzParseEAInformation`, `FuzzParseSecurityDescriptor`, `FuzzParseUSNRecord`,
-`FuzzParseLogRestartPage`, `FuzzParseLogRecord`, and `FuzzEachLogRecord` round
-out the set.
+Twelve targets cover every parser fed image bytes; `go test -list 'Fuzz.*' .`
+lists them. CI runs a 20-second smoke pass of each on every change and ten
+minutes per target nightly, carrying the generated corpus between runs.
 
 `Report()` is covered by a golden-file test, since its JSON is the library's
 widest output surface:

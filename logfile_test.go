@@ -539,6 +539,249 @@ func TestLogOperationName(t *testing.T) {
 	}
 }
 
+// buildLogRestartTable assembles a restart table with entryCount entries of
+// entrySize bytes each, filled with the entry index so slicing can be checked.
+func buildLogRestartTable(entrySize, entryCount uint16) []byte {
+	buf := make([]byte, logRestartTableHeaderSize+int(entrySize)*int(entryCount))
+
+	WriteUint16LE(buf, 0x00, entrySize)
+	WriteUint16LE(buf, 0x02, entryCount)
+	WriteUint16LE(buf, 0x04, entryCount)
+	WriteUint32LE(buf, 0x0C, 8)  // Free goal
+	WriteUint32LE(buf, 0x10, 12) // First free
+	WriteUint32LE(buf, 0x14, 16) // Last free
+
+	for i := 0; i < int(entryCount); i++ {
+		start := logRestartTableHeaderSize + i*int(entrySize)
+		WriteUint32LE(buf, start, uint32(i))
+	}
+
+	return buf
+}
+
+func TestParseLogRestartTable(t *testing.T) {
+	table, err := ParseLogRestartTable(buildLogRestartTable(0x28, 4))
+	if err != nil {
+		t.Fatalf("ParseLogRestartTable failed: %v", err)
+	}
+
+	if table.EntrySize != 0x28 || table.EntryCount != 4 || table.AllocatedCount != 4 {
+		t.Errorf("unexpected table header: %+v", table)
+	}
+	if table.FirstFree != 12 || table.LastFree != 16 || table.FreeGoal != 8 {
+		t.Errorf("unexpected free-list fields: %+v", table)
+	}
+
+	if len(table.Entries) != 4 {
+		t.Fatalf("expected 4 entries, got %d", len(table.Entries))
+	}
+	for i, entry := range table.Entries {
+		if len(entry) != 0x28 {
+			t.Fatalf("entry %d is %d bytes, expected %d", i, len(entry), 0x28)
+		}
+		if got := ReadUint32LE(entry, 0); got != uint32(i) {
+			t.Errorf("entry %d holds %d, expected %d", i, got, i)
+		}
+	}
+}
+
+// TestParseLogRestartTableClampsToBuffer covers a header claiming more entries
+// than the dump actually carries, which must yield those present rather than
+// read past them.
+func TestParseLogRestartTableClampsToBuffer(t *testing.T) {
+	buf := buildLogRestartTable(0x10, 4)
+	WriteUint16LE(buf, 0x04, 64) // Claim 64 allocated entries
+
+	table, err := ParseLogRestartTable(buf)
+	if err != nil {
+		t.Fatalf("ParseLogRestartTable failed: %v", err)
+	}
+
+	if len(table.Entries) != 4 {
+		t.Errorf("expected the 4 entries present, got %d", len(table.Entries))
+	}
+	if table.AllocatedCount != 64 {
+		t.Errorf("expected the recorded count preserved, got %d", table.AllocatedCount)
+	}
+}
+
+func TestParseLogRestartTableRejectsBadInput(t *testing.T) {
+	zeroEntrySize := buildLogRestartTable(0x10, 1)
+	WriteUint16LE(zeroEntrySize, 0, 0)
+
+	tests := []struct {
+		name string
+		buf  []byte
+	}{
+		{name: "short", buf: make([]byte, 8)},
+		{name: "zero entry size", buf: zeroEntrySize},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParseLogRestartTable(tt.buf); !errors.Is(err, ErrInvalidLogRecord) {
+				t.Errorf("expected ErrInvalidLogRecord, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLogRecordRestartTable(t *testing.T) {
+	dump := buildLogRestartTable(0x28, 2)
+
+	raw := buildLogRecord(1, LogRecordTypeClient,
+		buildNTFSLogData(LogOpOpenAttributeTableDump, LogOpNoop, 0, nil, dump, nil))
+
+	record, _, err := ParseLogRecord(raw)
+	if err != nil {
+		t.Fatalf("ParseLogRecord failed: %v", err)
+	}
+
+	if !record.IsTableDump() {
+		t.Fatal("expected a table dump record")
+	}
+
+	table, err := record.RestartTable()
+	if err != nil {
+		t.Fatalf("RestartTable failed: %v", err)
+	}
+	if table == nil || len(table.Entries) != 2 {
+		t.Fatalf("expected 2 table entries, got %+v", table)
+	}
+}
+
+func TestLogRecordRestartTableIgnoresOtherOperations(t *testing.T) {
+	raw := buildLogRecord(1, LogRecordTypeClient,
+		buildNTFSLogData(LogOpUpdateResidentValue, LogOpNoop, 0, nil, []byte("data"), nil))
+
+	record, _, err := ParseLogRecord(raw)
+	if err != nil {
+		t.Fatalf("ParseLogRecord failed: %v", err)
+	}
+
+	if record.IsTableDump() {
+		t.Error("expected an ordinary operation not to be a table dump")
+	}
+
+	table, err := record.RestartTable()
+	if err != nil {
+		t.Fatalf("RestartTable failed: %v", err)
+	}
+	if table != nil {
+		t.Errorf("expected no table, got %+v", table)
+	}
+}
+
+// logRecordWithTransaction builds a parsed record carrying a transaction ID and
+// a redo operation, without going through the byte layout.
+func logRecordWithTransaction(lsn uint64, transaction uint32, redoOp uint16) *LogRecord {
+	return &LogRecord{
+		LSN:           lsn,
+		RecordType:    LogRecordTypeClient,
+		TransactionID: transaction,
+		RedoOperation: redoOp,
+	}
+}
+
+func TestGroupLogTransactions(t *testing.T) {
+	records := []*LogRecord{
+		logRecordWithTransaction(30, 2, LogOpAddIndexEntryRoot),
+		logRecordWithTransaction(10, 1, LogOpInitializeFileRecordSegment),
+		logRecordWithTransaction(20, 1, LogOpCreateAttribute),
+		logRecordWithTransaction(40, 1, LogOpCommitTransaction),
+		logRecordWithTransaction(50, 2, LogOpForgetTransaction),
+		{LSN: 60, RecordType: LogRecordTypeRestart},
+	}
+
+	transactions := GroupLogTransactions(records)
+
+	if len(transactions) != 2 {
+		t.Fatalf("expected 2 transactions, got %d: %+v", len(transactions), transactions)
+	}
+
+	// Ordered by the LSN each transaction began at, so transaction 1 comes first
+	// even though transaction 2's record appeared earlier in the slice.
+	first := transactions[0]
+	if first.ID != 1 {
+		t.Fatalf("expected transaction 1 first, got %d", first.ID)
+	}
+	if first.FirstLSN != 10 || first.LastLSN != 40 {
+		t.Errorf("expected transaction 1 to span 10..40, got %d..%d",
+			first.FirstLSN, first.LastLSN)
+	}
+	if len(first.Records) != 3 {
+		t.Errorf("expected 3 records in transaction 1, got %d", len(first.Records))
+	}
+	if !first.Committed || first.Forgotten {
+		t.Errorf("expected transaction 1 committed and not forgotten, got %+v", first)
+	}
+
+	second := transactions[1]
+	if second.ID != 2 || !second.Forgotten || second.Committed {
+		t.Errorf("expected transaction 2 forgotten and not committed, got %+v", second)
+	}
+
+	// Restart records carry no transaction and must not create one.
+	for _, transaction := range transactions {
+		for _, record := range transaction.Records {
+			if !record.IsClientRecord() {
+				t.Error("expected restart records excluded from transactions")
+			}
+		}
+	}
+}
+
+// TestLogTransactionOperations covers the summary of what a transaction did,
+// which is the point of grouping in the first place.
+func TestLogTransactionOperations(t *testing.T) {
+	transactions := GroupLogTransactions([]*LogRecord{
+		logRecordWithTransaction(1, 7, LogOpInitializeFileRecordSegment),
+		logRecordWithTransaction(2, 7, LogOpCreateAttribute),
+		logRecordWithTransaction(3, 7, LogOpCreateAttribute),
+		logRecordWithTransaction(4, 7, LogOpAddIndexEntryRoot),
+	})
+
+	if len(transactions) != 1 {
+		t.Fatalf("expected 1 transaction, got %d", len(transactions))
+	}
+
+	ops := transactions[0].Operations()
+	want := []string{"InitializeFileRecordSegment", "CreateAttribute", "AddIndexEntryRoot"}
+
+	if len(ops) != len(want) {
+		t.Fatalf("expected %v, got %v", want, ops)
+	}
+	for i := range want {
+		if ops[i] != want[i] {
+			t.Errorf("operation %d: expected %q, got %q", i, want[i], ops[i])
+		}
+	}
+}
+
+// TestGroupLogTransactionsIncompleteWindow covers the normal case for a circular
+// log: a transaction whose end has already been overwritten.
+func TestGroupLogTransactionsIncompleteWindow(t *testing.T) {
+	transactions := GroupLogTransactions([]*LogRecord{
+		logRecordWithTransaction(1, 9, LogOpCreateAttribute),
+	})
+
+	if len(transactions) != 1 {
+		t.Fatalf("expected 1 transaction, got %d", len(transactions))
+	}
+	if transactions[0].Committed || transactions[0].Forgotten {
+		t.Error("expected an unterminated transaction to report neither outcome")
+	}
+}
+
+func TestGroupLogTransactionsEmpty(t *testing.T) {
+	if got := GroupLogTransactions(nil); len(got) != 0 {
+		t.Errorf("expected no transactions, got %+v", got)
+	}
+	if got := GroupLogTransactions([]*LogRecord{nil}); len(got) != 0 {
+		t.Errorf("expected nil records skipped, got %+v", got)
+	}
+}
+
 // newLogTestVolume builds an in-memory volume whose $LogFile at MFT entry 2 is
 // backed by the supplied image.
 func newLogTestVolume(t testing.TB, logImage []byte) *Volume {

@@ -49,9 +49,17 @@ func main() {
 	withData := flag.Bool("data", false, "include the redo and undo payloads as hex")
 	opFilter := flag.String("op", "", "only report records whose redo operation contains this text")
 	restartOnly := flag.Bool("restart", false, "report the restart area and exit")
+	transactions := flag.Bool("transactions", false, "group records into transactions instead of listing them")
 	limit := flag.Int("n", 0, "stop after this many records (0 means no limit)")
 	flag.Usage = usage
 	flag.Parse()
+
+	mode := outputMode{
+		json:         *asJSON,
+		sorted:       *sorted,
+		withData:     *withData,
+		transactions: *transactions,
+	}
 
 	if flag.NArg() != 1 {
 		flag.Usage()
@@ -71,7 +79,17 @@ func main() {
 	vol, volErr := libntfs.Open(f)
 	if volErr == nil {
 		defer vol.Close()
-		runVolume(vol, *restartOnly, *asJSON, *sorted, *withData, *opFilter, *limit)
+
+		if *restartOnly {
+			restart, err := vol.LogRestartArea()
+			if err != nil {
+				log.Fatalf("Failed to read the restart area: %v", err)
+			}
+			printRestart(restart, mode.json)
+			return
+		}
+
+		emit(collect(vol.EachLogRecord, *opFilter, *limit), mode)
 		return
 	}
 
@@ -85,7 +103,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Not an NTFS volume (%v) and no readable restart page: %v", volErr, err)
 		}
-		printRestart(restart, *asJSON)
+		printRestart(restart, mode.json)
 		return
 	}
 
@@ -93,23 +111,16 @@ func main() {
 		return libntfs.EachLogRecord(data, fn)
 	}, *opFilter, *limit)
 
-	emit(records, *asJSON, *sorted, *withData)
+	emit(records, mode)
 }
 
-func runVolume(vol *libntfs.Volume, restartOnly, asJSON, sorted, withData bool,
-	opFilter string, limit int,
-) {
-	if restartOnly {
-		restart, err := vol.LogRestartArea()
-		if err != nil {
-			log.Fatalf("Failed to read the restart area: %v", err)
-		}
-		printRestart(restart, asJSON)
-		return
-	}
-
-	records := collect(vol.EachLogRecord, opFilter, limit)
-	emit(records, asJSON, sorted, withData)
+// outputMode carries the presentation flags, which every path needs and none of
+// which change how the log is read.
+type outputMode struct {
+	json         bool
+	sorted       bool
+	withData     bool
+	transactions bool
 }
 
 // errLimitReached stops the walk once enough records have been gathered.
@@ -178,8 +189,8 @@ func containsFold(haystack, needle string) bool {
 	return false
 }
 
-func emit(records []*libntfs.LogRecord, asJSON, sorted, withData bool) {
-	if sorted {
+func emit(records []*libntfs.LogRecord, mode outputMode) {
+	if mode.sorted {
 		// The log is circular, so on-disk order is wherever the ring currently
 		// wraps. Sorting by LSN turns it back into a timeline.
 		sort.Slice(records, func(i, j int) bool {
@@ -187,12 +198,17 @@ func emit(records []*libntfs.LogRecord, asJSON, sorted, withData bool) {
 		})
 	}
 
-	if asJSON {
+	if mode.transactions {
+		emitTransactions(libntfs.GroupLogTransactions(records), mode.json)
+		return
+	}
+
+	if mode.json {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		reports := make([]recordReport, 0, len(records))
 		for _, r := range records {
-			reports = append(reports, describe(r, withData))
+			reports = append(reports, describe(r, mode.withData))
 		}
 		if err := enc.Encode(reports); err != nil {
 			log.Fatalf("Failed to encode output: %v", err)
@@ -209,15 +225,75 @@ func emit(records []*libntfs.LogRecord, asJSON, sorted, withData bool) {
 		fmt.Printf("%-12d  txn %-8d  %-32s %-32s  vcn %d\n",
 			r.LSN, r.TransactionID, r.RedoOperationName(), r.UndoOperationName(), r.TargetVCN)
 
-		if withData && len(r.RedoData) > 0 {
+		if mode.withData && len(r.RedoData) > 0 {
 			fmt.Printf("%14sredo %s\n", "", hex.EncodeToString(r.RedoData))
 		}
-		if withData && len(r.UndoData) > 0 {
+		if mode.withData && len(r.UndoData) > 0 {
 			fmt.Printf("%14sundo %s\n", "", hex.EncodeToString(r.UndoData))
 		}
 	}
 
 	fmt.Fprintf(os.Stderr, "\n%d records\n", len(records))
+}
+
+// transactionReport is one grouped transaction rendered for output.
+type transactionReport struct {
+	ID          uint32   `json:"transaction_id"`
+	FirstLSN    uint64   `json:"first_lsn"`
+	LastLSN     uint64   `json:"last_lsn"`
+	RecordCount int      `json:"record_count"`
+	Committed   bool     `json:"committed"`
+	Forgotten   bool     `json:"forgotten"`
+	Operations  []string `json:"operations"`
+}
+
+// emitTransactions prints records grouped by transaction, which is how a single
+// user-visible action — creating a file, renaming one — reads as one thing
+// rather than as the handful of records NTFS actually wrote for it.
+func emitTransactions(transactions []libntfs.LogTransaction, asJSON bool) {
+	if asJSON {
+		reports := make([]transactionReport, 0, len(transactions))
+		for _, t := range transactions {
+			reports = append(reports, transactionReport{
+				ID:          t.ID,
+				FirstLSN:    t.FirstLSN,
+				LastLSN:     t.LastLSN,
+				RecordCount: len(t.Records),
+				Committed:   t.Committed,
+				Forgotten:   t.Forgotten,
+				Operations:  t.Operations(),
+			})
+		}
+
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(reports); err != nil {
+			log.Fatalf("Failed to encode output: %v", err)
+		}
+		return
+	}
+
+	for _, t := range transactions {
+		// Neither outcome set means the log window does not contain the end of
+		// this transaction, which for the oldest entries in a circular log is
+		// normal rather than a sign of interrupted work.
+		outcome := "open"
+		switch {
+		case t.Forgotten:
+			outcome = "forgotten"
+		case t.Committed:
+			outcome = "committed"
+		}
+
+		fmt.Printf("txn %-10d  lsn %d..%d  %-10s  %d records\n",
+			t.ID, t.FirstLSN, t.LastLSN, outcome, len(t.Records))
+
+		for _, op := range t.Operations() {
+			fmt.Printf("%16s%s\n", "", op)
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "\n%d transactions\n", len(transactions))
 }
 
 func describe(r *libntfs.LogRecord, withData bool) recordReport {
@@ -287,6 +363,7 @@ Examples:
   logdump -restart disk.img              # log geometry and how recent it is
   logdump -sort -n 200 disk.img          # the 200 most recent operations
   logdump -op index disk.img             # directory index changes only
+  logdump -transactions -sort disk.img   # grouped, so one action reads as one thing
   logdump -json -data '$LogFile'         # an extracted log, payloads included
 
 $LogFile is circular: it holds the most recent operations and overwrites the

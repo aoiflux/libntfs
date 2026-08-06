@@ -115,16 +115,35 @@ try {
     Remove-Item "$drive\deleted.txt" -Force
 
     # Extended attributes are written by WSL rather than by Windows tooling. If
-    # a WSL distribution is installed, touch a file through it so the image
-    # carries real LXATTRB metadata; otherwise carry on without it.
+    # a WSL distribution is installed, write two files through it: one carrying
+    # LXATTRB (mode and ownership) and one also carrying LXXATTR (POSIX extended
+    # attributes).
+    #
+    # The LXXATTR file matters more than its size suggests. LXXATTR is not a
+    # documented structure, so libntfs decodes a layout inferred from what WSL
+    # writes. This is the fixture that confirms the inference against a real
+    # writer; without it, ParseLinuxExtendedAttributes is only ever tested
+    # against bytes libntfs itself produced.
     $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
     if ($wsl) {
-        $wslPath = "/mnt/$($partition.DriveLetter.ToString().ToLower())/wsl-metadata.txt"
-        & wsl.exe -e sh -c "echo posix > $wslPath && chmod 754 $wslPath" 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $mount = "/mnt/$($partition.DriveLetter.ToString().ToLower())"
+
+        & wsl.exe -e sh -c "echo posix > $mount/wsl-metadata.txt && chmod 754 $mount/wsl-metadata.txt" 2>$null | Out-Null
+        $modeOK = ($LASTEXITCODE -eq 0)
+
+        & wsl.exe -e sh -c "echo tagged > $mount/wsl-xattr.txt && setfattr -n user.origin -v corpus $mount/wsl-xattr.txt" 2>$null | Out-Null
+        $xattrOK = ($LASTEXITCODE -eq 0)
+
+        if ($modeOK) {
             Write-Host 'Wrote a file through WSL, so the image carries LXATTRB'
         } else {
-            Write-Warning 'WSL is present but could not write to the volume; the image has no extended attributes'
+            Write-Warning 'WSL is present but could not write to the volume; the image has no LXATTRB'
+        }
+
+        if ($xattrOK) {
+            Write-Host 'Set a POSIX extended attribute, so the image carries LXXATTR'
+        } else {
+            Write-Warning 'Could not set a POSIX extended attribute (is attr installed? try: sudo apt install attr). The image has no LXXATTR, and ParseLinuxExtendedAttributes stays unvalidated against a real writer.'
         }
     } else {
         Write-Warning 'No WSL found; the image will have no extended attributes'

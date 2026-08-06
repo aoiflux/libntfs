@@ -67,12 +67,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fuzz targets `FuzzParseLogRestartPage`, `FuzzParseLogRecord`, and
   `FuzzEachLogRecord`, the last driving the page walker so the carry buffer that
   reassembles page-spanning records is exercised too.
+- Transaction grouping. `GroupLogTransactions` collects log records by
+  transaction ID, ordered by the LSN each began at, with `Committed` and
+  `Forgotten` reporting how each ended and `(LogTransaction).Operations`
+  summarising what it did. A single user-visible action — creating a file,
+  renaming one — is several log records under one transaction ID, and reading
+  them individually loses the fact that they belong together.
+- `ParseLogRestartTable` and `(*LogRecord).RestartTable` decode the periodic
+  table dumps NTFS writes into the log, plus `(*LogRecord).IsTableDump`.
+  The table header is decoded; entries are handed over as raw fixed-size records
+  rather than decoded structures, because their layout depends on the NTFS
+  version that wrote them and libntfs cannot confirm which it is looking at.
+  `EntrySize` is what makes them usable — a caller who knows its target version
+  can decode them. Reporting a wrongly-decoded MFT reference would attribute an
+  operation to the wrong file, which is worse than reporting none.
+- POSIX extended attribute decoding. `(*File).LinuxExtendedAttributes` and
+  `ParseLinuxExtendedAttributes` unpack the `user.*` and `security.*` attributes
+  WSL stores inside `LXXATTR` — capabilities on a binary, SELinux labels, and
+  whatever an application hung off a file. On Windows these are one opaque blob
+  inside a single NTFS extended attribute, so nothing surfaces them.
+- `examples/logdump` gained `-transactions`, grouping records so one action reads
+  as one thing.
+- Fuzz targets `FuzzParseLogRestartTable`, `FuzzParseLinuxAttributes`, and
+  `FuzzParseLinuxExtendedAttributes`, bringing the set to twelve.
+- GitHub Actions workflows. `ci.yml` builds, vets, and race-tests on Linux,
+  Windows, and macOS, plus a 20-second smoke run of every fuzz target. `fuzz.yml`
+  runs each target for ten minutes nightly, caching the generated corpus between
+  runs so a night starts from what previous nights found, and uploading any
+  crasher as an artifact.
 
 ### Notes
 - `$LogFile` is read, not replayed. Reconstructing file content from redo data,
   undoing to a consistent state, and replaying transactions are deliberately out
   of scope: that is a different problem, and libntfs stops at handing over the
   decoded records.
+- `LogRecord.TargetAttribute` is still an index into the open attribute table
+  rather than a resolved file and stream. Resolving it needs the per-entry
+  layout of that table, which differs between NTFS versions; guessing it would
+  produce confident, wrong attribution. `ParseLogRestartTable` exposes the
+  entries and their size so a caller with a known target version can do it.
+- `LXXATTR` is not a documented structure. The layout decoded here matches what
+  WSL writes, but Microsoft publishes no specification and a future version could
+  change it. Every field is bounds-checked, so a layout change surfaces as a
+  parse failure rather than as plausible nonsense — but validate against your own
+  corpus before relying on it.
 - The log is circular, holding the most recent operations and overwriting the
   oldest, so records arrive in whatever order the ring currently holds. Sort by
   LSN for a timeline.

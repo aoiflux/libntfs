@@ -24,6 +24,13 @@ const (
 // linuxAttributesSize is the LXATTRB structure's length.
 const linuxAttributesSize = 0x38
 
+const (
+	// lxxattrHeaderSize is the flags and version word before the first entry.
+	lxxattrHeaderSize = 4
+	// lxxattrEntryHeaderSize is the fixed part of one entry, before its name.
+	lxxattrEntryHeaderSize = 6
+)
+
 // POSIX file type bits, the top of a mode word.
 const (
 	linuxModeFormatMask = 0o170000
@@ -291,4 +298,134 @@ func eaUint32(value []byte) (uint32, bool) {
 		return 0, false
 	}
 	return ReadUint32LE(value, 0), true
+}
+
+// LinuxExtendedAttribute is one POSIX extended attribute — a user.* or
+// security.* name and its value — as stored inside WSL's LXXATTR.
+//
+// These are the attributes getfattr and setfattr work with from inside WSL:
+// capabilities on a binary, SELinux labels, and whatever an application chose to
+// hang off a file. On Windows they are one opaque blob inside a single NTFS
+// extended attribute, so nothing surfaces them.
+type LinuxExtendedAttribute struct {
+	Name  string
+	Value []byte
+}
+
+// String renders the attribute as its name and value length.
+func (a LinuxExtendedAttribute) String() string {
+	return fmt.Sprintf("%s (%d bytes)", a.Name, len(a.Value))
+}
+
+// ParseLinuxExtendedAttributes decodes an LXXATTR value into the POSIX extended
+// attributes packed inside it.
+//
+// LXXATTR is not a documented structure. The layout decoded here — a flags and
+// version word, then entries of next-entry offset, flags, name length, value
+// length, a NUL-terminated ASCII name, and the value — matches what WSL writes,
+// but Microsoft publishes no specification for it and a future version could
+// change it. Every field is bounds-checked against the buffer rather than
+// trusted, and Version is exposed on the caller's side through the entries that
+// parse, so a layout change shows up as a parse failure rather than as plausible
+// nonsense. Validate against your own corpus before relying on it.
+//
+// Entries that parse are returned even when a later one is malformed, matching
+// ParseExtendedAttributes.
+func ParseLinuxExtendedAttributes(buf []byte) ([]LinuxExtendedAttribute, error) {
+	if len(buf) == 0 {
+		return nil, nil
+	}
+
+	if len(buf) < lxxattrHeaderSize {
+		return nil, fmt.Errorf("%w: LXXATTR is %d bytes, need %d for a header",
+			ErrInvalidExtendedAttribute, len(buf), lxxattrHeaderSize)
+	}
+
+	var attrs []LinuxExtendedAttribute
+	offset := lxxattrHeaderSize
+
+	for offset < len(buf) {
+		if len(buf)-offset < lxxattrEntryHeaderSize {
+			return attrs, fmt.Errorf("%w: LXXATTR entry at %d is %d bytes, need %d",
+				ErrInvalidExtendedAttribute, offset, len(buf)-offset, lxxattrEntryHeaderSize)
+		}
+
+		nextEntryOffset := int(ReadUint16LE(buf, offset))
+		nameLength := int(buf[offset+3])
+		valueLength := int(ReadUint16LE(buf, offset+4))
+
+		// A zeroed header is padding after the last entry rather than an entry
+		// with an empty name.
+		if nextEntryOffset == 0 && nameLength == 0 && valueLength == 0 {
+			return attrs, nil
+		}
+
+		// The name is NUL-terminated, so the value starts one byte past its end.
+		nameStart := offset + lxxattrEntryHeaderSize
+		nameEnd := nameStart + nameLength
+		valueStart := nameEnd + 1
+		valueEnd := valueStart + valueLength
+
+		if valueEnd > len(buf) {
+			return attrs, fmt.Errorf("%w: LXXATTR entry at %d needs %d bytes, only %d remain",
+				ErrInvalidExtendedAttribute, offset, valueEnd-offset, len(buf)-offset)
+		}
+
+		value := make([]byte, valueLength)
+		copy(value, buf[valueStart:valueEnd])
+
+		attrs = append(attrs, LinuxExtendedAttribute{
+			Name:  string(buf[nameStart:nameEnd]),
+			Value: value,
+		})
+
+		if nextEntryOffset == 0 {
+			return attrs, nil
+		}
+
+		// An offset that does not clear this entry would make the next entry
+		// overlap it, and one that does not advance would spin forever.
+		entrySize := valueEnd - offset
+		if nextEntryOffset < entrySize {
+			return attrs, fmt.Errorf("%w: LXXATTR entry at %d advances %d bytes over a %d byte entry",
+				ErrInvalidExtendedAttribute, offset, nextEntryOffset, entrySize)
+		}
+
+		next := offset + nextEntryOffset
+		if next > len(buf) {
+			// The last entry points past the end rather than carrying a zero.
+			return attrs, nil
+		}
+
+		offset = next
+	}
+
+	return attrs, nil
+}
+
+// LinuxExtendedAttributes returns the POSIX extended attributes WSL stored on
+// this file, or none when it carries no LXXATTR.
+//
+// These are separate from LinuxAttributes, which returns the mode and ownership
+// WSL keeps in LXATTRB. A file commonly has one and not the other.
+func (f *File) LinuxExtendedAttributes() ([]LinuxExtendedAttribute, error) {
+	eas, err := f.ExtendedAttributes()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ea := range eas {
+		if !matchesEAName(ea.Name, EANameLXXATTR) {
+			continue
+		}
+
+		attrs, err := ParseLinuxExtendedAttributes(ea.Value)
+		if err != nil {
+			return attrs, fmt.Errorf("entry %d: %w", f.entryNum, err)
+		}
+
+		return attrs, nil
+	}
+
+	return nil, nil
 }

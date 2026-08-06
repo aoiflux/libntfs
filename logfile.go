@@ -3,6 +3,7 @@ package libntfs
 import (
 	"fmt"
 	"io"
+	"sort"
 )
 
 // $LogFile page magics and layout constants.
@@ -152,6 +153,204 @@ func LogOperationName(op uint16) string {
 		return name
 	}
 	return fmt.Sprintf("0x%04X", op)
+}
+
+// logRestartTableHeaderSize is the fixed header before a restart table's
+// entries.
+const logRestartTableHeaderSize = 0x18
+
+// maxLogRestartTableEntries bounds how many entries are sliced out of a table,
+// so a corrupt count cannot drive the allocation.
+const maxLogRestartTableEntries = 1 << 16
+
+// LogRestartTable is one of the tables NTFS periodically dumps into the log so a
+// recovery pass can rebuild its state: the open attribute table, the dirty page
+// table, and the transaction table.
+//
+// The table header is decoded. Entries are handed over as raw fixed-size records
+// rather than decoded structures, because their layout depends on the NTFS
+// version that wrote them and libntfs has no way to confirm which it is looking
+// at. Reporting a wrongly-decoded MFT reference would be worse than reporting
+// none: it would attribute an operation to the wrong file.
+//
+// EntrySize is what makes the raw entries usable — it says how to slice them,
+// and a caller that knows its target version can decode them itself.
+type LogRestartTable struct {
+	EntrySize      uint16 // Bytes per entry
+	EntryCount     uint16 // Entries in use
+	AllocatedCount uint16 // Entries the table has room for
+	FreeGoal       uint32
+	FirstFree      uint32
+	LastFree       uint32
+	Entries        [][]byte // Raw entries, EntrySize bytes each
+}
+
+// ParseLogRestartTable decodes the table header carried in a dump record's redo
+// data and slices out its entries.
+func ParseLogRestartTable(buf []byte) (*LogRestartTable, error) {
+	if len(buf) < logRestartTableHeaderSize {
+		return nil, fmt.Errorf("%w: restart table is %d bytes, need %d for a header",
+			ErrInvalidLogRecord, len(buf), logRestartTableHeaderSize)
+	}
+
+	table := &LogRestartTable{
+		EntrySize:      ReadUint16LE(buf, 0x00),
+		EntryCount:     ReadUint16LE(buf, 0x02),
+		AllocatedCount: ReadUint16LE(buf, 0x04),
+		FreeGoal:       ReadUint32LE(buf, 0x0C),
+		FirstFree:      ReadUint32LE(buf, 0x10),
+		LastFree:       ReadUint32LE(buf, 0x14),
+	}
+
+	if table.EntrySize == 0 {
+		return nil, fmt.Errorf("%w: restart table declares a zero entry size",
+			ErrInvalidLogRecord)
+	}
+
+	// Slice whatever the buffer actually holds rather than what the header
+	// claims, so a truncated dump still yields the entries that are present.
+	available := (len(buf) - logRestartTableHeaderSize) / int(table.EntrySize)
+	count := int(table.AllocatedCount)
+	if count > available {
+		count = available
+	}
+	if count > maxLogRestartTableEntries {
+		count = maxLogRestartTableEntries
+	}
+
+	table.Entries = make([][]byte, 0, count)
+	for i := 0; i < count; i++ {
+		start := logRestartTableHeaderSize + i*int(table.EntrySize)
+		entry := make([]byte, table.EntrySize)
+		copy(entry, buf[start:start+int(table.EntrySize)])
+		table.Entries = append(table.Entries, entry)
+	}
+
+	return table, nil
+}
+
+// IsTableDump reports whether the record carries one of the periodic table dumps
+// rather than a file system operation.
+func (r *LogRecord) IsTableDump() bool {
+	if r == nil || !r.IsClientRecord() {
+		return false
+	}
+
+	switch r.RedoOperation {
+	case LogOpOpenAttributeTableDump, LogOpAttributeNamesDump,
+		LogOpDirtyPageTableDump, LogOpTransactionTableDump:
+		return true
+	default:
+		return false
+	}
+}
+
+// RestartTable decodes the table a dump record carries, or returns nil when the
+// record is not a table dump.
+func (r *LogRecord) RestartTable() (*LogRestartTable, error) {
+	if !r.IsTableDump() {
+		return nil, nil
+	}
+
+	return ParseLogRestartTable(r.RedoData)
+}
+
+// LogTransaction groups the records belonging to one NTFS transaction.
+//
+// A single user-visible action — creating a file, renaming one — is several log
+// records under one transaction ID, and reading them individually loses the fact
+// that they belong together. Grouping restores it.
+//
+// Committed and Forgotten say how the transaction ended. Neither being set means
+// the log's window does not contain the end of it, which for the oldest
+// transactions in a circular log is the normal case rather than a sign of
+// interrupted work.
+type LogTransaction struct {
+	ID        uint32
+	FirstLSN  uint64
+	LastLSN   uint64
+	Records   []*LogRecord
+	Committed bool // A CommitTransaction record was seen
+	Forgotten bool // A ForgetTransaction record was seen
+}
+
+// Operations returns the distinct redo operation names in the transaction, in
+// the order they first appear, which reads as a summary of what it did.
+func (t LogTransaction) Operations() []string {
+	seen := make(map[string]bool, len(t.Records))
+	names := make([]string, 0, len(t.Records))
+
+	for _, record := range t.Records {
+		name := record.RedoOperationName()
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+
+	return names
+}
+
+// GroupLogTransactions groups records by transaction, ordered by the lowest LSN
+// in each, which puts them in the order the transactions began.
+//
+// Records outside any transaction carry ID 0 and are grouped together under it.
+// Restart records carry no transaction and are skipped.
+//
+// Because the log is circular, a transaction near either end of the window will
+// be missing records that have been overwritten. The grouping reports what is
+// present rather than pretending otherwise.
+func GroupLogTransactions(records []*LogRecord) []LogTransaction {
+	byID := make(map[uint32]*LogTransaction)
+	order := make([]uint32, 0, len(records))
+
+	for _, record := range records {
+		if record == nil || !record.IsClientRecord() {
+			continue
+		}
+
+		transaction, ok := byID[record.TransactionID]
+		if !ok {
+			transaction = &LogTransaction{
+				ID:       record.TransactionID,
+				FirstLSN: record.LSN,
+				LastLSN:  record.LSN,
+			}
+			byID[record.TransactionID] = transaction
+			order = append(order, record.TransactionID)
+		}
+
+		transaction.Records = append(transaction.Records, record)
+
+		if record.LSN < transaction.FirstLSN {
+			transaction.FirstLSN = record.LSN
+		}
+		if record.LSN > transaction.LastLSN {
+			transaction.LastLSN = record.LSN
+		}
+
+		switch record.RedoOperation {
+		case LogOpCommitTransaction:
+			transaction.Committed = true
+		case LogOpForgetTransaction:
+			transaction.Forgotten = true
+		}
+	}
+
+	transactions := make([]LogTransaction, 0, len(order))
+	for _, id := range order {
+		transactions = append(transactions, *byID[id])
+	}
+
+	sort.Slice(transactions, func(i, j int) bool {
+		if transactions[i].FirstLSN != transactions[j].FirstLSN {
+			return transactions[i].FirstLSN < transactions[j].FirstLSN
+		}
+		return transactions[i].ID < transactions[j].ID
+	})
+
+	return transactions
 }
 
 // LogClient is one entry of a restart area's client array. NTFS is the only
