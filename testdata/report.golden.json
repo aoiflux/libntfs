@@ -1,0 +1,87 @@
+{
+  "name": "TESTVOL",
+  "start_offset": 0,
+  "end_offset": 65536,
+  "ntfs_meta": {
+    "type": "NTFS",
+    "block_size": 4096,
+    "offset": 16384
+  },
+  "files": [
+    {
+      "filename": "/notes.txt",
+      "type": "file",
+      "is_fragmented": false,
+      "is_deleted": false,
+      "size": 14,
+      "fragments": null
+    },
+    {
+      "filename": "/big.bin",
+      "type": "file",
+      "is_fragmented": true,
+      "is_deleted": false,
+      "size": 15384,
+      "fragments": [
+        {
+          "start_offset": 81920,
+          "end_offset": 90112,
+          "file_offset": 0,
+          "length": 8192,
+          "sparse": false,
+          "resident": false
+        },
+        {
+          "start_offset": 163840,
+          "end_offset": 171032,
+          "file_offset": 8192,
+          "length": 7192,
+          "sparse": false,
+          "resident": false
+        }
+      ]
+    },
+    {
+      "filename": "/sparse.bin",
+      "type": "file",
+      "is_fragmented": false,
+      "is_deleted": false,
+      "size": 12288,
+      "fragments": [
+        {
+          "start_offset": 245760,
+          "end_offset": 249856,
+          "file_offset": 8192,
+          "length": 4096,
+          "sparse": false,
+          "resident": false
+        }
+      ]
+    },
+    {
+      "filename": "/docs",
+      "type": "directory",
+      "is_fragmented": false,
+      "is_deleted": false,
+      "size": 0,
+      "fragments": null
+    },
+    {
+      "filename": "/deleted.txt",
+      "type": "file",
+      "is_fragmented": false,
+      "is_deleted": true,
+      "size": 2000,
+      "fragments": [
+        {
+          "start_offset": 286720,
+          "end_offset": 288720,
+          "file_offset": 0,
+          "length": 2000,
+          "sparse": false,
+          "resident": false
+        }
+      ]
+    }
+  ]
+}

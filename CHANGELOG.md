@@ -5,6 +5,78 @@ All notable changes to the libntfs project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0]
+
+### Added
+- `$LogFile` parsing. The transaction log is the finest-grained record of
+  activity on a volume — finer than the USN journal, since it captures the
+  individual attribute writes behind each change — and it was the last major
+  forensic artifact libntfs could not read.
+- `ParseLogRestartPage` decodes a restart page into a `LogRestartArea`: the log's
+  geometry, its current LSN, the chkdsk LSN, the open count, and the client
+  array. `"CHKD"` pages are accepted alongside `"RSTR"`, since a page chkdsk
+  rewrote still holds a restart area.
+- `ParseLogRecord` decodes one record, and `EachLogRecord` walks a whole
+  `$LogFile` buffer with no Volume, for a log extracted with KAPE or FTK Imager.
+  Records split across a page boundary are reassembled: the log's data area is
+  one logical byte stream chopped into pages, each with its own header and
+  update sequence, so a record can start near the end of one page and finish in
+  the next.
+- `(*Volume).OpenLogFile`, `(*Volume).LogRestartArea`, and
+  `(*Volume).EachLogRecord`. The restart area falls back to the second copy when
+  the first cannot be read, which is exactly the redundancy NTFS writes two for.
+  The log is read a chunk of pages at a time rather than loaded whole.
+- `LogRecord` exposes both halves of a record: the log-file-service header — LSN,
+  the previous and undo-next links, the transaction, the record type — and NTFS's
+  own fields, including the redo and undo operations, the target attribute and
+  VCN, the LCN list, and the redo and undo payloads. Payload interpretation is
+  left to the caller, since its meaning depends entirely on the operation.
+- 35 `LogOp*` constants and `LogOperationName`, plus
+  `(*LogRecord).RedoOperationName`, `.UndoOperationName`, and `.IsClientRecord`.
+- `ErrInvalidLogRecord`.
+- WSL POSIX metadata decoding on top of the extended attribute parser.
+  `(*File).LinuxAttributes` returns the mode, owner, group, device, and POSIX
+  timestamps WSL stores in `LXATTRB` — metadata no Windows tool surfaces and no
+  NTFS structure otherwise records. `ParseLinuxAttributes` decodes the value with
+  no Volume.
+- WSL1's older layout is supported too: when `LXATTRB` is absent, the separate
+  `$LXUID`, `$LXGID`, `$LXMOD`, and `$LXDEV` attributes are assembled into the
+  same shape, with `FromLegacyAttributes` set so a caller can tell which it got.
+  Names are matched case-insensitively and with or without the leading `$`, since
+  the two WSL generations disagree about the prefix.
+- `(*LinuxAttributes).ModeString` renders the mode the way `ls` does, setuid,
+  setgid, and sticky bits included. `.Permissions`, `.FileType`, and `.IsSymlink`
+  round it out. A POSIX zero timestamp reads as the zero time rather than 1970,
+  so an absent timestamp does not become a 1970 entry in a timeline.
+- `EANameLXATTRB` and the other WSL attribute name constants.
+- `examples/logdump`, reading `$LogFile` from a volume or a standalone file, with
+  `-restart` for the geometry, `-sort` to turn the circular log back into a
+  timeline, `-op` to filter by operation, `-data` for the payloads, and `-json`.
+- `TestReportGolden`, a golden-file test over `Report()`. Its output is the
+  library's widest surface and had changed twice with no test watching it. Run
+  `go test -run TestReportGolden -update` to rewrite the golden file after an
+  intended change.
+- A real-image test corpus. `testdata/make_corpus.ps1` builds a small NTFS volume
+  that Windows formats and populates — fragmented, sparse, compressed, and
+  resident files, an alternate data stream, a symlink, a junction, a deleted
+  entry, and WSL metadata — and `corpus_test.go` runs thirteen tests against it.
+  Every other test in the package builds NTFS structures byte by byte, which
+  proves the parsers against bytes libntfs itself wrote; these prove them against
+  bytes Windows wrote. The tests skip with instructions when the image has not
+  been generated, since generating it needs an elevated Windows prompt.
+- Fuzz targets `FuzzParseLogRestartPage`, `FuzzParseLogRecord`, and
+  `FuzzEachLogRecord`, the last driving the page walker so the carry buffer that
+  reassembles page-spanning records is exercised too.
+
+### Notes
+- `$LogFile` is read, not replayed. Reconstructing file content from redo data,
+  undoing to a consistent state, and replaying transactions are deliberately out
+  of scope: that is a different problem, and libntfs stops at handing over the
+  decoded records.
+- The log is circular, holding the most recent operations and overwriting the
+  oldest, so records arrive in whatever order the ring currently holds. Sort by
+  LSN for a timeline.
+
 ## [0.2.1]
 
 ### Added

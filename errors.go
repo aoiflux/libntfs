@@ -94,6 +94,9 @@ var (
 
 	// ErrInvalidReparsePoint indicates a malformed $REPARSE_POINT value.
 	ErrInvalidReparsePoint = errors.New("invalid or malformed reparse point")
+
+	// ErrInvalidLogRecord indicates a malformed $LogFile page or record.
+	ErrInvalidLogRecord = errors.New("invalid or malformed log record")
 )
 
 // VolumeError wraps errors specific to volume operations.

@@ -90,6 +90,70 @@ func FuzzParseDataRuns(f *testing.F) {
 	})
 }
 
+func FuzzParseLogRestartPage(f *testing.F) {
+	f.Add(buildLogRestartPage(logRestartOpts{currentLSN: 42, clientName: "NTFS"}))
+	f.Add(buildLogRestartPage(logRestartOpts{magic: LogChkdskPageMagic}))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		restart, err := ParseLogRestartPage(data)
+		if err != nil {
+			return
+		}
+
+		// The client array is bounded by the page it was read out of, so a
+		// corrupt client count must not conjure entries from nowhere.
+		if len(restart.Clients) > len(data) {
+			t.Fatalf("parsed %d clients from a %d byte page", len(restart.Clients), len(data))
+		}
+	})
+}
+
+func FuzzParseLogRecord(f *testing.F) {
+	f.Add(buildLogRecord(1, LogRecordTypeClient,
+		buildNTFSLogData(LogOpUpdateResidentValue, LogOpNoop, 3,
+			[]uint64{7, 8}, []byte("redo"), []byte("undo"))))
+	f.Add(buildLogRecord(2, LogRecordTypeRestart, make([]byte, 32)))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		record, consumed, err := ParseLogRecord(data)
+		if err != nil {
+			return
+		}
+
+		if consumed <= 0 || consumed > len(data)+logAlignment {
+			t.Fatalf("record consumed %d bytes of a %d byte buffer", consumed, len(data))
+		}
+
+		// Every payload is sliced out of the record's own client data, so none
+		// can be longer than the buffer it came from.
+		if len(record.RedoData) > len(data) || len(record.UndoData) > len(data) {
+			t.Fatalf("payload longer than the %d byte record", len(data))
+		}
+		if len(record.LCNs)*8 > len(data) {
+			t.Fatalf("parsed %d LCNs from a %d byte record", len(record.LCNs), len(data))
+		}
+
+		// Every accessor must survive whatever the parser produced.
+		_ = record.RedoOperationName()
+		_ = record.UndoOperationName()
+		_ = record.String()
+	})
+}
+
+// FuzzEachLogRecord drives the page walker rather than a single record, so the
+// carry buffer that reassembles page-spanning records is exercised too.
+func FuzzEachLogRecord(f *testing.F) {
+	f.Add(buildLogFileImage(f, buildLogRecord(1, LogRecordTypeClient,
+		buildNTFSLogData(LogOpCreateAttribute, LogOpNoop, 1, nil, []byte("seed"), nil))))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_ = EachLogRecord(data, func(*LogRecord) error { return nil })
+	})
+}
+
 func FuzzParseSecurityDescriptor(f *testing.F) {
 	f.Add(make([]byte, 20))
 	f.Add([]byte{})

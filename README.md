@@ -89,14 +89,21 @@ Implemented:
 - Extended attribute parsing ($EA and $EA_INFORMATION), including WSL metadata
 - Reparse point parsing with target resolution for symlinks, junctions, and WSL
   symlinks
+- WSL POSIX metadata decoding (mode, owner, group, POSIX timestamps) from both
+  the WSL2 LXATTRB layout and WSL1's separate attributes
 - Security descriptor parsing with $Secure lookup (owner, group, DACL, SACL)
 - USN change journal parsing from a volume or an extracted $J file
+- $LogFile transaction log parsing, including records split across page
+  boundaries, from a volume or an extracted $LogFile
 - File name namespace handling (DOS/Win32/WinDOS/POSIX)
 - Typed error model with context wrappers (including path traversal errors)
 
 Current limitations:
 
 - Encrypted file data: detection only (returns ErrEncryptedData)
+- $LogFile is read, not replayed: records are decoded and handed over, but
+  reconstructing file content from redo data, undoing to a consistent state, and
+  replaying transactions are out of scope
 - Standalone $MFT records expose metadata and data run maps, but their content
   cannot be read: that requires cluster access, which only a Volume provides
 - Write support is limited to in-place overwrite on writable handles: no file
@@ -152,6 +159,8 @@ Metadata-level:
 - ParseReparsePoint(buf []byte) (*ReparsePoint, error)
 - (*File).ReparsePoint() (*ReparsePoint, error)
 - (*ReparsePoint).Target() (substituteName, printName string, ok bool)
+- ParseLinuxAttributes(buf []byte) (*LinuxAttributes, error)
+- (*File).LinuxAttributes() (*LinuxAttributes, error)
 
 Journal-level:
 
@@ -159,6 +168,15 @@ Journal-level:
 - EachUSNRecord(buf []byte, fn func(*USNRecord) error) error
 - (*Volume).OpenUSNJournal() (*File, error)
 - (*Volume).EachUSNRecord(fn func(*USNRecord) error) error
+
+Log-level:
+
+- ParseLogRestartPage(buf []byte) (*LogRestartArea, error)
+- ParseLogRecord(buf []byte) (*LogRecord, int, error)
+- EachLogRecord(buf []byte, fn func(*LogRecord) error) error
+- (*Volume).OpenLogFile() (*File, error)
+- (*Volume).LogRestartArea() (*LogRestartArea, error)
+- (*Volume).EachLogRecord(fn func(*LogRecord) error) error
 
 Security-level:
 
@@ -420,6 +438,34 @@ header directly, and third-party tags, which carry a 16-byte owner GUID first.
 libntfs does not follow reparse points. A directory carrying one is reported as a
 directory, and `ReadDir` lists its own index rather than the target's.
 
+### WSL POSIX metadata
+
+`LinuxAttributes` decodes what WSL stores in those extended attributes into
+typed fields:
+
+```go
+attrs, err := file.LinuxAttributes()
+if err != nil {
+    log.Fatal(err)
+}
+
+if attrs != nil {
+    fmt.Printf("%s %d:%d  %s\n",
+        attrs.ModeString(), attrs.UID, attrs.GID, attrs.ModifyTime)
+}
+```
+
+This is metadata no Windows tool surfaces and no NTFS structure otherwise
+records. The POSIX timestamps are tracked separately from the NTFS ones in
+`$STANDARD_INFORMATION` and can disagree with them, which is occasionally the
+interesting part.
+
+WSL2 writes one `LXATTRB` attribute; WSL1 wrote the same fields as separate
+`$LXUID`, `$LXGID`, `$LXMOD`, and `$LXDEV` attributes. Both are read, and
+`FromLegacyAttributes` reports which. A POSIX zero timestamp reads as the zero
+time rather than 1970, so an absent timestamp does not become a 1970 entry in a
+timeline.
+
 ## USN Change Journal
 
 The journal records every create, delete, rename, and write, which makes it the
@@ -457,6 +503,70 @@ Zero-filled and malformed regions are skipped rather than ending the walk, so a
 partially damaged journal still yields the records around the damage. Version 4
 extent records carry no timestamp or file name and report that rather than
 inventing one.
+
+## Transaction Log ($LogFile)
+
+`$LogFile` records the metadata operations NTFS was about to perform. It is finer
+grained than the USN journal — it captures the individual attribute writes behind
+each change — and being circular, it covers a short window in far more detail
+than anything else on the volume.
+
+Start with the restart area, which says how recent the log's contents are:
+
+```go
+restart, err := vol.LogRestartArea()
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("current LSN %d, %d bytes of log, opened %d times\n",
+    restart.CurrentLSN, restart.FileSize, restart.RestartOpenCount)
+```
+
+Two copies are written, in the first two pages. The second is used when the first
+cannot be read, which is exactly the redundancy NTFS keeps them for.
+
+Then walk the records:
+
+```go
+err := vol.EachLogRecord(func(r *libntfs.LogRecord) error {
+    if !r.IsClientRecord() {
+        return nil // A client restart marker, not an operation
+    }
+    fmt.Printf("LSN %d  txn %d  %s / %s  vcn %d\n",
+        r.LSN, r.TransactionID,
+        r.RedoOperationName(), r.UndoOperationName(), r.TargetVCN)
+    return nil
+})
+```
+
+An extracted `$LogFile` parses with no volume at all, the same way `$J` does:
+
+```go
+data, err := os.ReadFile("$LogFile")
+if err != nil {
+    log.Fatal(err)
+}
+
+err = libntfs.EachLogRecord(data, func(r *libntfs.LogRecord) error { ... })
+```
+
+Two things are worth knowing before building on this.
+
+**The log is circular.** It holds the most recent operations and overwrites the
+oldest, so records arrive in whatever order the ring currently holds rather than
+oldest-first. Sort by `LSN` for a timeline.
+
+**libntfs reads the log; it does not replay it.** `RedoData` and `UndoData` are
+handed over as NTFS wrote them — for an `UpdateResidentValue`, the attribute
+bytes after and before the change. Interpreting them depends entirely on the
+operation, and reconstructing file content from redo data, undoing to a
+consistent state, and replaying transactions are deliberately out of scope.
+
+Records split across a page boundary are reassembled. The log's data area is one
+logical byte stream chopped into fixed-size pages, each with its own header and
+update sequence, so a record can start near the end of one page and finish in the
+next. Damaged and uninitialised pages are skipped rather than ending the walk.
 
 ## Error Handling
 
@@ -520,6 +630,8 @@ You can also use disk image files directly on all platforms.
 - examples/streams: data streams and access control for a path or MFT entry,
   with alternate-stream hunting and extraction
 - examples/usnjrnl: USN change journal timeline from a volume or an extracted $J
+- examples/logdump: $LogFile transaction log from a volume or an extracted
+  $LogFile, with operation filtering and LSN sorting
 
 Run one example:
 
@@ -552,8 +664,34 @@ go test -run '^$' -fuzz FuzzParseReparsePoint -fuzztime 60s
 go test -run '^$' -fuzz FuzzParseDataRuns -fuzztime 60s
 ```
 
-`FuzzParseEAInformation`, `FuzzParseSecurityDescriptor`, and `FuzzParseUSNRecord`
-round out the set.
+`FuzzParseEAInformation`, `FuzzParseSecurityDescriptor`, `FuzzParseUSNRecord`,
+`FuzzParseLogRestartPage`, `FuzzParseLogRecord`, and `FuzzEachLogRecord` round
+out the set.
+
+`Report()` is covered by a golden-file test, since its JSON is the library's
+widest output surface:
+
+```bash
+go test -run TestReportGolden           # compare against testdata/report.golden.json
+go test -run TestReportGolden -update   # rewrite it after an intended change
+```
+
+Most tests build NTFS structures byte by byte, which proves the parsers against
+bytes libntfs itself wrote. `corpus_test.go` proves them against bytes Windows
+wrote, using a small NTFS volume carrying one of each shape the library handles.
+Those tests skip until the image exists; generate it from an **elevated**
+PowerShell prompt:
+
+```powershell
+.\testdata\make_corpus.ps1
+```
+
+The script creates a VHD, formats it NTFS, writes the fixtures — fragmented,
+sparse, compressed, and resident files, an alternate data stream, a symlink, a
+junction, a deleted entry, and WSL metadata if a distribution is installed —
+and copies the raw volume out to `testdata/ntfs-corpus.img.gz`. On Linux,
+`mkntfs` produces an equivalent image without elevation, but that is ntfs-3g
+writing the structures rather than Windows, which is the point of the fixture.
 
 ## Project Status
 
