@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -129,7 +130,11 @@ func TestReportGolden(t *testing.T) {
 		t.Fatalf("reading %s failed (run with -update to create it): %v", reportGoldenPath, err)
 	}
 
-	if string(got) != string(want) {
+	// Compare on content rather than on line endings. .gitattributes keeps git
+	// from rewriting the fixture, but a test that fails because of how a file
+	// was checked out is testing the wrong thing, and this one did: it passed on
+	// Linux and macOS and failed on Windows.
+	if normalizeNewlines(string(got)) != normalizeNewlines(string(want)) {
 		t.Errorf("Report() output changed.\n--- want ---\n%s\n--- got ---\n%s\n"+
 			"If the change is intended, rerun with -update and review the diff.", want, got)
 	}
@@ -172,4 +177,10 @@ func TestReportFragmentsExcludeHoles(t *testing.T) {
 	if sparse.IsFragmented {
 		t.Error("expected a single allocated run not to count as fragmented")
 	}
+}
+
+// normalizeNewlines makes a comparison indifferent to CRLF, so a golden test
+// checks the output rather than the checkout.
+func normalizeNewlines(text string) string {
+	return strings.ReplaceAll(text, "\r\n", "\n")
 }

@@ -1,0 +1,13 @@
+# Test fixtures must arrive byte for byte as they were committed.
+#
+# Without this, a checkout on Windows converts LF to CRLF for anything git
+# considers text. The golden file is compared against output a Go encoder
+# produced with LF endings, so the converted copy never matches and the test
+# fails on Windows while passing on Linux and macOS — which is exactly how it
+# was found.
+testdata/** -text
+
+# Disk images are binary and must never be touched.
+*.dd binary
+*.img binary
+*.gz binary

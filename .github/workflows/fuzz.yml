@@ -60,11 +60,15 @@ jobs:
           restore-keys: |
             fuzz-${{ matrix.target }}-
 
+      # FUZZTIME is set as an environment variable rather than interpolated into
+      # the command, so the expression is evaluated by YAML once and the shell
+      # never sees a quote it has to survive. Inlining it needed nested quoting
+      # that made the whole workflow file unparseable.
       - name: Fuzz
-        run: |
-          go test -run '^$' \
-            -fuzz '^${{ matrix.target }}$' \
-            -fuzztime '${{ inputs.fuzztime || ''10m'' }}' .
+        env:
+          FUZZTIME: ${{ inputs.fuzztime || '10m' }}
+          TARGET: ${{ matrix.target }}
+        run: go test -run '^$' -fuzz "^${TARGET}$" -fuzztime "$FUZZTIME" .
 
       # A crash writes its input to testdata/fuzz/<target>/, which becomes a
       # permanent regression case once committed. Upload it so the failure is
