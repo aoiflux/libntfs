@@ -77,6 +77,15 @@ var (
 	// ErrInvalidIndex indicates an index structure is invalid.
 	ErrInvalidIndex = errors.New("invalid index structure")
 
+	// ErrCorruptIndex indicates a directory index entry or index record could
+	// not be parsed. It wraps ErrInvalidIndex so callers already matching the
+	// broader error keep matching.
+	ErrCorruptIndex = fmt.Errorf("%w: corrupt directory index", ErrInvalidIndex)
+
+	// ErrTruncatedRecord indicates a record ended before the structures it
+	// declared did. It wraps ErrInvalidIndex for the same reason.
+	ErrTruncatedRecord = fmt.Errorf("%w: truncated index record", ErrInvalidIndex)
+
 	// ErrCacheFull indicates the cache is full.
 	ErrCacheFull = errors.New("cache is full")
 
@@ -98,6 +107,35 @@ var (
 	// ErrInvalidLogRecord indicates a malformed $LogFile page or record.
 	ErrInvalidLogRecord = errors.New("invalid or malformed log record")
 )
+
+// PartialDirError reports that a directory listing is incomplete.
+//
+// ReadDir returns it alongside the entries it did recover, so a walk over a
+// damaged volume can record what was lost and carry on rather than treating
+// the whole subtree as unreadable. Callers that only care whether the listing
+// is trustworthy can keep testing err != nil; callers that want the surviving
+// names should check for this type:
+//
+//	entries, err := dir.ReadDir()
+//	var partial *libntfs.PartialDirError
+//	if errors.As(err, &partial) {
+//		// entries holds partial.Recovered names; partial.Skipped were lost.
+//	}
+type PartialDirError struct {
+	EntryNum  uint64 // MFT entry of the directory
+	Recovered int    // Entries successfully parsed and returned
+	Skipped   int    // Index records that could not be parsed
+	Err       error  // Underlying error (ErrCorruptIndex, ErrTruncatedRecord, ...)
+}
+
+func (e *PartialDirError) Error() string {
+	return fmt.Sprintf("directory %d: recovered %d entries, skipped %d index records: %v",
+		e.EntryNum, e.Recovered, e.Skipped, e.Err)
+}
+
+func (e *PartialDirError) Unwrap() error {
+	return e.Err
+}
 
 // VolumeError wraps errors specific to volume operations.
 type VolumeError struct {

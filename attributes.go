@@ -442,7 +442,15 @@ func parseDeletedFileNameFromIndexSlack(data []byte, offset int) (*FileName, int
 		return nil, 0
 	}
 
+	// Rounding up to the 4-byte boundary a real entry would be padded to can
+	// reach past the end of the buffer, since only the name itself was
+	// checked against it. Clamp, so the caller never reports an entry longer
+	// than the data it was handed.
 	consumed := AlignUp(16+66+nameLen*2, 4)
+	if offset+consumed > len(data) {
+		consumed = len(data) - offset
+	}
+
 	return fn, consumed
 }
 

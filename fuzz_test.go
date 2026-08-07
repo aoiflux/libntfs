@@ -1,6 +1,8 @@
 package libntfs
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -298,4 +300,182 @@ func FuzzParseUSNRecord(f *testing.F) {
 			t.Fatalf("record consumed %d bytes of a %d byte buffer", size, len(data))
 		}
 	})
+}
+
+// The index targets below cover the directory-listing path. They are split in
+// two on purpose: the entry and record parsers take bytes off the disk, while
+// the accumulator takes already-parsed entries and merges them. The panic that
+// v0.3.0 shipped lived in the second, where no amount of malformed input to
+// the first would have reached it.
+
+func FuzzParseIndexEntries(f *testing.F) {
+	f.Add(buildIndexEntry(30, 1, buildFileNameAttrValue(5, 1, "seed.txt", NamespaceWin32, 4096, 1024, 0x20)))
+	f.Add(make([]byte, 16)) // Header-only entry, EntryLength 0
+	f.Add(make([]byte, 15)) // Shorter than a header
+	f.Add([]byte{})
+
+	overlong := buildIndexEntry(30, 1, buildFileNameAttrValue(5, 1, "over.txt", NamespaceWin32, 4096, 1024, 0x20))
+	WriteUint16LE(overlong, 8, 0xFFFF) // EntryLength past the buffer
+	f.Add(overlong)
+
+	unaligned := buildIndexEntry(30, 1, buildFileNameAttrValue(5, 1, "odd.txt", NamespaceWin32, 4096, 1024, 0x20))
+	WriteUint16LE(unaligned, 8, uint16(len(unaligned))-1) // Not 4-aligned
+	f.Add(unaligned)
+
+	overrun := buildIndexEntry(30, 1, buildFileNameAttrValue(5, 1, "run.txt", NamespaceWin32, 4096, 1024, 0x20))
+	WriteUint16LE(overrun, 10, 0xFFF0) // StreamLength past EntryLength
+	f.Add(overrun)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		entries, err := parseIndexEntries(data)
+		if err != nil {
+			return
+		}
+		assertIndexEntriesWithin(t, entries, data)
+	})
+}
+
+func FuzzParseIndexEntriesRecoverDeleted(f *testing.F) {
+	seed := buildIndexEntry(30, 1, buildFileNameAttrValue(5, 1, "seed.txt", NamespaceWin32, 4096, 1024, 0x20))
+	f.Add(seed, len(seed))
+	f.Add(seed, 0)              // Everything is slack
+	f.Add(seed, len(seed)*4)    // usedLen past the buffer
+	f.Add(seed, -1)             // Negative usedLen
+	f.Add(make([]byte, 16), 16) // Header-only
+	f.Add([]byte{}, 0)          // Empty
+	f.Add(make([]byte, 3), 3)   // Shorter than a header
+
+	f.Fuzz(func(t *testing.T, data []byte, usedLen int) {
+		entries, err := parseIndexEntriesRecoverDeleted(data, usedLen)
+		if err != nil {
+			return
+		}
+		assertIndexEntriesWithin(t, entries, data)
+	})
+}
+
+func FuzzParseIndexRecord(f *testing.F) {
+	f.Add(buildIndexAllocationRecord(f, 4096, 0,
+		buildIndexEntry(30, 1, buildFileNameAttrValue(5, 1, "seed.txt", NamespaceWin32, 4096, 1024, 0x20))))
+	f.Add(buildIndexAllocationRecord(f, 512, 0))
+
+	// Records too short for the reads the header offsets imply. An
+	// $INDEX_ALLOCATION whose boot-sector record size is bogus produces
+	// exactly these.
+	for _, size := range []int{0, 2, 4, 8, 24, 39} {
+		short := make([]byte, size)
+		if size >= 4 {
+			WriteUint32LE(short, 0, IndexAllocationMagic)
+		}
+		f.Add(short)
+	}
+
+	// A well-formed record whose node bounds point outside it.
+	bogusBounds := buildIndexAllocationRecord(f, 4096, 0)
+	WriteUint32LE(bogusBounds, indexRecordHeaderSize+8, 0xFFFFFFFF)
+	f.Add(bogusBounds)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		entries, err := parseIndexRecord(data)
+		if err != nil {
+			return
+		}
+		assertIndexEntriesWithin(t, entries, data)
+	})
+}
+
+// FuzzDirEntryAccumulator drives the merge step that panicked in v0.3.0.
+//
+// The invariant it asserts is the one the old code broke: every position held
+// in the dedup maps has to address a live entry. A stale position is not a
+// cosmetic problem -- it is read back as a slice index on the next matching
+// name, which is what turned one directory into a dead volume walk.
+func FuzzDirEntryAccumulator(f *testing.F) {
+	f.Add([]byte{5, 2, 0, 0, 5, 1, 1, 0})             // 8.3 then long name, same reference
+	f.Add([]byte{5, 2, 0, 0, 6, 2, 1, 0, 6, 1, 2, 0}) // Two 8.3 names, long name for the second
+	f.Add([]byte{9, 1, 0, 1, 9, 1, 0, 0})             // Deleted then allocated duplicate
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		acc := newDirEntryAccumulator(nil)
+
+		for _, idxEntry := range decodeSyntheticIndexEntries(data) {
+			acc.add(idxEntry)
+
+			for ref, pos := range acc.dosIndexByRef {
+				if pos < 0 || pos >= len(acc.entries) {
+					t.Fatalf("dosIndexByRef[%d] = %d addresses nothing in %d entries",
+						ref, pos, len(acc.entries))
+				}
+			}
+			for key, pos := range acc.seenByName {
+				if pos < 0 || pos >= len(acc.entries) {
+					t.Fatalf("seenByName[%q] = %d addresses nothing in %d entries",
+						key, pos, len(acc.entries))
+				}
+			}
+		}
+
+		// The maps exist to collapse duplicates, so the result must not hold
+		// the same reference and name twice.
+		seen := make(map[string]bool, len(acc.entries))
+		for _, entry := range acc.entries {
+			key := strings.ToLower(fmt.Sprintf("%d|%s", entry.EntryNum, entry.Name))
+			if seen[key] {
+				t.Fatalf("duplicate entry %s survived deduplication", key)
+			}
+			seen[key] = true
+		}
+	})
+}
+
+// decodeSyntheticIndexEntries turns fuzz bytes into index entries that are
+// already well-formed, so the target exercises the merge rules rather than
+// re-testing the parsers.
+func decodeSyntheticIndexEntries(data []byte) []IndexEntry {
+	names := []string{"a.txt", "A~1.TXT", "b.txt", "B~1.TXT", "", ".", "..", "Program Files"}
+
+	var entries []IndexEntry
+	for i := 0; i+4 <= len(data); i += 4 {
+		fileName := &FileName{
+			Name:      names[int(data[i+2])%len(names)],
+			Namespace: data[i+1] % 4,
+		}
+
+		entry := IndexEntry{
+			FileReference: uint64(data[i]),
+			SequenceNum:   1,
+			Deleted:       data[i+3]&1 != 0,
+			FileName:      fileName,
+		}
+		if data[i+3]&2 != 0 {
+			entry.FileName = nil // add must tolerate an entry with no name
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries
+}
+
+// assertIndexEntriesWithin checks that no parsed entry claims more bytes than
+// the buffer it came from.
+func assertIndexEntriesWithin(t *testing.T, entries []IndexEntry, data []byte) {
+	t.Helper()
+
+	for _, entry := range entries {
+		if int(entry.EntryLength) > len(data) {
+			t.Fatalf("entry claims %d bytes of a %d byte buffer", entry.EntryLength, len(data))
+		}
+		if len(entry.Stream) > len(data) {
+			t.Fatalf("entry stream is %d bytes of a %d byte buffer", len(entry.Stream), len(data))
+		}
+		// The name is measured in runes, not bytes: it is stored as UTF-16 and
+		// returned as UTF-8, which expands by up to half again. Each rune still
+		// costs at least one 2-byte code unit inside the buffer.
+		if entry.FileName != nil && utf8.RuneCountInString(entry.FileName.Name) > len(data)/2 {
+			t.Fatalf("entry name is %d runes from a %d byte buffer",
+				utf8.RuneCountInString(entry.FileName.Name), len(data))
+		}
+	}
 }

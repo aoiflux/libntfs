@@ -40,6 +40,10 @@ jobs:
           - FuzzEachLogRecord
           - FuzzParseLinuxAttributes
           - FuzzParseLinuxExtendedAttributes
+          - FuzzParseIndexEntries
+          - FuzzParseIndexEntriesRecoverDeleted
+          - FuzzParseIndexRecord
+          - FuzzDirEntryAccumulator
 
     steps:
       - uses: actions/checkout@v4

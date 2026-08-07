@@ -25,6 +25,12 @@ const (
 	IndexEntryHeaderSize = 16
 	IndexAllocationMagic = 0x58444E49 // "INDX"
 
+	// An INDX record carries a fixup array over 512-byte sectors, so it can
+	// never be smaller than one sector. The upper bound matches the largest
+	// cluster NTFS supports.
+	MinIndexRecordSize = 512   // Minimum $INDEX_ALLOCATION record size
+	MaxIndexRecordSize = 65536 // Maximum $INDEX_ALLOCATION record size
+
 	// Time conversion constants
 	// Number of 100-nanosecond intervals between 1601-01-01 and 1970-01-01
 	NTFSTimeOffset    = 116444736000000000

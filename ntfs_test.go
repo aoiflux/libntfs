@@ -986,10 +986,7 @@ func TestNormalizeNTFSPath(t *testing.T) {
 }
 
 func TestAddIndexDirEntryPrefersLongOverDOS(t *testing.T) {
-	var entries []DirEntry
-	dosIndexByRef := make(map[uint64]int)
-	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]int)
+	acc := newDirEntryAccumulator(nil)
 
 	dos := IndexEntry{
 		FileReference: 42,
@@ -1008,22 +1005,80 @@ func TestAddIndexDirEntryPrefersLongOverDOS(t *testing.T) {
 		},
 	}
 
-	entries = addIndexDirEntry(entries, dos, dosIndexByRef, longSeenByRef, seenByName, nil)
-	entries = addIndexDirEntry(entries, long, dosIndexByRef, longSeenByRef, seenByName, nil)
+	acc.add(dos)
+	acc.add(long)
 
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(entries))
+	if len(acc.entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(acc.entries))
 	}
-	if entries[0].Name != "Program Files" {
-		t.Fatalf("expected long name replacement, got %q", entries[0].Name)
+	if acc.entries[0].Name != "Program Files" {
+		t.Fatalf("expected long name replacement, got %q", acc.entries[0].Name)
+	}
+}
+
+// TestAddIndexDirEntrySplitAcrossSources covers the case that panicked in
+// v0.3.0: a file whose 8.3 name sorts into $INDEX_ROOT while its long name
+// sorts into an $INDEX_ALLOCATION block. The two sources were collected into
+// separate slices while sharing the dedup maps, so the position recorded for
+// the 8.3 name indexed a slice that did not contain it.
+func TestAddIndexDirEntrySplitAcrossSources(t *testing.T) {
+	acc := newDirEntryAccumulator(nil)
+
+	// $INDEX_ROOT pass: two 8.3 names, the second at position 1.
+	acc.add(IndexEntry{
+		FileReference: 5, SequenceNum: 1,
+		FileName: &FileName{Name: "AAAAAA~1.TXT", Namespace: NamespaceDOS},
+	})
+	acc.add(IndexEntry{
+		FileReference: 6, SequenceNum: 1,
+		FileName: &FileName{Name: "BBBBBB~1.TXT", Namespace: NamespaceDOS},
+	})
+
+	// $INDEX_ALLOCATION pass: the long name for reference 6.
+	acc.add(IndexEntry{
+		FileReference: 6, SequenceNum: 1,
+		FileName: &FileName{Name: "a long file name.txt", Namespace: NamespaceWin32},
+	})
+
+	if len(acc.entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(acc.entries))
+	}
+	if acc.entries[1].Name != "a long file name.txt" {
+		t.Fatalf("expected the long name to replace the 8.3 name in place, got %q", acc.entries[1].Name)
+	}
+	if acc.entries[0].Name != "AAAAAA~1.TXT" {
+		t.Fatalf("unrelated entry was overwritten: %q", acc.entries[0].Name)
+	}
+}
+
+// TestAddIndexDirEntryStalePositionDoesNotPanic asserts the accumulator
+// degrades into a duplicate rather than a panic if a recorded position is ever
+// invalidated, which is what turned a single bad directory into a dead walk.
+func TestAddIndexDirEntryStalePositionDoesNotPanic(t *testing.T) {
+	acc := newDirEntryAccumulator(nil)
+	acc.add(IndexEntry{
+		FileReference: 9, SequenceNum: 1,
+		FileName: &FileName{Name: "SHORT~1.TXT", Namespace: NamespaceDOS},
+	})
+
+	// Simulate the corruption the old code produced.
+	acc.entries = nil
+
+	acc.add(IndexEntry{
+		FileReference: 9, SequenceNum: 1,
+		FileName: &FileName{Name: "short name.txt", Namespace: NamespaceWin32},
+	})
+
+	if len(acc.entries) != 1 {
+		t.Fatalf("expected the entry to be appended, got %d entries", len(acc.entries))
+	}
+	if acc.entries[0].Name != "short name.txt" {
+		t.Fatalf("unexpected entry %q", acc.entries[0].Name)
 	}
 }
 
 func TestAddIndexDirEntryKeepsDistinctNamesForSameEntry(t *testing.T) {
-	var entries []DirEntry
-	dosIndexByRef := make(map[uint64]int)
-	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]int)
+	acc := newDirEntryAccumulator(nil)
 
 	nameA := IndexEntry{
 		FileReference: 55,
@@ -1042,14 +1097,14 @@ func TestAddIndexDirEntryKeepsDistinctNamesForSameEntry(t *testing.T) {
 		},
 	}
 
-	entries = addIndexDirEntry(entries, nameA, dosIndexByRef, longSeenByRef, seenByName, nil)
-	entries = addIndexDirEntry(entries, nameB, dosIndexByRef, longSeenByRef, seenByName, nil)
+	acc.add(nameA)
+	acc.add(nameB)
 
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 distinct names, got %d", len(entries))
+	if len(acc.entries) != 2 {
+		t.Fatalf("expected 2 distinct names, got %d", len(acc.entries))
 	}
 
-	gotNames := []string{entries[0].Name, entries[1].Name}
+	gotNames := []string{acc.entries[0].Name, acc.entries[1].Name}
 	wantNames := []string{"alpha.txt", "beta.txt"}
 	if !reflect.DeepEqual(gotNames, wantNames) {
 		t.Fatalf("unexpected names: got %v want %v", gotNames, wantNames)
@@ -1057,11 +1112,6 @@ func TestAddIndexDirEntryKeepsDistinctNamesForSameEntry(t *testing.T) {
 }
 
 func TestAddIndexDirEntryResolverOverridesFileNameType(t *testing.T) {
-	var entries []DirEntry
-	dosIndexByRef := make(map[uint64]int)
-	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]int)
-
 	idx := IndexEntry{
 		FileReference: 77,
 		SequenceNum:   1,
@@ -1079,22 +1129,18 @@ func TestAddIndexDirEntryResolverOverridesFileNameType(t *testing.T) {
 		return true, nil
 	}
 
-	entries = addIndexDirEntry(entries, idx, dosIndexByRef, longSeenByRef, seenByName, resolver)
+	acc := newDirEntryAccumulator(resolver)
+	acc.add(idx)
 
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(entries))
+	if len(acc.entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(acc.entries))
 	}
-	if !entries[0].IsDirectory {
+	if !acc.entries[0].IsDirectory {
 		t.Fatal("expected entry to be directory based on resolver")
 	}
 }
 
 func TestAddIndexDirEntryResolverFallbackOnError(t *testing.T) {
-	var entries []DirEntry
-	dosIndexByRef := make(map[uint64]int)
-	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]int)
-
 	idx := IndexEntry{
 		FileReference: 88,
 		SequenceNum:   1,
@@ -1109,21 +1155,19 @@ func TestAddIndexDirEntryResolverFallbackOnError(t *testing.T) {
 		return false, fmt.Errorf("lookup failed")
 	}
 
-	entries = addIndexDirEntry(entries, idx, dosIndexByRef, longSeenByRef, seenByName, resolver)
+	acc := newDirEntryAccumulator(resolver)
+	acc.add(idx)
 
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(entries))
+	if len(acc.entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(acc.entries))
 	}
-	if entries[0].IsDirectory {
+	if acc.entries[0].IsDirectory {
 		t.Fatal("expected fallback to file-name attributes when resolver fails")
 	}
 }
 
 func TestAddIndexDirEntryPrefersAllocatedOverDeletedDuplicate(t *testing.T) {
-	var entries []DirEntry
-	dosIndexByRef := make(map[uint64]int)
-	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]int)
+	acc := newDirEntryAccumulator(nil)
 
 	deleted := IndexEntry{
 		FileReference: 91,
@@ -1137,13 +1181,13 @@ func TestAddIndexDirEntryPrefersAllocatedOverDeletedDuplicate(t *testing.T) {
 	allocated := deleted
 	allocated.Deleted = false
 
-	entries = addIndexDirEntry(entries, deleted, dosIndexByRef, longSeenByRef, seenByName, nil)
-	entries = addIndexDirEntry(entries, allocated, dosIndexByRef, longSeenByRef, seenByName, nil)
+	acc.add(deleted)
+	acc.add(allocated)
 
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(entries))
+	if len(acc.entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(acc.entries))
 	}
-	if entries[0].Deleted {
+	if acc.entries[0].Deleted {
 		t.Fatal("expected allocated entry to replace deleted duplicate")
 	}
 }

@@ -240,7 +240,12 @@ func (v *Volume) parseBootSector() error {
 			ErrInvalidBootSector, v.mftRecordSize, bs.ClustersPerMFTRecord)
 	}
 
-	if v.indexRecordSize == 0 {
+	// An INDX record has to hold its own 24-byte header plus a 16-byte node
+	// header before any entry, and the fixup array assumes 512-byte sectors.
+	// A damaged boot sector can encode a size below that -- ClustersPerIndexRecord
+	// of -1 yields 2 -- which the index reader would otherwise take at face value.
+	if v.indexRecordSize < MinIndexRecordSize || v.indexRecordSize > MaxIndexRecordSize ||
+		v.indexRecordSize&(v.indexRecordSize-1) != 0 {
 		return fmt.Errorf("%w: invalid index record size %d (ClustersPerIndexRecord=%d)",
 			ErrInvalidBootSector, v.indexRecordSize, bs.ClustersPerIndexRecord)
 	}

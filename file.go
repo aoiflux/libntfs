@@ -1,6 +1,7 @@
 package libntfs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -99,21 +100,60 @@ func normalizeNTFSPath(filePath string) string {
 	return filePath
 }
 
-func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
-	dosIndexByRef map[uint64]int,
-	longSeenByRef map[uint64]bool,
-	seenByName map[string]int,
-	resolveType dirTypeResolver,
-) []DirEntry {
+// dirEntryAccumulator collects the entries of a single directory from every
+// source that contributes to it: $INDEX_ROOT, $INDEX_ALLOCATION, and the
+// optional MFT parent-link fallback.
+//
+// The dedup maps hold positions into entries, so all three sources have to
+// append to one slice. Collecting a source into a slice of its own and
+// concatenating afterwards rebases those positions: a recorded index then
+// addresses an unrelated entry, or none at all. Keeping the slice and the maps
+// behind one type is what stops that from being expressible.
+type dirEntryAccumulator struct {
+	entries []DirEntry
+
+	// dosIndexByRef maps a file reference to the position of its 8.3 name,
+	// so a long name found later can replace it in place.
+	dosIndexByRef map[uint64]int
+	// longSeenByRef records file references whose long name is already
+	// present, so a later 8.3 name for the same file is dropped.
+	longSeenByRef map[uint64]bool
+	// seenByName maps reference|name to a position, collapsing the duplicate
+	// names that slack-space recovery produces.
+	seenByName map[string]int
+
+	resolveType dirTypeResolver
+}
+
+func newDirEntryAccumulator(resolveType dirTypeResolver) *dirEntryAccumulator {
+	return &dirEntryAccumulator{
+		dosIndexByRef: make(map[uint64]int),
+		longSeenByRef: make(map[uint64]bool),
+		seenByName:    make(map[string]int),
+		resolveType:   resolveType,
+	}
+}
+
+// at reports whether pos addresses a live entry. A recorded position can only
+// be stale if a caller collected entries somewhere other than this
+// accumulator, which the type is arranged to prevent; the check is here so
+// that a future regression degrades into a duplicate entry rather than a
+// panic in the middle of a volume walk.
+func (a *dirEntryAccumulator) at(pos int) bool {
+	return pos >= 0 && pos < len(a.entries)
+}
+
+// add merges one index entry into the accumulated listing.
+func (a *dirEntryAccumulator) add(idxEntry IndexEntry) {
 	if idxEntry.FileName == nil {
-		return entries
+		return
 	}
 
 	entry := DirEntry{
 		Name:          idxEntry.FileName.Name,
 		EntryNum:      idxEntry.FileReference,
 		SequenceNum:   idxEntry.SequenceNum,
-		IsDirectory:   resolveDirEntryIsDirectory(idxEntry, resolveType),
+		IsDirectory:   resolveDirEntryIsDirectory(idxEntry, a.resolveType),
 		Deleted:       idxEntry.Deleted,
 		Size:          idxEntry.FileName.RealSize,
 		AllocatedSize: idxEntry.FileName.AllocatedSize,
@@ -124,43 +164,48 @@ func addIndexDirEntry(entries []DirEntry, idxEntry IndexEntry,
 	}
 
 	if entry.Name == "." || entry.Name == ".." {
-		return entries
+		return
 	}
 
 	key := strings.ToLower(fmt.Sprintf("%d|%s", entry.EntryNum, entry.Name))
-	if existingIdx, exists := seenByName[key]; exists {
-		if entries[existingIdx].Deleted && !entry.Deleted {
-			entries[existingIdx] = entry
+	if existingIdx, exists := a.seenByName[key]; exists {
+		if a.at(existingIdx) {
+			if a.entries[existingIdx].Deleted && !entry.Deleted {
+				a.entries[existingIdx] = entry
+			}
+			return
 		}
-		return entries
+		delete(a.seenByName, key)
 	}
 
 	namespace := idxEntry.FileName.Namespace
 	if namespace == NamespaceDOS {
-		if longSeenByRef[entry.EntryNum] {
-			return entries
+		if a.longSeenByRef[entry.EntryNum] {
+			return
 		}
-		if _, exists := dosIndexByRef[entry.EntryNum]; exists {
-			return entries
+		if _, exists := a.dosIndexByRef[entry.EntryNum]; exists {
+			return
 		}
 
-		entries = append(entries, entry)
-		dosIndexByRef[entry.EntryNum] = len(entries) - 1
-		seenByName[key] = len(entries) - 1
-		return entries
+		a.entries = append(a.entries, entry)
+		a.dosIndexByRef[entry.EntryNum] = len(a.entries) - 1
+		a.seenByName[key] = len(a.entries) - 1
+		return
 	}
 
-	longSeenByRef[entry.EntryNum] = true
-	if dosIdx, exists := dosIndexByRef[entry.EntryNum]; exists {
-		entries[dosIdx] = entry
-		delete(dosIndexByRef, entry.EntryNum)
-		seenByName[key] = dosIdx
-		return entries
+	a.longSeenByRef[entry.EntryNum] = true
+	if dosIdx, exists := a.dosIndexByRef[entry.EntryNum]; exists {
+		delete(a.dosIndexByRef, entry.EntryNum)
+		if a.at(dosIdx) {
+			// Replace the 8.3 name already recorded for this file.
+			a.entries[dosIdx] = entry
+			a.seenByName[key] = dosIdx
+			return
+		}
 	}
 
-	entries = append(entries, entry)
-	seenByName[key] = len(entries) - 1
-	return entries
+	a.entries = append(a.entries, entry)
+	a.seenByName[key] = len(a.entries) - 1
 }
 
 func mftParentLookupSequences(dirEntry *MFTEntry) []uint16 {
@@ -352,11 +397,14 @@ func (v *Volume) OpenPath(filePath string) (*File, error) {
 				fmt.Errorf("%w: %s is not a directory", ErrNotDirectory, current.name))
 		}
 
-		// Read directory entries
+		// Read directory entries. A partially readable directory may still
+		// hold the component being looked up, so the error is deferred until
+		// the search over what was recovered actually fails.
 		entries, err := current.ReadDir()
-		if err != nil {
+		if err != nil && !isPartialDirError(err) {
 			return nil, wrapPathError("readdir", filePath, pathSoFar, err)
 		}
+		readErr := err
 
 		// Find matching entry
 		found := false
@@ -375,6 +423,11 @@ func (v *Volume) OpenPath(filePath string) (*File, error) {
 		}
 
 		if !found {
+			// The component is genuinely absent from what could be read, so
+			// a damaged index is now the better explanation to report.
+			if readErr != nil {
+				return nil, wrapPathError("readdir", filePath, pathSoFar, readErr)
+			}
 			return nil, wrapPathError("lookup", filePath, pathSoFar,
 				fmt.Errorf("%w: %s", ErrFileNotFound, pathSoFar))
 		}
@@ -649,6 +702,13 @@ func (f *File) ReadAll() ([]byte, error) {
 
 // ReadDir reads the directory entries.
 // Only valid for directories.
+//
+// On a damaged volume ReadDir returns the entries it could parse together with
+// a *PartialDirError, so both return values can be non-nil. A caller walking a
+// whole volume can then record the loss and descend into what survived instead
+// of losing the subtree; a caller that wants nothing but complete listings can
+// keep testing err != nil. A nil slice with a non-nil error means nothing at
+// all could be read, and the error wraps ErrCorruptIndex or ErrNotDirectory.
 func (f *File) ReadDir() ([]DirEntry, error) {
 	if f.volume.IsClosed() {
 		return nil, ErrVolumeClosed
@@ -661,19 +721,16 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 	// Find $INDEX_ROOT attribute
 	indexRootAttr := f.entry.FindAttribute(AttrTypeIndexRoot, "$I30")
 	if indexRootAttr == nil || indexRootAttr.Resident == nil {
-		return nil, fmt.Errorf("directory missing $INDEX_ROOT attribute")
+		return nil, fmt.Errorf("%w: directory missing $INDEX_ROOT attribute", ErrCorruptIndex)
 	}
 
 	// Parse $INDEX_ROOT
 	indexRoot, err := parseIndexRoot(indexRootAttr.Resident.Value)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse $INDEX_ROOT: %w", err)
+		return nil, fmt.Errorf("%w: failed to parse $INDEX_ROOT: %w", ErrCorruptIndex, err)
 	}
 
-	var entries []DirEntry
-	dosIndexByRef := make(map[uint64]int)
-	longSeenByRef := make(map[uint64]bool)
-	seenByName := make(map[string]int)
+	acc := newDirEntryAccumulator(nil)
 
 	entryListOffset := int(indexRoot.NodeHeader.EntryListOffset)
 	entryListUsedEnd := int(indexRoot.NodeHeader.EntryListEnd)
@@ -683,15 +740,15 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 	entriesAllocEnd := 16 + entryListAllocEnd
 
 	if entriesStart < 16 || entriesUsedEnd < entriesStart || entriesAllocEnd < entriesUsedEnd || entriesAllocEnd > len(indexRootAttr.Resident.Value) {
-		return nil, fmt.Errorf("invalid $INDEX_ROOT entry bounds (start=%d usedEnd=%d allocEnd=%d size=%d)",
-			entriesStart, entriesUsedEnd, entriesAllocEnd, len(indexRootAttr.Resident.Value))
+		return nil, fmt.Errorf("%w: invalid $INDEX_ROOT entry bounds (start=%d usedEnd=%d allocEnd=%d size=%d)",
+			ErrCorruptIndex, entriesStart, entriesUsedEnd, entriesAllocEnd, len(indexRootAttr.Resident.Value))
 	}
 
 	rootEntriesData := indexRootAttr.Resident.Value[entriesStart:entriesAllocEnd]
 	rootUsedLen := entriesUsedEnd - entriesStart
 	rootEntries, err := parseIndexEntriesRecoverDeleted(rootEntriesData, rootUsedLen)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse $INDEX_ROOT entries: %w", err)
+		return nil, fmt.Errorf("%w: failed to parse $INDEX_ROOT entries: %w", ErrCorruptIndex, err)
 	}
 
 	// Process index root entries (including recoverable deleted entries in slack)
@@ -701,101 +758,88 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 			continue
 		}
 
-		entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName, nil)
+		acc.add(idxEntry)
 	}
 
 	// Check if there's an $INDEX_ALLOCATION attribute (for large directories)
+	var skipped int
+	var indexErr error
 	indexAllocAttr := f.entry.FindAttribute(AttrTypeIndexAllocation, "$I30")
 	if indexAllocAttr != nil && indexAllocAttr.NonResident != nil {
-		// Read index allocation entries
-		allocEntries, err := f.readIndexAllocation(indexAllocAttr.NonResident, dosIndexByRef, longSeenByRef, seenByName, nil)
-		if err != nil {
-			// Log error but continue with what we have
-			// Some corrupted entries shouldn't prevent reading the rest
-		} else {
-			entries = append(entries, allocEntries...)
-		}
+		// A damaged $INDEX_ALLOCATION must not cost the caller the entries
+		// $INDEX_ROOT already yielded, so the records that fail are counted
+		// and reported rather than aborting the listing.
+		skipped, indexErr = f.readIndexAllocation(indexAllocAttr.NonResident, acc)
+		f.resolveZeroSizedEntries(acc.entries)
 	}
 
 	// Optional TSK-style fallback: include children inferred from MFT
 	// $FILE_NAME parent links. This can be expensive on large volumes.
 	if f.volume.mftParentFallbackEnabled() {
 		for _, candidate := range f.volume.getMFTParentCandidates(f.entryNum, f.entry) {
-			entries = addIndexDirEntry(entries, candidate, dosIndexByRef, longSeenByRef, seenByName, nil)
+			acc.add(candidate)
 		}
 	}
 
-	return entries, nil
+	if indexErr != nil || skipped > 0 {
+		if indexErr == nil {
+			indexErr = ErrCorruptIndex
+		}
+		return acc.entries, &PartialDirError{
+			EntryNum:  f.entryNum,
+			Recovered: len(acc.entries),
+			Skipped:   skipped,
+			Err:       indexErr,
+		}
+	}
+
+	return acc.entries, nil
 }
 
-// readIndexAllocation reads entries from the $INDEX_ALLOCATION attribute.
-func (f *File) readIndexAllocation(
-	attr *NonResidentAttribute,
-	dosIndexByRef map[uint64]int,
-	longSeenByRef map[uint64]bool,
-	seenByName map[string]int,
-	resolveType dirTypeResolver,
-) ([]DirEntry, error) {
-	var entries []DirEntry
+// indexRecordHeaderSize is the INDX record header that precedes the node
+// header: magic, update sequence offset and size, LSN, VCN.
+const indexRecordHeaderSize = 24
 
+// readIndexAllocation merges the entries of the $INDEX_ALLOCATION attribute
+// into acc.
+//
+// It returns the number of index records it had to skip. A skipped record is
+// not fatal on its own -- a directory whose INDX blocks are partly damaged
+// still yields the names in the blocks that survived -- but it is never
+// silent, because a caller cannot otherwise tell a small directory from a
+// truncated one.
+func (f *File) readIndexAllocation(attr *NonResidentAttribute, acc *dirEntryAccumulator) (int, error) {
 	// Read all index allocation data
 	size := attr.RealSize
 	if size > 1<<30 {
 		// Limit to 1 GB for safety
-		return nil, fmt.Errorf("index allocation too large: %d bytes", size)
+		return 0, fmt.Errorf("%w: index allocation too large: %d bytes", ErrCorruptIndex, size)
 	}
 
 	data := make([]byte, size)
 	_, err := f.volume.ReadDataRuns(attr.DataRuns, 0, data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read index allocation: %w", err)
+		return 0, fmt.Errorf("failed to read index allocation: %w", err)
 	}
 
-	// Parse index records
+	// Parse index records. The record size comes from the boot sector, so a
+	// damaged one can make it too small to hold even the INDX header the
+	// reads below assume.
 	indexRecordSize := int(f.volume.IndexRecordSize())
-	if indexRecordSize <= 0 {
-		return nil, fmt.Errorf("invalid index record size: %d", indexRecordSize)
+	if indexRecordSize < indexRecordHeaderSize {
+		return 0, fmt.Errorf("%w: invalid index record size: %d", ErrCorruptIndex, indexRecordSize)
 	}
-	for offset := 0; offset < len(data); offset += indexRecordSize {
-		if offset+indexRecordSize > len(data) {
-			break
-		}
 
-		record := data[offset : offset+indexRecordSize]
-
-		// Check magic
-		magic := ReadUint32LE(record, 0)
-		if magic != IndexAllocationMagic {
-			continue // Skip invalid records
-		}
-
-		// Apply update sequence
-		updateSeqOffset := ReadUint16LE(record, 4)
-		updateSeqSize := ReadUint16LE(record, 6)
-		if err := applyUpdateSequence(record, updateSeqOffset, updateSeqSize); err != nil {
-			continue // Skip corrupted records
-		}
-
-		// Parse node header
-		nodeHeaderOffset := 24 // After INDX header
-		if nodeHeaderOffset+16 > len(record) {
-			continue
-		}
-
-		entryListOffset := ReadUint32LE(record, nodeHeaderOffset)
-		entryListEnd := ReadUint32LE(record, nodeHeaderOffset+4)
-		entryListAlloc := ReadUint32LE(record, nodeHeaderOffset+8)
-		entriesStart := nodeHeaderOffset + int(entryListOffset)
-		entriesUsedEnd := nodeHeaderOffset + int(entryListEnd)
-		entriesAllocEnd := nodeHeaderOffset + int(entryListAlloc)
-
-		if entriesStart < nodeHeaderOffset || entriesUsedEnd < entriesStart || entriesAllocEnd < entriesUsedEnd || entriesAllocEnd > len(record) {
-			continue
-		}
-
-		// Parse entries, including slack-space records that can indicate deleted names.
-		idxEntries, err := parseIndexEntriesRecoverDeleted(record[entriesStart:entriesAllocEnd], entriesUsedEnd-entriesStart)
+	var skipped int
+	for offset := 0; offset+indexRecordSize <= len(data); offset += indexRecordSize {
+		idxEntries, err := parseIndexRecord(data[offset : offset+indexRecordSize])
 		if err != nil {
+			if !errors.Is(err, errNotIndexRecord) {
+				// Unallocated blocks in the run are expected and carry no
+				// magic; anything that claims to be an INDX record and then
+				// fails to parse is a real loss and is counted.
+				skipped++
+			}
 			continue
 		}
 
@@ -804,14 +848,78 @@ func (f *File) readIndexAllocation(
 				continue
 			}
 
-			entries = addIndexDirEntry(entries, idxEntry, dosIndexByRef, longSeenByRef, seenByName, resolveType)
+			acc.add(idxEntry)
 		}
 	}
 
-	// $FILE_NAME.RealSize in the directory index is not always updated by Windows
-	// for system metadata files ($LogFile, $AttrDef, $Boot, $UpCase, etc.).
-	// Resolve the actual DATA attribute size for any non-directory entry that
-	// reports 0 bytes so callers see the real on-disk size.
+	if skipped > 0 {
+		return skipped, fmt.Errorf("%w: skipped %d unreadable index records", ErrCorruptIndex, skipped)
+	}
+
+	return 0, nil
+}
+
+// errNotIndexRecord marks a block that never claimed to be an INDX record.
+// An $INDEX_ALLOCATION run routinely covers blocks the directory has not
+// filled yet, so this is the one skip that is not a sign of damage.
+var errNotIndexRecord = errors.New("not an index record")
+
+// parseIndexRecord validates one INDX record and returns the index entries it
+// holds, including entries recovered from slack space.
+//
+// The record is modified in place: applying the update sequence is what makes
+// the last two bytes of every sector readable.
+func parseIndexRecord(record []byte) ([]IndexEntry, error) {
+	// Every read below is at a fixed offset in the INDX header or the node
+	// header that follows it, so the record has to be long enough for both
+	// before any of them happen. The record size comes from the boot sector,
+	// which on a damaged volume can describe something far smaller.
+	if len(record) < indexRecordHeaderSize+IndexNodeHeaderSize {
+		return nil, fmt.Errorf("%w: index record is %d bytes, need %d",
+			ErrTruncatedRecord, len(record), indexRecordHeaderSize+IndexNodeHeaderSize)
+	}
+
+	if ReadUint32LE(record, 0) != IndexAllocationMagic {
+		return nil, errNotIndexRecord
+	}
+
+	updateSeqOffset := ReadUint16LE(record, 4)
+	updateSeqSize := ReadUint16LE(record, 6)
+	if err := applyUpdateSequence(record, updateSeqOffset, updateSeqSize); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrCorruptIndex, err)
+	}
+
+	// Node header offsets are relative to the node header itself.
+	const nodeHeaderOffset = indexRecordHeaderSize
+	entryListOffset := ReadUint32LE(record, nodeHeaderOffset)
+	entryListEnd := ReadUint32LE(record, nodeHeaderOffset+4)
+	entryListAlloc := ReadUint32LE(record, nodeHeaderOffset+8)
+	entriesStart := nodeHeaderOffset + int(entryListOffset)
+	entriesUsedEnd := nodeHeaderOffset + int(entryListEnd)
+	entriesAllocEnd := nodeHeaderOffset + int(entryListAlloc)
+
+	if entriesStart < nodeHeaderOffset || entriesUsedEnd < entriesStart ||
+		entriesAllocEnd < entriesUsedEnd || entriesAllocEnd > len(record) {
+		return nil, fmt.Errorf("%w: invalid index node bounds (start=%d usedEnd=%d allocEnd=%d size=%d)",
+			ErrCorruptIndex, entriesStart, entriesUsedEnd, entriesAllocEnd, len(record))
+	}
+
+	// Parse entries, including slack-space records that can indicate deleted names.
+	entries, err := parseIndexEntriesRecoverDeleted(record[entriesStart:entriesAllocEnd], entriesUsedEnd-entriesStart)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrCorruptIndex, err)
+	}
+
+	return entries, nil
+}
+
+// resolveZeroSizedEntries fills in sizes the directory index does not carry.
+//
+// $FILE_NAME.RealSize is not always updated by Windows for system metadata
+// files ($LogFile, $AttrDef, $Boot, $UpCase, etc.). Resolve the actual DATA
+// attribute size for any non-directory entry that reports 0 bytes so callers
+// see the real on-disk size.
+func (f *File) resolveZeroSizedEntries(entries []DirEntry) {
 	for i := range entries {
 		if entries[i].IsDirectory || entries[i].Size != 0 {
 			continue
@@ -828,8 +936,6 @@ func (f *File) readIndexAllocation(
 			}
 		}
 	}
-
-	return entries, nil
 }
 
 // GetMetadata returns the standard information for this file.
@@ -842,10 +948,19 @@ func (f *File) GetFileName() (*FileName, error) {
 	return f.entry.GetFileName()
 }
 
+// isPartialDirError reports whether err carries entries worth keeping.
+func isPartialDirError(err error) bool {
+	var partial *PartialDirError
+	return errors.As(err, &partial)
+}
+
 // ListFiles is a convenience method to list all files in a directory.
+//
+// A partially readable directory yields the files that could be recovered
+// together with a *PartialDirError; see ReadDir.
 func (f *File) ListFiles() ([]DirEntry, error) {
 	entries, err := f.ReadDir()
-	if err != nil {
+	if err != nil && !isPartialDirError(err) {
 		return nil, err
 	}
 
@@ -856,13 +971,16 @@ func (f *File) ListFiles() ([]DirEntry, error) {
 		}
 	}
 
-	return files, nil
+	return files, err
 }
 
 // ListDirectories is a convenience method to list all subdirectories.
+//
+// A partially readable directory yields the subdirectories that could be
+// recovered together with a *PartialDirError; see ReadDir.
 func (f *File) ListDirectories() ([]DirEntry, error) {
 	entries, err := f.ReadDir()
-	if err != nil {
+	if err != nil && !isPartialDirError(err) {
 		return nil, err
 	}
 
@@ -873,7 +991,7 @@ func (f *File) ListDirectories() ([]DirEntry, error) {
 		}
 	}
 
-	return dirs, nil
+	return dirs, err
 }
 
 // String returns a string representation of the file.

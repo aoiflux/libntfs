@@ -207,6 +207,32 @@ Attribute-level:
 `ReadDir` returns both allocated and recoverable deleted names. Use
 `DirEntry.Deleted` to distinguish deleted entries.
 
+On a damaged volume `ReadDir` returns the entries it could parse *together with*
+a `*PartialDirError`, so both return values can be non-nil. A walk over a whole
+volume can then record the loss and descend into what survived, instead of
+losing the subtree:
+
+```go
+entries, err := dir.ReadDir()
+
+var partial *libntfs.PartialDirError
+if errors.As(err, &partial) {
+    log.Printf("directory %d: %d names recovered, %d index records lost",
+        partial.EntryNum, partial.Recovered, partial.Skipped)
+} else if err != nil {
+    return err // Nothing could be read at all
+}
+
+for _, entry := range entries {
+    // ...
+}
+```
+
+A nil slice with a non-nil error means nothing could be read; the error wraps
+`ErrCorruptIndex` or `ErrNotDirectory`. Code that only wants complete listings
+can keep testing `err != nil` and ignore the entries. `ListFiles` and
+`ListDirectories` follow the same contract.
+
 Use `ReadSupport` to check whether the primary `$DATA` stream is readable, and
 whether it is resident, sparse, compressed, or encrypted, before calling `Read`,
 `ReadAt`, or `ReadAll`.
@@ -707,6 +733,17 @@ if err != nil {
 _ = f
 ```
 
+Damaged structures are reported rather than fatal. `ErrCorruptIndex` and
+`ErrTruncatedRecord` both wrap `ErrInvalidIndex`, so a caller can match the
+specific cause or the whole family:
+
+```go
+entries, err := dir.ReadDir()
+if errors.Is(err, libntfs.ErrInvalidIndex) {
+    // entries still holds whatever survived; see PartialDirError above.
+}
+```
+
 ## Platform Notes
 
 Raw volume access usually requires elevated privileges.
@@ -775,9 +812,15 @@ go test -run '^$' -fuzz FuzzParseReparsePoint -fuzztime 60s
 go test -run '^$' -fuzz FuzzParseDataRuns -fuzztime 60s
 ```
 
-Twelve targets cover every parser fed image bytes; `go test -list 'Fuzz.*' .`
+Eighteen targets cover every parser fed image bytes; `go test -list 'Fuzz.*' .`
 lists them. CI runs a 20-second smoke pass of each on every change and ten
 minutes per target nightly, carrying the generated corpus between runs.
+
+`FuzzDirEntryAccumulator` is the odd one out: it takes already-parsed index
+entries rather than image bytes, and asserts that the positions the directory
+listing records for deduplication always address a live entry. That invariant
+is not reachable from any parser input, which is exactly why it needs a target
+of its own.
 
 `Report()` is covered by a golden-file test, since its JSON is the library's
 widest output surface:
