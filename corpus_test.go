@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -24,6 +25,14 @@ const (
 	//
 	//	LIBNTFS_TEST_IMAGE=/path/to/ntfs.dd go test -run TestCorpus ./...
 	corpusEnv = "LIBNTFS_TEST_IMAGE"
+
+	// corpusOffsetEnv is the byte offset of the volume within that image, for a
+	// partition inside a whole-disk image rather than a bare volume. libntfs
+	// itself expects the boot sector at offset 0, which a caller arranges with
+	// io.NewSectionReader; this is the test harness doing the same.
+	//
+	//	LIBNTFS_TEST_IMAGE=disk.dd LIBNTFS_TEST_IMAGE_OFFSET=16777216 go test -run TestCorpus ./...
+	corpusOffsetEnv = "LIBNTFS_TEST_IMAGE_OFFSET"
 
 	// corpusPath is the small fixture volume testdata/make_corpus.ps1 builds,
 	// carrying one of each shape the library handles under known names. Tests
@@ -45,9 +54,24 @@ func openCorpus(t *testing.T) *Volume {
 		}
 		t.Cleanup(func() { f.Close() })
 
-		vol, err := Open(f)
+		info, err := f.Stat()
 		if err != nil {
-			t.Fatalf("opening %s as an NTFS volume failed: %v", path, err)
+			t.Fatalf("stat on %s failed: %v", path, err)
+		}
+
+		var reader io.ReaderAt = f
+		offset := corpusOffset(t)
+		if offset > 0 {
+			if offset >= info.Size() {
+				t.Fatalf("%s=%d is past the end of the %d byte image",
+					corpusOffsetEnv, offset, info.Size())
+			}
+			reader = io.NewSectionReader(f, offset, info.Size()-offset)
+		}
+
+		vol, err := Open(reader)
+		if err != nil {
+			t.Fatalf("opening %s at offset %d as an NTFS volume failed: %v", path, offset, err)
 		}
 		t.Cleanup(func() { vol.Close() })
 
@@ -62,6 +86,27 @@ func openCorpus(t *testing.T) *Volume {
 	t.Cleanup(func() { vol.Close() })
 
 	return vol
+}
+
+// corpusOffset reads the volume's byte offset within the image, which is zero
+// for a bare volume and the partition's start for a whole-disk image.
+func corpusOffset(t *testing.T) int64 {
+	t.Helper()
+
+	raw := os.Getenv(corpusOffsetEnv)
+	if raw == "" {
+		return 0
+	}
+
+	offset, err := strconv.ParseInt(raw, 0, 64)
+	if err != nil {
+		t.Fatalf("%s=%q is not a number: %v", corpusOffsetEnv, raw, err)
+	}
+	if offset < 0 {
+		t.Fatalf("%s=%d is negative", corpusOffsetEnv, offset)
+	}
+
+	return offset
 }
 
 // loadFixtureCorpus decompresses the generated fixture image, skipping the test
@@ -599,6 +644,11 @@ func TestCorpusLogTableDumps(t *testing.T) {
 			// A dump whose payload was clipped by the circular log is expected,
 			// so this is reported rather than failed.
 			t.Logf("LSN %d: %s did not decode: %v", r.LSN, r.RedoOperationName(), err)
+			return nil
+		}
+		if table == nil {
+			// An AttributeNamesDump is a table dump but not a restart table, so
+			// it correctly decodes to no table here.
 			return nil
 		}
 

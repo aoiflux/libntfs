@@ -422,3 +422,159 @@ func pathBase(path string) string {
 	}
 	return path
 }
+
+// TestCorpusResolvesTargetAttribute is what the open attribute table exists for:
+// turning a log record from "UpdateResidentValue on attribute 0x18" into
+// "UpdateResidentValue on $MFT's $DATA".
+//
+// The entry layout was derived from a real volume rather than a specification,
+// so this is the test that keeps it honest. Every assertion below is a way the
+// decoding could be wrong and would show: an attribute type NTFS does not
+// define, a file reference outside the MFT, a name on an attribute type that
+// cannot carry one, or an LSN outside the log that recorded it.
+func TestCorpusResolvesTargetAttribute(t *testing.T) {
+	vol := openCorpus(t)
+
+	table, err := vol.LogAttributeTable()
+	if err != nil {
+		t.Fatalf("LogAttributeTable failed: %v", err)
+	}
+	if table.Len() == 0 {
+		t.Skip("the log window holds no open attribute table dump")
+	}
+
+	entryCount, err := vol.MFTEntryCount()
+	if err != nil {
+		t.Fatalf("MFTEntryCount failed: %v", err)
+	}
+
+	named := 0
+	for _, entry := range table.Entries() {
+		if !entry.InUse {
+			continue
+		}
+
+		// Only a handful of attribute types are ever held open.
+		switch entry.AttributeType {
+		case AttrTypeData, AttrTypeIndexAllocation, AttrTypeBitmap,
+			AttrTypeIndexRoot, AttrTypeReparsePoint, AttrTypeEA:
+		default:
+			t.Errorf("entry at 0x%04X names attribute type 0x%X (%s), which is not one "+
+				"NTFS holds open — the type field may be at the wrong offset",
+				entry.Offset, entry.AttributeType, entry.AttributeTypeName())
+		}
+
+		if entry.RecordNumber >= entryCount {
+			t.Errorf("entry at 0x%04X names MFT record %d, past the %d the volume has — "+
+				"the file reference may be at the wrong offset",
+				entry.Offset, entry.RecordNumber, entryCount)
+		}
+
+		if entry.Name != "" {
+			named++
+
+			// A name belongs to an index or a named stream, never to a bitmap.
+			if entry.AttributeType == AttrTypeBitmap {
+				t.Errorf("entry at 0x%04X carries the name %q on a $BITMAP, which does "+
+					"not have one — names may be keyed to the wrong entries",
+					entry.Offset, entry.Name)
+			}
+		}
+	}
+
+	if named == 0 {
+		t.Error("expected some attributes to carry names ($I30 on directories at least)")
+	}
+
+	// Now resolve real records and check the rate. A log holding a recent dump
+	// should resolve nearly everything; a low rate means the offsets the records
+	// carry do not line up with the offsets the table reports.
+	var withTarget, resolved int
+
+	if err := vol.EachLogRecord(func(record *LogRecord) error {
+		if !record.IsClientRecord() || record.TargetAttribute == 0 {
+			return nil
+		}
+
+		withTarget++
+		if _, ok := table.Resolve(record); ok {
+			resolved++
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("EachLogRecord failed: %v", err)
+	}
+
+	if withTarget == 0 {
+		t.Skip("no records in the log name an attribute")
+	}
+
+	rate := float64(resolved) / float64(withTarget)
+	t.Logf("%d entries (%d named), %d of %d records resolved (%.1f%%)",
+		table.Len(), named, resolved, withTarget, rate*100)
+
+	if rate < 0.5 {
+		t.Errorf("only %.1f%% of records naming an attribute resolved; the table "+
+			"offsets and the records' TargetAttribute may not be the same quantity", rate*100)
+	}
+}
+
+// TestCorpusLogTableDumpShapes checks the two dump shapes stay distinct. An
+// AttributeNamesDump is a table dump but not a restart table, and reading one as
+// a restart table decodes an entry size out of the first name's bytes.
+func TestCorpusLogTableDumpShapes(t *testing.T) {
+	vol := openCorpus(t)
+
+	restartTables, nameDumps := 0, 0
+
+	if err := vol.EachLogRecord(func(record *LogRecord) error {
+		if !record.IsTableDump() {
+			return nil
+		}
+
+		if record.RedoOperation == LogOpAttributeNamesDump {
+			if record.IsRestartTableDump() {
+				t.Errorf("LSN %d: an AttributeNamesDump reported itself a restart table",
+					record.LSN)
+			}
+			if table, _ := record.RestartTable(); table != nil {
+				t.Errorf("LSN %d: a restart table was decoded from attribute names: %+v",
+					record.LSN, table)
+			}
+
+			names, err := record.AttributeNames()
+			if err != nil && len(names) == 0 {
+				t.Logf("LSN %d: names did not decode, likely clipped by the log: %v",
+					record.LSN, err)
+				return nil
+			}
+			nameDumps++
+
+			for offset, name := range names {
+				if name == "" {
+					t.Errorf("LSN %d: empty name at offset 0x%04X", record.LSN, offset)
+				}
+			}
+			return nil
+		}
+
+		if !record.IsRestartTableDump() {
+			t.Errorf("LSN %d: %s should be a restart table dump",
+				record.LSN, record.RedoOperationName())
+			return nil
+		}
+
+		table, err := record.RestartTable()
+		if err != nil || table == nil {
+			return nil
+		}
+		restartTables++
+
+		return nil
+	}); err != nil {
+		t.Fatalf("EachLogRecord failed: %v", err)
+	}
+
+	t.Logf("%d restart table dumps, %d attribute name dumps", restartTables, nameDumps)
+}

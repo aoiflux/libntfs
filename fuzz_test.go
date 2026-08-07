@@ -3,6 +3,7 @@ package libntfs
 import (
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // The parsers below are fed bytes lifted straight off a disk image, which in a
@@ -215,6 +216,56 @@ func FuzzParseLinuxAttributes(f *testing.F) {
 		_ = attrs.FileType()
 		_ = attrs.Permissions()
 		_ = attrs.String()
+	})
+}
+
+func FuzzParseLogOpenAttributeTable(f *testing.F) {
+	f.Add(buildOpenAttributeTableDump(
+		buildOpenAttributeEntry(true, AttrTypeData, 0, 1, 100),
+		buildOpenAttributeEntry(false, AttrTypeIndexAllocation, 5, 5, 200),
+	))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		entries, err := ParseLogOpenAttributeTable(data)
+		if err != nil {
+			return
+		}
+
+		for _, entry := range entries {
+			if len(entry.Raw) > len(data) {
+				t.Fatalf("entry raw is %d bytes from a %d byte dump", len(entry.Raw), len(data))
+			}
+			if int(entry.Offset) > len(data) {
+				t.Fatalf("entry offset %d is past the %d byte dump", entry.Offset, len(data))
+			}
+
+			_ = entry.AttributeTypeName()
+			_ = entry.String()
+		}
+	})
+}
+
+// FuzzParseLogAttributeNames matters because the layout it decodes was derived
+// from observed data rather than a specification.
+func FuzzParseLogAttributeNames(f *testing.F) {
+	f.Add(buildAttributeNamesDump(
+		map[uint32]string{0x68: "$I30", 0x130: "$Q"}, 0x68, 0x130))
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		names, _ := ParseLogAttributeNames(data)
+
+		for offset, name := range names {
+			// Each rune was decoded from at least one UTF-16 code unit, so the
+			// name cannot hold more runes than the dump has pairs of bytes. The
+			// decoded string itself can be longer in bytes than its source,
+			// since UTF-16 to UTF-8 expands.
+			if utf8.RuneCountInString(name)*2 > len(data) {
+				t.Fatalf("name at 0x%X decodes %d runes from a %d byte dump",
+					offset, utf8.RuneCountInString(name), len(data))
+			}
+		}
 	})
 }
 

@@ -36,6 +36,8 @@ type recordReport struct {
 	TargetAttribute uint16   `json:"target_attribute"`
 	TargetVCN       int64    `json:"target_vcn"`
 	MFTClusterIndex uint16   `json:"mft_cluster_index"`
+	Target          string   `json:"target,omitempty"` // Resolved file and stream
+	TargetEntry     uint64   `json:"target_entry,omitempty"`
 	RedoLength      int      `json:"redo_length"`
 	UndoLength      int      `json:"undo_length"`
 	LCNs            []uint64 `json:"lcns,omitempty"`
@@ -50,6 +52,7 @@ func main() {
 	opFilter := flag.String("op", "", "only report records whose redo operation contains this text")
 	restartOnly := flag.Bool("restart", false, "report the restart area and exit")
 	transactions := flag.Bool("transactions", false, "group records into transactions instead of listing them")
+	resolve := flag.Bool("resolve", false, "resolve each record's target attribute to a file and stream")
 	limit := flag.Int("n", 0, "stop after this many records (0 means no limit)")
 	flag.Usage = usage
 	flag.Parse()
@@ -59,6 +62,7 @@ func main() {
 		sorted:       *sorted,
 		withData:     *withData,
 		transactions: *transactions,
+		resolve:      *resolve,
 	}
 
 	if flag.NArg() != 1 {
@@ -87,6 +91,18 @@ func main() {
 			}
 			printRestart(restart, mode.json)
 			return
+		}
+
+		if mode.resolve {
+			table, err := vol.LogAttributeTable()
+			if err != nil {
+				log.Fatalf("Failed to build the open attribute table: %v", err)
+			}
+			if table.Len() == 0 {
+				fmt.Fprintln(os.Stderr,
+					"warning: the log holds no open attribute table dump, so nothing resolves")
+			}
+			mode.table = table
 		}
 
 		emit(collect(vol.EachLogRecord, *opFilter, *limit), mode)
@@ -121,6 +137,13 @@ type outputMode struct {
 	sorted       bool
 	withData     bool
 	transactions bool
+	resolve      bool
+
+	// table resolves a record's target attribute to the file and stream it
+	// names. NTFS records the file once, when it opens an attribute, and every
+	// later record carries only an offset into the open attribute table — so
+	// without this a log reads as operations with no subject.
+	table *libntfs.LogAttributeTable
 }
 
 // errLimitReached stops the walk once enough records have been gathered.
@@ -208,7 +231,7 @@ func emit(records []*libntfs.LogRecord, mode outputMode) {
 		enc.SetIndent("", "  ")
 		reports := make([]recordReport, 0, len(records))
 		for _, r := range records {
-			reports = append(reports, describe(r, mode.withData))
+			reports = append(reports, describe(r, mode))
 		}
 		if err := enc.Encode(reports); err != nil {
 			log.Fatalf("Failed to encode output: %v", err)
@@ -222,8 +245,17 @@ func emit(records []*libntfs.LogRecord, mode outputMode) {
 			continue
 		}
 
-		fmt.Printf("%-12d  txn %-8d  %-32s %-32s  vcn %d\n",
-			r.LSN, r.TransactionID, r.RedoOperationName(), r.UndoOperationName(), r.TargetVCN)
+		// NTFS names the file once, when it opens an attribute; every later
+		// record carries only an offset into the open attribute table. Without
+		// resolving that, a log reads as operations with no subject.
+		target := ""
+		if entry, ok := mode.table.Resolve(r); ok {
+			target = "  -> " + entry.String()
+		}
+
+		fmt.Printf("%-12d  txn %-8d  %-32s %-32s  vcn %-8d%s\n",
+			r.LSN, r.TransactionID, r.RedoOperationName(), r.UndoOperationName(),
+			r.TargetVCN, target)
 
 		if mode.withData && len(r.RedoData) > 0 {
 			fmt.Printf("%14sredo %s\n", "", hex.EncodeToString(r.RedoData))
@@ -296,7 +328,7 @@ func emitTransactions(transactions []libntfs.LogTransaction, asJSON bool) {
 	fmt.Fprintf(os.Stderr, "\n%d transactions\n", len(transactions))
 }
 
-func describe(r *libntfs.LogRecord, withData bool) recordReport {
+func describe(r *libntfs.LogRecord, mode outputMode) recordReport {
 	recordType := "restart"
 	if r.IsClientRecord() {
 		recordType = "client"
@@ -318,7 +350,12 @@ func describe(r *libntfs.LogRecord, withData bool) recordReport {
 		LCNs:            r.LCNs,
 	}
 
-	if withData {
+	if entry, ok := mode.table.Resolve(r); ok {
+		report.Target = entry.String()
+		report.TargetEntry = entry.RecordNumber
+	}
+
+	if mode.withData {
 		report.RedoData = hex.EncodeToString(r.RedoData)
 		report.UndoData = hex.EncodeToString(r.UndoData)
 	}
@@ -364,6 +401,7 @@ Examples:
   logdump -sort -n 200 disk.img          # the 200 most recent operations
   logdump -op index disk.img             # directory index changes only
   logdump -transactions -sort disk.img   # grouped, so one action reads as one thing
+  logdump -resolve -op index disk.img    # index changes, named by file and stream
   logdump -json -data '$LogFile'         # an extracted log, payloads included
 
 $LogFile is circular: it holds the most recent operations and overwrites the

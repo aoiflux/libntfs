@@ -105,9 +105,11 @@ Current limitations:
 - $LogFile is read, not replayed: records are decoded and handed over, but
   reconstructing file content from redo data, undoing to a consistent state, and
   replaying transactions are out of scope
-- $LogFile open attribute table entries are exposed raw rather than decoded,
-  since their layout varies by NTFS version. LogRecord.TargetAttribute is an
-  index into that table, not a resolved file and stream
+- $LogFile dirty page and transaction table entries are exposed raw rather than
+  decoded; the open attribute table is decoded, so LogRecord.TargetAttribute
+  resolves to a file and stream through (*Volume).LogAttributeTable
+- Log operations above 0x22 are undocumented and reported as hex. One (0x25)
+  occurs on real volumes and is described in logfile.go, but not named
 - Standalone $MFT records expose metadata and data run maps, but their content
   cannot be read: that requires cluster access, which only a Volume provides
 - Write support is limited to in-place overwrite on writable handles: no file
@@ -184,6 +186,10 @@ Log-level:
 - (*Volume).LogRestartArea() (*LogRestartArea, error)
 - (*Volume).EachLogRecord(fn func(*LogRecord) error) error
 - GroupLogTransactions(records []*LogRecord) []LogTransaction
+- (*Volume).LogAttributeTable() (*LogAttributeTable, error)
+- (*LogAttributeTable).Resolve(record *LogRecord) (LogOpenAttributeEntry, bool)
+- ParseLogOpenAttributeTable(buf []byte) ([]LogOpenAttributeEntry, error)
+- ParseLogAttributeNames(buf []byte) (map[uint32]string, error)
 - ParseLogRestartTable(buf []byte) (*LogRestartTable, error)
 - (*LogRecord).RestartTable() (*LogRestartTable, error)
 
@@ -624,32 +630,54 @@ the log's window does not contain the end of it, which for the oldest
 transactions in a circular log is the normal case rather than a sign of
 interrupted work.
 
-### What is not resolved
+### Naming what a record touched
 
-`LogRecord.TargetAttribute` is an index into the open attribute table, not a file
-and stream. Resolving it would turn "attribute 0x18" into a named stream on a
-named file, which is what a timeline actually wants — but the per-entry layout of
-that table differs between NTFS versions, and guessing it would produce
-confident, wrong attribution.
+A log record does not carry the file it operated on. NTFS names a file once, when
+it opens an attribute, records that in the open attribute table, and every later
+record carries only an offset into that table. Read without it, a log is a list
+of operations with no subject: `UpdateResidentValue on attribute 0x18`.
 
-So `ParseLogRestartTable` decodes the table *header* from the periodic dump
-records and hands the entries over raw, with `EntrySize` saying how to slice
-them:
+NTFS periodically dumps that table into the log so recovery can rebuild it, which
+is what makes this recoverable from the log alone:
 
 ```go
-err := vol.EachLogRecord(func(r *libntfs.LogRecord) error {
-    table, err := r.RestartTable() // nil unless r.IsTableDump()
-    if err != nil || table == nil {
-        return nil
+table, err := vol.LogAttributeTable()
+if err != nil {
+    log.Fatal(err)
+}
+
+err = vol.EachLogRecord(func(r *libntfs.LogRecord) error {
+    entry, ok := table.Resolve(r)
+    if !ok {
+        return nil // The log wrapped past the dump covering this attribute
     }
-    fmt.Printf("%s: %d entries of %d bytes\n",
-        r.RedoOperationName(), len(table.Entries), table.EntrySize)
+    fmt.Printf("LSN %d  %s  ->  MFT entry %d %s
+",
+        r.LSN, r.RedoOperationName(), entry.RecordNumber, entry.AttributeTypeName())
     return nil
 })
 ```
 
-A caller who knows which NTFS version wrote the volume can decode those entries.
-libntfs does not guess.
+`entry.Name` carries the stream name where there is one — `$I30` on a directory
+index, `$SDS` on `$Secure`, `$Q` on `$Quota` — merged in from the separate
+`AttributeNamesDump` records. On a real volume this resolved 98% of the records
+that name an attribute.
+
+The entry layout is not from a published specification. It was derived from a
+real volume and cross-checked field by field; the reasoning is recorded in
+[logtable.go](logtable.go) so it can be argued with. Two fields per entry remain
+unidentified and are deliberately not exposed — `Raw` carries the whole entry for
+anyone who wants to go further.
+
+`ParseLogRestartTable` gives the same treatment to the dirty page and transaction
+tables, whose per-entry layouts libntfs does not decode: the header is parsed and
+the entries handed over raw, with `EntrySize` saying how to slice them.
+
+One shape to know about: an `AttributeNamesDump` is a table dump but *not* a
+restart table — its data is a bare run of names with no table header. `IsTableDump`
+covers both; `IsRestartTableDump` and `RestartTable` exclude it, and
+`AttributeNames` reads it.
+
 
 ## Error Handling
 
@@ -760,10 +788,28 @@ go test -run TestReportGolden -update   # rewrite it after an intended change
 ```
 
 Most tests build NTFS structures byte by byte, which proves the parsers against
-bytes libntfs itself wrote. `corpus_test.go` proves them against bytes Windows
-wrote, using a small NTFS volume carrying one of each shape the library handles.
-Those tests skip until the image exists; generate it from an **elevated**
-PowerShell prompt:
+bytes libntfs itself wrote. That is not enough on its own: a parser and its
+fixtures can share a wrong assumption indefinitely and agree with each other the
+whole time. Two bugs found this way were invisible to the synthetic suite —
+every directory on a real volume was reported as a file, and index-slack recovery
+emitted phantom deleted files with mojibake names.
+
+So point the tests at a real volume image. Any raw NTFS image will do, since
+these tests assert invariants rather than filenames:
+
+```bash
+LIBNTFS_TEST_IMAGE=/path/to/ntfs.dd go test -run TestCorpus ./...
+```
+
+They check that `ReadDir`'s directory flag agrees with the MFT record for every
+entry, that every file's fragments tile its stream exactly and land inside the
+volume, that the first and last byte of every file read back and one past the end
+reports EOF, that `Report` and the directory walk agree on what exists, that
+`$Secure` resolves, and that walking every MFT record is clean.
+
+For the fixture-specific tests — named files carrying one of each shape,
+including WSL metadata — generate the small purpose-built volume instead, from an
+**elevated** PowerShell prompt:
 
 ```powershell
 .\testdata\make_corpus.ps1

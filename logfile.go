@@ -44,6 +44,19 @@ const (
 	// corrupt length field sending the walk off into nonsense.
 	LogMaxRecordDataLength = 1 << 20
 
+	// logMaxClientIndex bounds a record's client index.
+	//
+	// The log file service addresses its clients through a small array in the
+	// restart area, and NTFS is the only client of its own log, so a real record
+	// carries index 0. This is the loose bound applied when the restart area is
+	// not to hand; the walkers apply the exact client count instead.
+	//
+	// It matters more than it looks. Resynchronising after damage means testing
+	// arbitrary bytes as a record header, and record type plus data length alone
+	// let roughly one in sixty pass: on a real 5 MB log that produced ~489 false
+	// records out of 32,594, with client indices in the thousands.
+	logMaxClientIndex = 64
+
 	// logAlignment is the boundary records are laid out on.
 	logAlignment = 8
 
@@ -105,6 +118,16 @@ const (
 	LogOpUpdateRecordDataRoot         = 0x21
 	LogOpUpdateRecordDataAllocation   = 0x22
 )
+
+// Operations above LogOpUpdateRecordDataAllocation are not documented and are
+// deliberately not named here.
+//
+// They do occur: a real Windows volume produced 376 records carrying operation
+// 0x25, all with the same shape — one LCN, no redo or undo payload, and a target
+// VCN that maps to that LCN by a constant offset, which is the $MFT's own
+// allocation. Enough to see it tracks a single cluster's mapping; not enough to
+// name it. LogOperationName reports the hex value rather than inventing one,
+// since a wrong name in a forensic report is worse than a number.
 
 // logOperationNames maps each operation to its name. Operations outside this
 // range are reported as a hex value rather than silently dropped.
@@ -229,8 +252,9 @@ func ParseLogRestartTable(buf []byte) (*LogRestartTable, error) {
 	return table, nil
 }
 
-// IsTableDump reports whether the record carries one of the periodic table dumps
-// rather than a file system operation.
+// IsTableDump reports whether the record carries one of the periodic dumps NTFS
+// writes so a recovery pass can rebuild its state, rather than a file system
+// operation.
 func (r *LogRecord) IsTableDump() bool {
 	if r == nil || !r.IsClientRecord() {
 		return false
@@ -245,14 +269,59 @@ func (r *LogRecord) IsTableDump() bool {
 	}
 }
 
-// RestartTable decodes the table a dump record carries, or returns nil when the
-// record is not a table dump.
+// IsRestartTableDump reports whether the record carries a restart table
+// specifically.
+//
+// AttributeNamesDump is a table dump but not a restart table: its data is a bare
+// run of names with no table header, so reading one as a restart table produces
+// an entry size and count out of the first name's bytes. Use
+// [ParseLogAttributeNames] for it.
+func (r *LogRecord) IsRestartTableDump() bool {
+	if r == nil || !r.IsClientRecord() {
+		return false
+	}
+
+	switch r.RedoOperation {
+	case LogOpOpenAttributeTableDump, LogOpDirtyPageTableDump,
+		LogOpTransactionTableDump:
+		return true
+	default:
+		return false
+	}
+}
+
+// RestartTable decodes the restart table a dump record carries, or returns nil
+// when the record carries none.
+//
+// An AttributeNamesDump returns nil rather than a table decoded out of its
+// names; [ParseLogAttributeNames] reads that one.
 func (r *LogRecord) RestartTable() (*LogRestartTable, error) {
-	if !r.IsTableDump() {
+	if !r.IsRestartTableDump() {
 		return nil, nil
 	}
 
 	return ParseLogRestartTable(r.RedoData)
+}
+
+// AttributeNames decodes the attribute names an AttributeNamesDump record
+// carries, keyed by their offset in the open attribute table, or returns nil
+// when the record carries none.
+func (r *LogRecord) AttributeNames() (map[uint32]string, error) {
+	if r == nil || !r.IsClientRecord() || r.RedoOperation != LogOpAttributeNamesDump {
+		return nil, nil
+	}
+
+	return ParseLogAttributeNames(r.RedoData)
+}
+
+// OpenAttributeTable decodes the open attribute table an OpenAttributeTableDump
+// record carries, or returns nil when the record carries none.
+func (r *LogRecord) OpenAttributeTable() ([]LogOpenAttributeEntry, error) {
+	if r == nil || !r.IsClientRecord() || r.RedoOperation != LogOpOpenAttributeTableDump {
+		return nil, nil
+	}
+
+	return ParseLogOpenAttributeTable(r.RedoData)
 }
 
 // LogTransaction groups the records belonging to one NTFS transaction.
@@ -639,6 +708,11 @@ func ParseLogRecord(buf []byte) (*LogRecord, int, error) {
 			ErrInvalidLogRecord, record.RecordType)
 	}
 
+	if record.ClientIndex > logMaxClientIndex {
+		return nil, 0, fmt.Errorf("%w: client index %d is beyond the %d the log file service addresses",
+			ErrInvalidLogRecord, record.ClientIndex, logMaxClientIndex)
+	}
+
 	total := AlignUp(LogRecordHeaderSize+int(record.ClientDataLength), logAlignment)
 	if LogRecordHeaderSize+int(record.ClientDataLength) > len(buf) {
 		return nil, total, io.ErrUnexpectedEOF
@@ -714,8 +788,8 @@ func sliceLogPayload(data []byte, offset, length int) []byte {
 // hide the records after it. If fn returns a non-nil error, iteration stops and
 // that error is returned.
 func EachLogRecord(buf []byte, fn func(*LogRecord) error) error {
-	pageSize := logPageSizeFrom(buf)
-	walker := &logPageWalker{fn: fn}
+	pageSize, bounds := logGeometryFrom(buf)
+	walker := &logPageWalker{fn: fn, bounds: bounds}
 
 	for offset := 0; offset+pageSize <= len(buf); offset += pageSize {
 		if err := walker.feed(buf[offset : offset+pageSize]); err != nil {
@@ -738,6 +812,63 @@ func EachLogRecord(buf []byte, fn func(*LogRecord) error) error {
 type logPageWalker struct {
 	carry []byte
 	fn    func(*LogRecord) error
+
+	// bounds are what the restart area says about the log. A zero value means
+	// it could not be read, and only the loose checks in ParseLogRecord apply.
+	bounds logBounds
+}
+
+// logBounds are the limits a restart area places on what can be a real record.
+//
+// Resynchronising after damage means testing arbitrary bytes as a record header,
+// and the header's own fields are too weak to reject all of it: record type and
+// data length alone let a surprising amount through. These come from the log's
+// own description of itself, so they reject what the header cannot.
+type logBounds struct {
+	// clientCount is how many clients the log serves — one, for NTFS. A record
+	// naming a client beyond that is not a record.
+	clientCount uint16
+
+	// sequenceBits is how many low bits of an LSN hold the offset within the
+	// log, leaving the high bits as a wrap count.
+	sequenceBits uint32
+
+	// maxSequence is the highest wrap count a record may carry.
+	maxSequence uint64
+}
+
+// logBoundsFrom derives the limits from a restart area.
+//
+// The sequence allowance is the restart area's own wrap count plus one, because
+// CurrentLSN is written at a checkpoint and the log runs on past it: on a real
+// volume, 8,686 of 32,594 records sat above CurrentLSN, so treating it as a hard
+// ceiling would discard a quarter of the log. The wrap count moving on by more
+// than one between checkpoints is not something a log this size does.
+func logBoundsFrom(restart *LogRestartArea) logBounds {
+	bounds := logBounds{clientCount: restart.LogClientCount}
+
+	// A sequence field wider than the LSN leaves nothing to compare.
+	if restart.SeqNumberBits == 0 || restart.SeqNumberBits >= 64 {
+		return bounds
+	}
+
+	bounds.sequenceBits = restart.SeqNumberBits
+	bounds.maxSequence = (restart.CurrentLSN >> restart.SeqNumberBits) + 1
+
+	return bounds
+}
+
+// permits reports whether a record is within what the restart area allows.
+func (b logBounds) permits(record *LogRecord) bool {
+	if b.clientCount > 0 && record.ClientIndex >= b.clientCount {
+		return false
+	}
+
+	if b.sequenceBits > 0 && (record.LSN>>b.sequenceBits) > b.maxSequence {
+		return false
+	}
+
+	return true
 }
 
 // feed processes one page. Anything that is not a usable record page discards
@@ -763,7 +894,7 @@ func (w *logPageWalker) feed(page []byte) error {
 
 	w.carry = append(w.carry, fixed[dataStart:]...)
 
-	consumed, err := walkLogRecords(w.carry, w.fn)
+	consumed, err := walkLogRecords(w.carry, w.bounds, w.fn)
 	if err != nil {
 		return err
 	}
@@ -776,7 +907,7 @@ func (w *logPageWalker) feed(page []byte) error {
 // walkLogRecords consumes whole records from the front of buf, leaving a
 // trailing partial record for the caller to complete from the next page. It
 // returns how many bytes it consumed.
-func walkLogRecords(buf []byte, fn func(*LogRecord) error) (int, error) {
+func walkLogRecords(buf []byte, bounds logBounds, fn func(*LogRecord) error) (int, error) {
 	offset := 0
 
 	for offset+LogRecordHeaderSize <= len(buf) {
@@ -801,6 +932,13 @@ func walkLogRecords(buf []byte, fn func(*LogRecord) error) (int, error) {
 			continue
 		}
 
+		// Bytes the resynchronisation walked into can satisfy the header's own
+		// fields; the log's description of itself is what rejects them.
+		if !bounds.permits(record) {
+			offset += logAlignment
+			continue
+		}
+
 		if err := fn(record); err != nil {
 			return offset, err
 		}
@@ -816,20 +954,24 @@ func walkLogRecords(buf []byte, fn func(*LogRecord) error) (int, error) {
 	return offset, nil
 }
 
-// logPageSizeFrom reads the page size out of a $LogFile's restart area, falling
-// back to the default when no restart page can be read.
-func logPageSizeFrom(buf []byte) int {
+// logGeometryFrom reads the page size and client count out of a $LogFile's
+// restart area, falling back to the default page size and an unknown client
+// count when no restart page can be read.
+func logGeometryFrom(buf []byte) (pageSize int, bounds logBounds) {
 	restart, err := ParseLogRestartPage(buf)
 	if err != nil {
-		return DefaultLogPageSize
+		return DefaultLogPageSize, logBounds{}
 	}
 
-	size := int(restart.LogPageSize)
-	if size <= 0 || size > maxLogPageSize || size%logAlignment != 0 {
+	return logPageSizeOrDefault(restart.LogPageSize), logBoundsFrom(restart)
+}
+
+// logPageSizeOrDefault accepts a page size only when it is a plausible one.
+func logPageSizeOrDefault(size uint32) int {
+	if size == 0 || size > maxLogPageSize || size%logAlignment != 0 {
 		return DefaultLogPageSize
 	}
-
-	return size
+	return int(size)
 }
 
 // OpenLogFile opens $LogFile, the transaction log at MFT entry 2.
@@ -915,15 +1057,14 @@ func (v *Volume) EachLogRecord(fn func(*LogRecord) error) error {
 	}
 
 	pageSize := DefaultLogPageSize
+	var bounds logBounds
 	if restart, err := v.LogRestartArea(); err == nil {
-		if candidate := int(restart.LogPageSize); candidate > 0 &&
-			candidate <= maxLogPageSize && candidate%logAlignment == 0 {
-			pageSize = candidate
-		}
+		pageSize = logPageSizeOrDefault(restart.LogPageSize)
+		bounds = logBoundsFrom(restart)
 	}
 
 	chunk := make([]byte, pageSize*logChunkPages)
-	walker := &logPageWalker{fn: fn}
+	walker := &logPageWalker{fn: fn, bounds: bounds}
 
 	for offset := int64(0); offset < size; {
 		n, readErr := logFile.ReadAt(chunk, offset)
