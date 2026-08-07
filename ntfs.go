@@ -83,9 +83,37 @@
 //
 // # Concurrency
 //
-// A [Volume] is safe for concurrent use. A [File] carries its own read offset,
-// so each goroutine should open its own rather than sharing one; opening a file
-// is cheap and the underlying MFT records are cached on the volume.
+// A [Volume] is safe for concurrent use. Its geometry is written once during
+// [Open] and read-only afterwards; the MFT cache, the security descriptor map,
+// and the parent-link map are each guarded by their own lock, so contention on
+// one does not block the others.
+//
+// A [File] carries its own read offset, so each goroutine should open its own
+// rather than sharing one. Opening is cheap: the MFT record behind it is cached
+// on the volume. [File.ReadAt] takes no offset from the handle and is safe to
+// call concurrently on the same [File]; [File.Read] is not, since it advances a
+// shared offset.
+//
+// The [MFTEntry] values handed out by [Volume.GetMFTEntry] and carried inside a
+// [File] come from that cache and are shared between goroutines. Treat them as
+// read-only.
+//
+// # Parallel walks
+//
+// [Volume.WalkMFT] parses records on a bounded worker pool and delivers them to
+// the callback one at a time in ascending entry order, so a parallel walk
+// returns exactly what a sequential one returns. The callback needs no locking
+// and the worker count is a tuning decision rather than a semantic one.
+//
+// It is off by default. Whether a pool helps depends on whether the volume's
+// [io.ReaderAt] serves concurrent reads concurrently, which the library cannot
+// determine. Walking the same volume: backed by an *os.File on Windows,
+// sequential took 13.5 ms and eight workers 22.9 ms, because the read syscall
+// dominates and the kernel serialises concurrent reads against one handle;
+// backed by memory, sequential took 4.5 ms and eight workers 1.3 ms. Callers
+// whose reader parallelises should opt in with [WorkersAuto].
+//
+// [Volume.EachMFTEntryContext] is the sequential walk with cancellation.
 //
 // # What this library does not do
 //

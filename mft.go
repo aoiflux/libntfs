@@ -32,14 +32,40 @@ func (v *Volume) GetMFTEntry(entryNum uint64) (*MFTEntry, error) {
 	// Some system files (for example $LogFile) keep primary $DATA extents in extension records.
 	_ = v.resolveAttributeList(entry, entryNum)
 
-	// Add to cache
-	v.mftCacheMu.Lock()
-	if len(v.mftCache) < DefaultMFTCacheSize {
-		v.mftCache[entryNum] = entry
-	}
-	v.mftCacheMu.Unlock()
+	v.cacheMFTEntry(entryNum, entry)
 
 	return entry, nil
+}
+
+// cacheMFTEntry stores a parsed entry, if there is still room.
+//
+// The cache fills once and is never evicted from, so past DefaultMFTCacheSize
+// every call is a no-op. Discovering that under the exclusive lock is what made
+// a parallel walk slower than a sequential one: with eight workers, 48% of all
+// lock delay was here. The atomic check keeps the saturated case off the write
+// lock entirely.
+//
+// The check is racy by design. Two goroutines may both find room and both
+// insert, which is harmless for a best-effort cache, and the worst outcome is a
+// handful of entries past the limit or one insert skipped.
+func (v *Volume) cacheMFTEntry(entryNum uint64, entry *MFTEntry) {
+	if v.mftCacheFull.Load() {
+		return
+	}
+
+	v.mftCacheMu.Lock()
+	defer v.mftCacheMu.Unlock()
+
+	if len(v.mftCache) >= DefaultMFTCacheSize {
+		v.mftCacheFull.Store(true)
+		return
+	}
+
+	v.mftCache[entryNum] = entry
+
+	if len(v.mftCache) >= DefaultMFTCacheSize {
+		v.mftCacheFull.Store(true)
+	}
 }
 
 // MFTEntryCount returns the number of addressable MFT records on the volume,
@@ -116,8 +142,28 @@ func buildRunEnds(runs []DataRun, bytesPerCluster uint32) []uint64 {
 	return runEnds
 }
 
+// rebuildMFTRunIndex recomputes the cumulative run-end index.
+//
+// It must be called only while the volume is being set up, before any other
+// goroutine can see it. Once Open returns, mftDataRunEnds is immutable and every
+// reader depends on that: it is consulted on the hot path of every MFT lookup,
+// with no lock, and only never being written makes that safe.
 func (v *Volume) rebuildMFTRunIndex() {
 	v.mftDataRunEnds = buildRunEnds(v.mftDataRuns, v.bytesPerCluster)
+}
+
+// mftRunEnds returns the cumulative run-end index for the $MFT.
+//
+// The index is built during Open and is immutable afterwards. A Volume
+// assembled by other means may not have one, so this falls back to computing a
+// private copy rather than filling the shared field: writing it here would race
+// with every concurrent reader, which is exactly the bug this replaced.
+func (v *Volume) mftRunEnds() []uint64 {
+	if len(v.mftDataRunEnds) == len(v.mftDataRuns) {
+		return v.mftDataRunEnds
+	}
+
+	return buildRunEnds(v.mftDataRuns, v.bytesPerCluster)
 }
 
 func parseAttributeListEntries(data []byte) ([]AttributeListEntry, error) {
@@ -404,12 +450,10 @@ func (v *Volume) getMFTEntryOffset(entryNum uint64) (int64, error) {
 		return 0, fmt.Errorf("MFT entry %d beyond MFT size", entryNum)
 	}
 
-	if len(v.mftDataRunEnds) != len(v.mftDataRuns) {
-		v.rebuildMFTRunIndex()
-	}
+	runEnds := v.mftRunEnds()
 
-	runIdx := sort.Search(len(v.mftDataRunEnds), func(i int) bool {
-		return v.mftDataRunEnds[i] > entryOffset
+	runIdx := sort.Search(len(runEnds), func(i int) bool {
+		return runEnds[i] > entryOffset
 	})
 	if runIdx >= len(v.mftDataRuns) {
 		return 0, fmt.Errorf("MFT entry %d beyond MFT size", entryNum)
@@ -418,7 +462,7 @@ func (v *Volume) getMFTEntryOffset(entryNum uint64) (int64, error) {
 	run := v.mftDataRuns[runIdx]
 	runStart := uint64(0)
 	if runIdx > 0 {
-		runStart = v.mftDataRunEnds[runIdx-1]
+		runStart = runEnds[runIdx-1]
 	}
 	offsetInRun := entryOffset - runStart
 

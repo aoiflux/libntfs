@@ -59,8 +59,13 @@ func (v *Volume) writeMFTRecord(entryNum uint64, record []byte, offset int64) er
 		return wrapIOError("write", offset, len(record), ErrBufferTooSmall)
 	}
 
+	// Evict so later reads see the new bytes. Clearing the saturation flag with
+	// it matters: the flag is what lets a full cache skip the write lock, and
+	// leaving it set after making room would keep this entry out of the cache
+	// for the life of the volume.
 	v.mftCacheMu.Lock()
 	delete(v.mftCache, entryNum)
+	v.mftCacheFull.Store(len(v.mftCache) >= DefaultMFTCacheSize)
 	v.mftCacheMu.Unlock()
 
 	return nil
