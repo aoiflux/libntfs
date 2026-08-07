@@ -1,6 +1,8 @@
 package libntfs
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -27,10 +29,29 @@ import (
 func TestCorpusDirEntryTypeMatchesMFT(t *testing.T) {
 	vol := openCorpus(t)
 
-	checked, directories := 0, 0
+	checked, directories, stale := 0, 0, 0
 
 	walkCorpus(t, vol, func(path string, entries []DirEntry) {
 		for _, entry := range entries {
+			record, err := vol.GetMFTEntry(entry.EntryNum)
+			if err != nil {
+				continue
+			}
+
+			// An index entry names the object that held this MFT slot when the
+			// name was written. NTFS bumps the record's sequence number every
+			// time the slot is reused, so a mismatch means the name outlived
+			// the object -- which is routine for a deleted name recovered from
+			// index slack. Comparing the two then compares a dead file against
+			// whatever now occupies its slot, which says nothing about the
+			// parser. A real volume carries plenty of these: on one test image
+			// the slack-recovered names sat at sequence 1 against records
+			// already reused up to sequence 4.
+			if entry.SequenceNum != record.SequenceNum {
+				stale++
+				continue
+			}
+
 			file, err := vol.Open(entry.EntryNum)
 			if err != nil {
 				continue
@@ -42,8 +63,9 @@ func TestCorpusDirEntryTypeMatchesMFT(t *testing.T) {
 			}
 
 			if entry.IsDirectory != file.IsDirectory() {
-				t.Errorf("%s/%s (entry %d): ReadDir says directory=%v, the MFT record says %v",
-					path, entry.Name, entry.EntryNum, entry.IsDirectory, file.IsDirectory())
+				t.Errorf("%s/%s (entry %d, sequence %d): ReadDir says directory=%v, the MFT record says %v",
+					path, entry.Name, entry.EntryNum, entry.SequenceNum,
+					entry.IsDirectory, file.IsDirectory())
 			}
 		}
 	})
@@ -55,7 +77,7 @@ func TestCorpusDirEntryTypeMatchesMFT(t *testing.T) {
 		t.Error("expected the volume to contain at least one directory")
 	}
 
-	t.Logf("checked %d entries, %d directories", checked, directories)
+	t.Logf("checked %d entries, %d directories, skipped %d stale references", checked, directories, stale)
 }
 
 // TestCorpusFragmentsTileEveryStream checks the fragment map against every file
@@ -386,8 +408,11 @@ func walkCorpus(t *testing.T, vol *Volume, fn func(path string, entries []DirEnt
 		queue = queue[1:]
 		visited++
 
+		// A partially readable directory still yields the names that survived,
+		// and dropping them here would hide exactly the entries an invariant
+		// test most wants to see.
 		entries, err := current.file.ReadDir()
-		if err != nil {
+		if err != nil && !isPartialDirError(err) {
 			continue
 		}
 
@@ -577,4 +602,175 @@ func TestCorpusLogTableDumpShapes(t *testing.T) {
 	}
 
 	t.Logf("%d restart table dumps, %d attribute name dumps", restartTables, nameDumps)
+}
+
+// TestCorpusDirEntryMergeIsConsistent is the invariant form of the v0.3.0
+// ReadDir panic.
+//
+// A directory index stores a file under several names -- an 8.3 name and a
+// long name for the same reference -- and ReadDir merges them into one entry.
+// Which name lands in $INDEX_ROOT and which lands in an $INDEX_ALLOCATION
+// block is decided by B-tree order, so on a large enough directory the merge
+// has to reach across both. v0.3.0 collected the two into separate slices
+// while sharing the position maps between them, and indexed one slice with a
+// position belonging to the other.
+//
+// On a real volume that panicked. The properties below are what a correct
+// merge guarantees, and none of them can be asserted on a fixture that never
+// splits a directory across both attributes.
+func TestCorpusDirEntryMergeIsConsistent(t *testing.T) {
+	vol := openCorpus(t)
+
+	listings, entries := 0, 0
+
+	walkCorpus(t, vol, func(path string, dirEntries []DirEntry) {
+		listings++
+		entries += len(dirEntries)
+
+		seen := make(map[string]bool, len(dirEntries))
+		liveByName := make(map[string]uint64, len(dirEntries))
+		liveNamesByRef := make(map[uint64][]string, len(dirEntries))
+
+		for _, entry := range dirEntries {
+			// NTFS has no nameless entry, and one cannot be opened, pathed, or
+			// reported. A zero-length $FILE_NAME parses without error, so this
+			// is reachable from index slack and from records damaged mid-write.
+			if entry.Name == "" {
+				t.Errorf("%s/: entry %d has an empty name", path, entry.EntryNum)
+				continue
+			}
+
+			name := strings.ToLower(entry.Name)
+
+			// The accumulator deduplicates on reference and name together, so
+			// that pair must be unique. Reference alone must not be, since a
+			// file hard-linked twice into one directory is two entries, and
+			// name alone must not be either: a deleted generation recovered
+			// from slack legitimately shares its name with the live file that
+			// replaced it, under a different reference. Both were observed on
+			// a real volume.
+			key := fmt.Sprintf("%d|%s", entry.EntryNum, name)
+			if seen[key] {
+				t.Errorf("%s/: reference %d listed twice under the name %q",
+					path, entry.EntryNum, entry.Name)
+			}
+			seen[key] = true
+
+			if entry.Deleted {
+				continue
+			}
+
+			// A directory index cannot hold two live entries with one name.
+			if previous, dup := liveByName[name]; dup {
+				t.Errorf("%s/: name %q is live under both reference %d and %d",
+					path, entry.Name, previous, entry.EntryNum)
+			}
+			liveByName[name] = entry.EntryNum
+			liveNamesByRef[entry.EntryNum] = append(liveNamesByRef[entry.EntryNum], entry.Name)
+		}
+
+		// The merge collapses the several names of one file into a single
+		// entry, preferring the long name over the 8.3 alias. A reference left
+		// holding both is the silent half of the v0.3.0 defect: wherever the
+		// stale index did not fall out of range and panic, it failed to
+		// replace the alias and the directory listed the file twice.
+		for ref, names := range liveNamesByRef {
+			if len(names) < 2 {
+				continue
+			}
+			for _, name := range names {
+				if isShortNameAlias(name) {
+					t.Errorf("%s/: reference %d kept the 8.3 alias %q alongside %v",
+						path, ref, name, names)
+				}
+			}
+		}
+	})
+
+	if listings == 0 {
+		t.Fatal("walked no directories")
+	}
+	t.Logf("checked %d entries across %d directory listings", entries, listings)
+}
+
+// isShortNameAlias reports whether name looks like an 8.3 alias NTFS generated
+// for a long name: uppercase, at most 8.3 characters, with the "~N" tail that
+// disambiguates colliding stems.
+//
+// This is a heuristic, and deliberately a narrow one. It is used only to
+// strengthen an invariant that already holds without it, so a false negative
+// costs nothing and a false positive would cost a spurious failure.
+func isShortNameAlias(name string) bool {
+	if len(name) > 12 || !strings.Contains(name, "~") {
+		return false
+	}
+	if name != strings.ToUpper(name) {
+		return false
+	}
+
+	stem, ext, _ := strings.Cut(name, ".")
+	return len(stem) <= 8 && len(ext) <= 3
+}
+
+// TestCorpusReadDirPartialContract checks the other half of the contract: a
+// damaged directory must hand back what it could read rather than nothing, and
+// its own accounting must agree with what it returned.
+func TestCorpusReadDirPartialContract(t *testing.T) {
+	vol := openCorpus(t)
+
+	root, err := vol.GetRootDirectory()
+	if err != nil {
+		t.Fatalf("GetRootDirectory failed: %v", err)
+	}
+
+	const maxDirectories = 512
+
+	queue := []*File{root}
+	seen := map[uint64]bool{root.EntryNumber(): true}
+	visited, partials := 0, 0
+
+	for len(queue) > 0 && visited < maxDirectories {
+		current := queue[0]
+		queue = queue[1:]
+		visited++
+
+		entries, err := current.ReadDir()
+
+		var partial *PartialDirError
+		if errors.As(err, &partial) {
+			partials++
+
+			if partial.Recovered != len(entries) {
+				t.Errorf("entry %d: PartialDirError reports %d recovered but ReadDir returned %d",
+					partial.EntryNum, partial.Recovered, len(entries))
+			}
+			if partial.Skipped == 0 && partial.Err == nil {
+				t.Errorf("entry %d: PartialDirError reports no loss and no cause",
+					partial.EntryNum)
+			}
+			// The typed error has to stay matchable both ways, since callers
+			// reach for whichever suits them.
+			if !errors.Is(err, ErrInvalidIndex) {
+				t.Errorf("entry %d: partial error does not wrap ErrInvalidIndex: %v",
+					partial.EntryNum, err)
+			}
+		} else if err != nil && len(entries) != 0 {
+			t.Errorf("entry %d: ReadDir returned %d entries with a non-partial error %v",
+				current.EntryNumber(), len(entries), err)
+		}
+
+		for _, entry := range entries {
+			if entry.Deleted || seen[entry.EntryNum] {
+				continue
+			}
+			child, err := vol.Open(entry.EntryNum)
+			if err != nil || !child.IsDirectory() || child.IsReparsePoint() {
+				continue
+			}
+			seen[entry.EntryNum] = true
+			queue = append(queue, child)
+		}
+	}
+
+	t.Logf("walked %d directories, %d partially readable", visited, partials)
 }
