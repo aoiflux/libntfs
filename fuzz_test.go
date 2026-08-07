@@ -479,3 +479,112 @@ func assertIndexEntriesWithin(t *testing.T, entries []IndexEntry, data []byte) {
 		}
 	}
 }
+
+// The directory path does not end at the index parsers. ReadDir reaches an
+// $INDEX_ROOT attribute, the $FILE_NAME inside every entry, and -- through
+// size resolution and the MFT parent fallback -- whole MFT records. A panic in
+// any of them ends the same walk, so each gets a target too.
+
+func FuzzParseIndexRoot(f *testing.F) {
+	f.Add(buildIndexRootValue(4096,
+		buildIndexEntry(30, 1, buildFileNameAttrValue(5, 1, "seed.txt", NamespaceWin32, 4096, 1024, 0x20))))
+	f.Add(buildIndexRootValue(4096))
+	f.Add(make([]byte, 32)) // Header and node header, no entries
+	f.Add(make([]byte, 31)) // One byte short of parsable
+	f.Add([]byte{})
+
+	// Node bounds pointing outside the attribute.
+	bogus := buildIndexRootValue(4096)
+	WriteUint32LE(bogus, 16, 0xFFFFFFFF) // Entry list offset
+	f.Add(bogus)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		root, err := parseIndexRoot(data)
+		if err != nil {
+			return
+		}
+		if root == nil {
+			t.Fatal("parseIndexRoot returned no root and no error")
+		}
+		assertIndexEntriesWithin(t, root.Entries, data)
+	})
+}
+
+func FuzzParseFileNameAttribute(f *testing.F) {
+	f.Add(buildFileNameAttrValue(5, 1, "seed.txt", NamespaceWin32, 4096, 1024, 0x20))
+	f.Add(buildFileNameAttrValue(5, 1, "", NamespaceDOS, 0, 0, 0))
+	f.Add(make([]byte, 66)) // Header with a zero-length name
+	f.Add(make([]byte, 65)) // One byte short of parsable
+	f.Add([]byte{})
+
+	// A name length that runs past the buffer.
+	overrun := buildFileNameAttrValue(5, 1, "short", NamespaceWin32, 4096, 1024, 0x20)
+	overrun[64] = 0xFF
+	f.Add(overrun)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		fn, err := parseFileNameAttribute(data)
+		if err != nil {
+			return
+		}
+		if fn == nil {
+			t.Fatal("parseFileNameAttribute returned no name and no error")
+		}
+		// Each rune costs at least one 2-byte UTF-16 code unit in the buffer.
+		if utf8.RuneCountInString(fn.Name) > len(data)/2 {
+			t.Fatalf("name is %d runes from a %d byte buffer",
+				utf8.RuneCountInString(fn.Name), len(data))
+		}
+	})
+}
+
+func FuzzParseMFTRecord(f *testing.F) {
+	f.Add(buildTestMFTRecord(f, testRecordOpts{
+		flags: MFTFlagInUse, name: "seed.txt", namespace: NamespaceWin32,
+	}), uint32(DefaultMFTRecordSize))
+
+	dir := buildTestMFTRecord(f, testRecordOpts{
+		flags: MFTFlagInUse | MFTFlagDirectory, name: "dir", namespace: NamespaceWin32,
+		extraAttrs: [][]byte{buildNamedResidentAttr(AttrTypeIndexRoot, 2, "$I30",
+			buildIndexRootValue(4096))},
+	})
+	f.Add(dir, uint32(DefaultMFTRecordSize))
+
+	f.Add(make([]byte, DefaultMFTRecordSize), uint32(DefaultMFTRecordSize))
+	f.Add([]byte{}, uint32(DefaultMFTRecordSize))
+	f.Add(make([]byte, 48), uint32(48))
+	f.Add(dir, uint32(0))
+	f.Add(dir, uint32(0xFFFFFFFF))
+
+	f.Fuzz(func(t *testing.T, data []byte, recordSize uint32) {
+		entry, err := ParseMFTRecord(data, 0, recordSize)
+		if err != nil {
+			return
+		}
+		if entry == nil {
+			t.Fatal("ParseMFTRecord returned no entry and no error")
+		}
+
+		// Whatever the record claimed, the parse must not have invented
+		// attributes that reach outside the buffer it was given.
+		for _, attr := range entry.Attributes {
+			if attr == nil {
+				t.Fatal("parsed a nil attribute")
+			}
+			if attr.Resident != nil && len(attr.Resident.Value) > len(data) {
+				t.Fatalf("resident attribute holds %d bytes of a %d byte record",
+					len(attr.Resident.Value), len(data))
+			}
+		}
+
+		// The directory-listing path calls these on every entry it meets, so
+		// they must be total on anything that parsed.
+		_ = entry.IsDirectory()
+		_ = entry.IsInUse()
+		_ = entry.FindAttribute(AttrTypeIndexRoot, "$I30")
+		_ = entry.FindPrimaryDataAttribute()
+		_, _ = entry.GetFileName()
+		_, _ = entry.GetStandardInformation()
+		_ = entry.DataStreams()
+	})
+}

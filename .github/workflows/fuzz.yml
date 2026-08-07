@@ -43,6 +43,9 @@ jobs:
           - FuzzParseIndexEntries
           - FuzzParseIndexEntriesRecoverDeleted
           - FuzzParseIndexRecord
+          - FuzzParseIndexRoot
+          - FuzzParseFileNameAttribute
+          - FuzzParseMFTRecord
           - FuzzDirEntryAccumulator
 
     steps:

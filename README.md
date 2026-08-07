@@ -812,9 +812,16 @@ go test -run '^$' -fuzz FuzzParseReparsePoint -fuzztime 60s
 go test -run '^$' -fuzz FuzzParseDataRuns -fuzztime 60s
 ```
 
-Eighteen targets cover every parser fed image bytes; `go test -list 'Fuzz.*' .`
+Twenty-one targets cover every parser fed image bytes; `go test -list 'Fuzz.*' .`
 lists them. CI runs a 20-second smoke pass of each on every change and ten
 minutes per target nightly, carrying the generated corpus between runs.
+
+The directory-listing path is covered end to end, since a panic anywhere along
+it ends a whole-volume walk: `FuzzParseMFTRecord` and
+`FuzzParseFileNameAttribute` for the records and names a listing is built from,
+`FuzzParseIndexRoot`, `FuzzParseIndexEntries`,
+`FuzzParseIndexEntriesRecoverDeleted` and `FuzzParseIndexRecord` for the index
+structures themselves.
 
 `FuzzDirEntryAccumulator` is the odd one out: it takes already-parsed index
 entries rather than image bytes, and asserts that the positions the directory

@@ -149,6 +149,14 @@ func (a *dirEntryAccumulator) add(idxEntry IndexEntry) {
 		return
 	}
 
+	// NTFS has no nameless directory entry. A $FILE_NAME whose name length is
+	// zero parses without error and yields one anyway, which reaches a caller
+	// as an entry it can neither open, path, nor report. Real volumes do carry
+	// them, in index slack and in records damaged mid-write.
+	if idxEntry.FileName.Name == "" {
+		return
+	}
+
 	entry := DirEntry{
 		Name:          idxEntry.FileName.Name,
 		EntryNum:      idxEntry.FileReference,

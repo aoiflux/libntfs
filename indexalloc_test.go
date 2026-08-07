@@ -2,6 +2,7 @@ package libntfs
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -302,5 +303,200 @@ func TestVolumeRejectsUndersizedIndexRecord(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInvalidBootSector) {
 		t.Fatalf("expected ErrInvalidBootSector, got %v", err)
+	}
+}
+
+// corruptSubtreeImage builds a small directory tree in which one subdirectory
+// is partly readable and another is not readable at all, so a recursive
+// descent has to meet both failure modes in a single walk.
+//
+//	/ (5)
+//	├── partial   (6)  valid $INDEX_ROOT, damaged INDX block
+//	├── unreadable(7)  unparsable $INDEX_ROOT
+//	└── ok.txt    (8)
+func corruptSubtreeImage(t testing.TB) []byte {
+	t.Helper()
+
+	const (
+		clusterSize     = 4096
+		indexRecordSize = 4096
+		indexCluster    = 8
+		rootEntry       = 5
+		dirAttrs        = uint64(FileAttrDupFileNameIndexPresent)
+	)
+
+	child := func(name string, namespace uint8, attrs uint64) []byte {
+		return buildFileNameAttrValue(rootEntry, 1, name, namespace, 4096, 1024, attrs)
+	}
+
+	rootIndex := buildIndexRootValue(indexRecordSize,
+		buildIndexEntry(6, 1, child("partial", NamespaceWin32, dirAttrs)),
+		buildIndexEntry(7, 1, child("unreadable", NamespaceWin32, dirAttrs)),
+		buildIndexEntry(8, 1, child("ok.txt", NamespaceWin32, 0x20)),
+	)
+
+	root := buildTestMFTRecord(t, testRecordOpts{
+		flags:       MFTFlagInUse | MFTFlagDirectory,
+		sequenceNum: 1,
+		name:        ".",
+		namespace:   NamespaceWin32,
+		extraAttrs:  [][]byte{buildNamedResidentAttr(AttrTypeIndexRoot, 2, "$I30", rootIndex)},
+	})
+
+	// "partial": one name in $INDEX_ROOT, and an INDX block that will be
+	// corrupted below.
+	partialIndex := buildIndexRootValue(indexRecordSize,
+		buildIndexEntry(9, 1, buildFileNameAttrValue(6, 1, "survivor.txt", NamespaceWin32, 4096, 1024, 0x20)),
+	)
+	partial := buildTestMFTRecord(t, testRecordOpts{
+		flags:       MFTFlagInUse | MFTFlagDirectory,
+		sequenceNum: 1,
+		name:        "partial",
+		namespace:   NamespaceWin32,
+		extraAttrs: [][]byte{
+			buildNamedResidentAttr(AttrTypeIndexRoot, 2, "$I30", partialIndex),
+			buildIndexAllocationAttr(t, 3, indexCluster, 1, clusterSize),
+		},
+	})
+
+	// "unreadable": an $INDEX_ROOT too short to parse at all.
+	unreadable := buildTestMFTRecord(t, testRecordOpts{
+		flags:       MFTFlagInUse | MFTFlagDirectory,
+		sequenceNum: 1,
+		name:        "unreadable",
+		namespace:   NamespaceWin32,
+		extraAttrs:  [][]byte{buildNamedResidentAttr(AttrTypeIndexRoot, 2, "$I30", make([]byte, 8))},
+	})
+
+	okFile := buildTestMFTRecord(t, testRecordOpts{
+		flags:       MFTFlagInUse,
+		sequenceNum: 1,
+		name:        "ok.txt",
+		namespace:   NamespaceWin32,
+	})
+
+	indx := buildIndexAllocationRecord(t, indexRecordSize, 0,
+		buildIndexEntry(10, 1, buildFileNameAttrValue(6, 1, "lost.txt", NamespaceWin32, 4096, 1024, 0x20)),
+	)
+
+	image := buildTestNTFSImageAt(t, map[uint64][]byte{
+		5: root, 6: partial, 7: unreadable, 8: okFile,
+	})
+	copy(image[indexCluster*clusterSize:], indx)
+
+	// Break the INDX fixup so the block is skipped but $INDEX_ROOT survives.
+	WriteUint16LE(image, indexCluster*clusterSize+UpdateSequenceStride-2, 0xFFFF)
+
+	return image
+}
+
+// TestRecursiveWalkSurvivesCorruptSubtree is the objective this work exists
+// for: a descent over a damaged volume must reach everything reachable, report
+// what it could not read, and finish. In v0.3.0 the first bad directory took
+// the goroutine down with it.
+//
+// The test deliberately installs no recover(). A panic anywhere below fails it.
+func TestRecursiveWalkSurvivesCorruptSubtree(t *testing.T) {
+	v, err := Open(&mockReaderAt{data: corruptSubtreeImage(t)})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer v.Close()
+
+	var (
+		visited   []string
+		partials  = map[string]*PartialDirError{}
+		unreadble = map[string]error{}
+	)
+
+	var walk func(dir *File, path string)
+	walk = func(dir *File, path string) {
+		entries, err := dir.ReadDir()
+
+		var partial *PartialDirError
+		switch {
+		case errors.As(err, &partial):
+			partials[path] = partial // Keep going: entries still holds names
+		case err != nil:
+			unreadble[path] = err // Skip this subtree, but not the walk
+			return
+		}
+
+		for _, entry := range entries {
+			full := path + "/" + entry.Name
+			visited = append(visited, full)
+
+			if !entry.IsDirectory {
+				continue
+			}
+			child, err := v.Open(entry.EntryNum)
+			if err != nil {
+				unreadble[full] = err
+				continue
+			}
+			walk(child, full)
+		}
+	}
+
+	root, err := v.Open(5)
+	if err != nil {
+		t.Fatalf("Open root failed: %v", err)
+	}
+	walk(root, "")
+
+	// Everything reachable was reached, including the survivor below the
+	// partially damaged directory and the sibling after the unreadable one.
+	want := []string{"/partial", "/partial/survivor.txt", "/unreadable", "/ok.txt"}
+	got := strings.Join(visited, ",")
+	for _, name := range want {
+		if !strings.Contains(got, name) {
+			t.Errorf("walk never visited %q; visited %v", name, visited)
+		}
+	}
+
+	// The damage was reported rather than swallowed.
+	if partials["/partial"] == nil {
+		t.Errorf("expected a PartialDirError for /partial, got %v", partials)
+	} else if partials["/partial"].Skipped != 1 {
+		t.Errorf("expected 1 skipped index record under /partial, got %d", partials["/partial"].Skipped)
+	}
+
+	if err := unreadble["/unreadable"]; err == nil {
+		t.Errorf("expected /unreadable to report an error, got %v", unreadble)
+	} else if !errors.Is(err, ErrCorruptIndex) {
+		t.Errorf("expected ErrCorruptIndex for /unreadable, got %v", err)
+	}
+
+	// The unreadable subtree cost only itself.
+	if len(unreadble) != 1 {
+		t.Errorf("expected exactly one unreadable path, got %v", unreadble)
+	}
+}
+
+// TestAddIndexDirEntryDropsNamelessEntries covers a shape found on a real
+// volume: a $FILE_NAME with a zero name length parses cleanly and produces an
+// entry a caller can do nothing with. 39 of them turned up in a 33k-file
+// image, in index slack and in records damaged mid-write.
+func TestAddIndexDirEntryDropsNamelessEntries(t *testing.T) {
+	acc := newDirEntryAccumulator(nil)
+
+	acc.add(IndexEntry{
+		FileReference: 12, SequenceNum: 1,
+		FileName: &FileName{Name: "", Namespace: NamespaceWin32},
+	})
+	acc.add(IndexEntry{
+		FileReference: 13, SequenceNum: 1,
+		FileName: &FileName{Name: "", Namespace: NamespaceDOS},
+	})
+	acc.add(IndexEntry{
+		FileReference: 14, SequenceNum: 1,
+		FileName: &FileName{Name: "real.txt", Namespace: NamespaceWin32},
+	})
+
+	if len(acc.entries) != 1 {
+		t.Fatalf("expected only the named entry, got %d: %+v", len(acc.entries), acc.entries)
+	}
+	if acc.entries[0].Name != "real.txt" {
+		t.Fatalf("unexpected entry %q", acc.entries[0].Name)
 	}
 }

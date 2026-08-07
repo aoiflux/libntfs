@@ -244,23 +244,38 @@ func TimeToNTFSTime(t time.Time) uint64 {
 }
 
 // Utility functions for reading specific structures
+//
+// These are raw slice reads: they panic if data is too short for the value at
+// offset, exactly as indexing a slice out of range does. That is deliberate --
+// they exist for hot paths that have already established their bounds, and a
+// returned error per field would be checked in a loop that has nothing useful
+// to do with it.
+//
+// Callers handling untrusted image bytes must therefore establish the bounds
+// first, as the index and MFT record parsers do before their fixed-offset
+// header reads. Use [BinaryReader] where the length is not already known: it
+// reports short reads instead of faulting.
 
 // ReadUint16LE reads a 16-bit little-endian value from a byte slice.
+// It panics if data is shorter than offset+2.
 func ReadUint16LE(data []byte, offset int) uint16 {
 	return binary.LittleEndian.Uint16(data[offset:])
 }
 
 // ReadUint32LE reads a 32-bit little-endian value from a byte slice.
+// It panics if data is shorter than offset+4.
 func ReadUint32LE(data []byte, offset int) uint32 {
 	return binary.LittleEndian.Uint32(data[offset:])
 }
 
 // ReadUint64LE reads a 64-bit little-endian value from a byte slice.
+// It panics if data is shorter than offset+8.
 func ReadUint64LE(data []byte, offset int) uint64 {
 	return binary.LittleEndian.Uint64(data[offset:])
 }
 
 // ReadFileRefAt reads a 6-byte file reference at the specified offset.
+// It panics if data is shorter than offset+6.
 func ReadFileRefAt(data []byte, offset int) uint64 {
 	return uint64(data[offset]) |
 		uint64(data[offset+1])<<8 |
