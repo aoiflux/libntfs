@@ -261,10 +261,14 @@ func (r *LogRecord) RestartTable() (*LogRestartTable, error) {
 // records under one transaction ID, and reading them individually loses the fact
 // that they belong together. Grouping restores it.
 //
-// Committed and Forgotten say how the transaction ended. Neither being set means
-// the log's window does not contain the end of it, which for the oldest
-// transactions in a circular log is the normal case rather than a sign of
-// interrupted work.
+// Committed and Forgotten say how the transaction ended. In practice NTFS ends
+// almost every transaction with ForgetTransaction rather than
+// CommitTransaction, so Forgotten is the outcome to expect; a log holding tens
+// of thousands of records routinely contains no CommitTransaction at all.
+//
+// Neither being set means the log's window does not contain the end of the
+// transaction, which for the oldest entries in a circular log is the normal case
+// rather than a sign of interrupted work.
 type LogTransaction struct {
 	ID        uint32
 	FirstLSN  uint64
@@ -292,33 +296,53 @@ func (t LogTransaction) Operations() []string {
 	return names
 }
 
-// GroupLogTransactions groups records by transaction, ordered by the lowest LSN
-// in each, which puts them in the order the transactions began.
+// GroupLogTransactions groups records into transactions, ordered by the LSN each
+// began at.
 //
-// Records outside any transaction carry ID 0 and are grouped together under it.
-// Restart records carry no transaction and are skipped.
+// TransactionID is an index into NTFS's transaction table, not a unique
+// identifier: the table is small and its slots are reused constantly, so the
+// same ID reappears for thousands of unrelated transactions over the life of a
+// log. Grouping on the ID alone therefore collapses a whole log into a handful
+// of enormous pseudo-transactions — on a real volume, 32,000 records into five.
 //
-// Because the log is circular, a transaction near either end of the window will
-// be missing records that have been overwritten. The grouping reports what is
-// present rather than pretending otherwise.
+// A transaction is closed instead when its end record appears, and the next
+// record carrying that ID starts a new one. That is what makes the grouping
+// track actual transactions rather than table slots.
+//
+// Restart records carry no transaction and are skipped. Because the log is
+// circular, a transaction near either end of the window will be missing records
+// that have been overwritten; the grouping reports what is present rather than
+// pretending otherwise.
 func GroupLogTransactions(records []*LogRecord) []LogTransaction {
-	byID := make(map[uint32]*LogTransaction)
-	order := make([]uint32, 0, len(records))
+	var transactions []LogTransaction
+
+	// Only transactions still awaiting their end record live here. Once one is
+	// closed it moves to the result, freeing the slot for the next reuse of the
+	// same ID.
+	open := make(map[uint32]*LogTransaction)
+
+	closeTransaction := func(id uint32) {
+		transaction, ok := open[id]
+		if !ok {
+			return
+		}
+		transactions = append(transactions, *transaction)
+		delete(open, id)
+	}
 
 	for _, record := range records {
 		if record == nil || !record.IsClientRecord() {
 			continue
 		}
 
-		transaction, ok := byID[record.TransactionID]
+		transaction, ok := open[record.TransactionID]
 		if !ok {
 			transaction = &LogTransaction{
 				ID:       record.TransactionID,
 				FirstLSN: record.LSN,
 				LastLSN:  record.LSN,
 			}
-			byID[record.TransactionID] = transaction
-			order = append(order, record.TransactionID)
+			open[record.TransactionID] = transaction
 		}
 
 		transaction.Records = append(transaction.Records, record)
@@ -333,14 +357,16 @@ func GroupLogTransactions(records []*LogRecord) []LogTransaction {
 		switch record.RedoOperation {
 		case LogOpCommitTransaction:
 			transaction.Committed = true
+			closeTransaction(record.TransactionID)
 		case LogOpForgetTransaction:
 			transaction.Forgotten = true
+			closeTransaction(record.TransactionID)
 		}
 	}
 
-	transactions := make([]LogTransaction, 0, len(order))
-	for _, id := range order {
-		transactions = append(transactions, *byID[id])
+	// Whatever is still open ran past the end of the window.
+	for id := range open {
+		transactions = append(transactions, *open[id])
 	}
 
 	sort.Slice(transactions, func(i, j int) bool {

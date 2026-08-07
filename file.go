@@ -53,7 +53,7 @@ type DirEntry struct {
 type dirTypeResolver func(entryNum uint64) (bool, error)
 
 func resolveDirEntryIsDirectory(idxEntry IndexEntry, resolveType dirTypeResolver) bool {
-	fromFileName := (idxEntry.FileName.FileAttributes & uint64(FileAttrDirectory)) != 0
+	fromFileName := isDirectoryFileAttributes(idxEntry.FileName.FileAttributes)
 	if resolveType == nil {
 		return fromFileName
 	}
@@ -64,6 +64,18 @@ func resolveDirEntryIsDirectory(idxEntry IndexEntry, resolveType dirTypeResolver
 	}
 
 	return isDir
+}
+
+// isDirectoryFileAttributes reports whether a FileAttributes field marks a
+// directory.
+//
+// NTFS sets FileAttrDupFileNameIndexPresent for a directory and leaves the Win32
+// FileAttrDirectory bit clear, so the former is what an index entry actually
+// carries. The Win32 bit is accepted as well, since tools that synthesise NTFS
+// structures from a Win32 view do set it, and accepting both costs nothing.
+func isDirectoryFileAttributes(attributes uint64) bool {
+	const directoryBits = uint64(FileAttrDupFileNameIndexPresent) | uint64(FileAttrDirectory)
+	return attributes&directoryBits != 0
 }
 
 // normalizeNTFSPath normalizes user input to an NTFS-internal absolute path.

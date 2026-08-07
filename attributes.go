@@ -2,6 +2,7 @@ package libntfs
 
 import (
 	"fmt"
+	"unicode/utf8"
 )
 
 // parseAttributeHeader parses an attribute header from the buffer at the given offset.
@@ -437,8 +438,62 @@ func parseDeletedFileNameFromIndexSlack(data []byte, offset int) (*FileName, int
 		return nil, 0
 	}
 
+	if !isPlausibleRecoveredFileName(fn) {
+		return nil, 0
+	}
+
 	consumed := AlignUp(16+66+nameLen*2, 4)
 	return fn, consumed
+}
+
+// isPlausibleRecoveredFileName reports whether a $FILE_NAME carved out of index
+// slack looks like a real one rather than like random bytes.
+//
+// Slack recovery scans unallocated space at every alignment boundary, so it is
+// offered far more garbage than genuine entries, and a size comparison alone
+// lets a great deal of it through. On a real volume that produces phantom files
+// with mojibake names — which in a forensic context is worse than missing a
+// marginal entry, because it sends an examiner chasing something that never
+// existed. The checks here therefore prefer false negatives.
+func isPlausibleRecoveredFileName(fn *FileName) bool {
+	if fn.Namespace > NamespaceWinDOS {
+		return false
+	}
+
+	// Every file has a parent, and entry 0 is $MFT, which is never one.
+	if fileReferenceRecordNumber(fn.ParentDirectory) == 0 {
+		return false
+	}
+
+	return isPlausibleFileNameText(fn.Name)
+}
+
+// isPlausibleFileNameText reports whether a name holds only characters NTFS
+// permits in one.
+//
+// The Win32 rules are applied to every namespace. POSIX names may legally hold
+// most of these, but a POSIX-namespace name is rare and random bytes decode into
+// one constantly, so the stricter rule is the better filter for carved data.
+func isPlausibleFileNameText(name string) bool {
+	if name == "" || len(name) > 255*4 {
+		return false
+	}
+
+	for _, r := range name {
+		if r < 0x20 || r == 0x7F {
+			return false // Control characters
+		}
+		if r == utf8.RuneError {
+			return false // Undecodable UTF-16, so not text NTFS wrote
+		}
+
+		switch r {
+		case '\\', '/', ':', '*', '?', '"', '<', '>', '|':
+			return false
+		}
+	}
+
+	return true
 }
 
 // parseIndexEntriesRecoverDeleted parses index entries from an entire index entry
@@ -489,12 +544,18 @@ func parseIndexEntriesRecoverDeleted(data []byte, usedLen int) ([]IndexEntry, er
 					entry.FileName = fn
 				}
 			}
-		} else if fn, consumed := parseDeletedFileNameFromIndexSlack(data, offset); fn != nil {
-			entry.FileName = fn
-			entry.Deleted = true
-			if consumed > entryLen {
-				entry.EntryLength = uint16(consumed)
-				entryLen = consumed
+		} else if fileReferenceRecordNumber(entry.FileReference) != 0 {
+			// A slack entry carries the whole old index entry, header included,
+			// so its file reference is meaningful. Entry 0 is $MFT, which is
+			// never a child of a directory index, so a reference of 0 means
+			// these bytes are not an index entry at all.
+			if fn, consumed := parseDeletedFileNameFromIndexSlack(data, offset); fn != nil {
+				entry.FileName = fn
+				entry.Deleted = true
+				if consumed > entryLen {
+					entry.EntryLength = uint16(consumed)
+					entryLen = consumed
+				}
 			}
 		}
 

@@ -34,12 +34,3 @@
 //		fmt.Printf("%s\n", entry.Name)
 //	}
 package libntfs
-
-// Version information
-const (
-	// Version is the current library version
-	Version = "0.3.0"
-
-	// Author information
-	Author = "libntfs contributors"
-)

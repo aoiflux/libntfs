@@ -9,25 +9,72 @@ import (
 	"testing"
 )
 
-// corpusPath is a small NTFS volume that Windows formatted and populated,
-// produced by testdata/make_corpus.ps1.
-//
 // Every other test in this package builds NTFS structures byte by byte, which
 // proves the parsers against bytes libntfs itself wrote. These tests prove them
 // against bytes Windows wrote, which is the only way to catch an assumption the
-// fixtures and the parser happen to share.
-const corpusPath = "testdata/ntfs-corpus.img.gz"
+// fixtures and the parser happen to share — as one already did: every directory
+// on a real volume was reported as a file, because the synthetic fixtures set
+// the same wrong flag the parser tested for.
+//
+// Two sources are supported.
+const (
+	// corpusEnv names a raw NTFS volume image to test against — any image will
+	// do, since the tests that use it assert invariants rather than filenames.
+	// It takes precedence over the generated fixture.
+	//
+	//	LIBNTFS_TEST_IMAGE=/path/to/ntfs.dd go test -run TestCorpus ./...
+	corpusEnv = "LIBNTFS_TEST_IMAGE"
 
-// loadCorpus decompresses the corpus image, skipping the test when it has not
-// been generated. Generating it needs an elevated Windows prompt, so it is not
-// something every checkout can do on demand.
-func loadCorpus(t *testing.T) []byte {
+	// corpusPath is the small fixture volume testdata/make_corpus.ps1 builds,
+	// carrying one of each shape the library handles under known names. Tests
+	// that assert on those names need this one specifically.
+	corpusPath = "testdata/ntfs-corpus.img.gz"
+)
+
+// openCorpus opens whichever corpus is available, skipping when neither is.
+//
+// An image named by corpusEnv is opened in place rather than read into memory,
+// since a real volume image is routinely gigabytes.
+func openCorpus(t *testing.T) *Volume {
+	t.Helper()
+
+	if path := os.Getenv(corpusEnv); path != "" {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("opening %s=%s failed: %v", corpusEnv, path, err)
+		}
+		t.Cleanup(func() { f.Close() })
+
+		vol, err := Open(f)
+		if err != nil {
+			t.Fatalf("opening %s as an NTFS volume failed: %v", path, err)
+		}
+		t.Cleanup(func() { vol.Close() })
+
+		return vol
+	}
+
+	vol, err := Open(&mockReaderAt{data: loadFixtureCorpus(t)})
+	if err != nil {
+		t.Fatalf("opening the corpus volume failed: %v", err)
+	}
+
+	t.Cleanup(func() { vol.Close() })
+
+	return vol
+}
+
+// loadFixtureCorpus decompresses the generated fixture image, skipping the test
+// when neither corpus is available. Generating it needs an elevated Windows
+// prompt, so it is not something every checkout can do on demand.
+func loadFixtureCorpus(t *testing.T) []byte {
 	t.Helper()
 
 	f, err := os.Open(corpusPath)
 	if errors.Is(err, os.ErrNotExist) {
-		t.Skipf("%s not present; generate it from an elevated PowerShell prompt with "+
-			"testdata\\make_corpus.ps1", corpusPath)
+		t.Skipf("no corpus available: set %s to a raw NTFS volume image, or generate "+
+			"%s from an elevated PowerShell prompt with testdata\\make_corpus.ps1",
+			corpusEnv, corpusPath)
 	}
 	if err != nil {
 		t.Fatalf("opening the corpus failed: %v", err)
@@ -48,18 +95,15 @@ func loadCorpus(t *testing.T) []byte {
 	return data
 }
 
-// openCorpus opens the corpus image as a volume.
-func openCorpus(t *testing.T) *Volume {
+// requireFixtureCorpus skips a test that asserts on the generated fixture's
+// filenames when the corpus in use is an arbitrary image supplied by the caller.
+func requireFixtureCorpus(t *testing.T) {
 	t.Helper()
 
-	vol, err := Open(&mockReaderAt{data: loadCorpus(t)})
-	if err != nil {
-		t.Fatalf("opening the corpus volume failed: %v", err)
+	if os.Getenv(corpusEnv) != "" {
+		t.Skipf("running against %s, which carries its own contents rather than the "+
+			"fixture's named files", corpusEnv)
 	}
-
-	t.Cleanup(func() { vol.Close() })
-
-	return vol
 }
 
 // corpusFiles indexes the corpus by path so each test can find its fixture
@@ -111,6 +155,8 @@ func TestCorpusOpensAndReportsGeometry(t *testing.T) {
 // TestCorpusReadsFileContent checks the whole read path end to end against a
 // file Windows wrote, rather than against runs the test built itself.
 func TestCorpusReadsFileContent(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	file, err := vol.OpenPath("/host.txt")
@@ -131,6 +177,8 @@ func TestCorpusReadsFileContent(t *testing.T) {
 // TestCorpusAlternateDataStream covers a stream Windows wrote, including the
 // Zone.Identifier every downloaded file carries.
 func TestCorpusAlternateDataStream(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	file, err := vol.OpenPath("/host.txt")
@@ -161,6 +209,8 @@ func TestCorpusAlternateDataStream(t *testing.T) {
 // Windows fragmented, whose extents must tile the stream and stop at its true
 // size rather than at the end of the last cluster.
 func TestCorpusFragmentsTileRealFile(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	file, err := vol.OpenPath("/fragmented.bin")
@@ -196,6 +246,8 @@ func TestCorpusFragmentsTileRealFile(t *testing.T) {
 // TestCorpusSparseFileKeepsHoles checks that a hole Windows punched is reported
 // rather than dropped, so stream offsets after it stay correct.
 func TestCorpusSparseFileKeepsHoles(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	file, err := vol.OpenPath("/sparse.bin")
@@ -236,6 +288,8 @@ func TestCorpusSparseFileKeepsHoles(t *testing.T) {
 // TestCorpusCompressedFileReads covers the decompressor against data NTFS
 // compressed, which is the only way to be sure of the compression unit handling.
 func TestCorpusCompressedFileReads(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	file, err := vol.OpenPath("/compressed.txt")
@@ -264,6 +318,8 @@ func TestCorpusCompressedFileReads(t *testing.T) {
 
 // TestCorpusReparsePoints covers a symlink and a junction Windows created.
 func TestCorpusReparsePoints(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	for _, tc := range []struct{ path, want string }{
@@ -299,6 +355,8 @@ func TestCorpusReparsePoints(t *testing.T) {
 // TestCorpusDeletedEntryRecovered covers recovery from index slack against an
 // entry Windows deleted, rather than one the test marked deleted itself.
 func TestCorpusDeletedEntryRecovered(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	root, err := vol.GetRootDirectory()
@@ -325,6 +383,8 @@ func TestCorpusDeletedEntryRecovered(t *testing.T) {
 // TestCorpusSecurityDescriptors covers $Secure lookup against descriptors
 // Windows wrote.
 func TestCorpusSecurityDescriptors(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	file, err := vol.OpenPath("/host.txt")
@@ -408,6 +468,8 @@ func TestCorpusUSNJournal(t *testing.T) {
 // TestCorpusExtendedAttributes covers WSL metadata, present only when the
 // generator had a WSL distribution to write through.
 func TestCorpusExtendedAttributes(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	file, err := vol.OpenPath("/wsl-metadata.txt")
@@ -433,6 +495,8 @@ func TestCorpusExtendedAttributes(t *testing.T) {
 // from what WSL writes; every other test of it feeds bytes libntfs itself built,
 // which would agree with a wrong inference. This one does not.
 func TestCorpusLinuxExtendedAttributes(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 
 	file, err := vol.OpenPath("/wsl-xattr.txt")
@@ -483,23 +547,37 @@ func TestCorpusLogTransactions(t *testing.T) {
 		t.Fatal("expected the records to group into transactions")
 	}
 
-	committed := 0
+	ended := 0
 	for _, transaction := range transactions {
 		if transaction.FirstLSN > transaction.LastLSN {
 			t.Errorf("transaction %d spans %d..%d, which is backwards",
 				transaction.ID, transaction.FirstLSN, transaction.LastLSN)
 		}
-		if transaction.Committed {
-			committed++
+		if len(transaction.Records) == 0 {
+			t.Errorf("transaction %d holds no records", transaction.ID)
+		}
+		if transaction.Committed || transaction.Forgotten {
+			ended++
 		}
 	}
 
-	t.Logf("%d records in %d transactions, %d committed",
-		len(records), len(transactions), committed)
+	t.Logf("%d records in %d transactions, %d ended within the window",
+		len(records), len(transactions), ended)
 
-	// A volume that was formatted and populated must have committed something.
-	if committed == 0 {
-		t.Error("expected at least one committed transaction")
+	// A volume that was formatted and populated must have finished some work.
+	// The outcome to expect is Forgotten: NTFS ends almost every transaction
+	// with ForgetTransaction, and a log this size routinely holds no
+	// CommitTransaction at all.
+	if ended == 0 {
+		t.Error("expected at least one transaction to end within the log window")
+	}
+
+	// TransactionID is a reused table index, so grouping that keyed on it alone
+	// would collapse the whole log into a handful of pseudo-transactions.
+	if len(records) > 1000 && len(transactions) < 100 {
+		t.Errorf("%d records grouped into only %d transactions, which suggests "+
+			"grouping keyed on the reused transaction ID rather than closing "+
+			"each transaction at its end record", len(records), len(transactions))
 	}
 }
 
@@ -552,6 +630,8 @@ func TestCorpusLogTableDumps(t *testing.T) {
 // parser at once over real structures and is where a crash on unusual metadata
 // would surface.
 func TestCorpusReportIsComplete(t *testing.T) {
+	requireFixtureCorpus(t)
+
 	vol := openCorpus(t)
 	files := corpusFiles(t, vol)
 

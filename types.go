@@ -204,6 +204,20 @@ const (
 	FileAttrOffline           = 0x1000
 	FileAttrNotContentIndexed = 0x2000
 	FileAttrEncrypted         = 0x4000
+
+	// FileAttrDupFileNameIndexPresent is how NTFS marks a directory in the
+	// FileAttributes field of $FILE_NAME and $STANDARD_INFORMATION.
+	//
+	// It is not FileAttrDirectory. That constant is the Win32
+	// FILE_ATTRIBUTE_DIRECTORY value the API reports to applications, and NTFS
+	// does not store it on disk: a real directory carries 0x10000000 here and
+	// leaves 0x0010 clear. Testing the Win32 bit against on-disk bytes reports
+	// every directory as a file.
+	//
+	// The MFT record header's MFTFlagDirectory is the authoritative source where
+	// the record is available; this bit is what an index entry carries, which is
+	// all a directory listing has to work from.
+	FileAttrDupFileNameIndexPresent = 0x10000000
 )
 
 // FileName represents the $FILE_NAME attribute.
