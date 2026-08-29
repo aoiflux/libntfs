@@ -1,15 +1,24 @@
 name: Fuzz
 
-# libntfs parses bytes lifted straight off a disk image, which in a forensic
-# context is untrusted input by definition: the image may be damaged,
-# deliberately malformed, or crafted. Short runs on every change catch gross
-# regressions; finding the inputs that actually break a parser takes minutes per
-# target, which is what this workflow is for.
+# Hunting for new fuzz inputs is a search, not a pass/fail test, so this runs
+# only when someone asks for it.
+#
+# It used to run nightly and mail the repository owner whenever it went red.
+# Every one of those failures was the same non-event: `go test -fuzz` exits
+# non-zero when -fuzztime expires while workers are still in flight, reporting
+# "context deadline exceeded" having found nothing. Four failed nights across
+# four different targets, ~19M executions, zero crashers. A scheduled job whose
+# only output is false alarms trains you to ignore it, so the schedule is gone.
+#
+# The durable half of fuzzing did not live here anyway. Committed crashers under
+# testdata/fuzz are replayed as ordinary subtests by `go test` in ci.yml, on
+# every push, on three platforms. This workflow only looks for inputs that are
+# not in that corpus yet.
+#
+# Run it from the Actions tab, or:
+#   gh workflow run fuzz.yml -f fuzztime=30m
 
 on:
-  schedule:
-    # Nightly, well outside working hours.
-    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       fuzztime:
@@ -21,32 +30,36 @@ permissions:
   contents: read
 
 jobs:
+  # The target list is read from the test binary rather than written out by
+  # hand. The hand-maintained matrix this replaces had drifted: it named 19 of
+  # the 21 targets, so FuzzParseLogAttributeNames and
+  # FuzzParseLogOpenAttributeTable were never fuzzed by CI at all.
+  targets:
+    name: list targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - id: list
+        run: |
+          set -euo pipefail
+          targets=$(go test -list 'Fuzz.*' . | grep '^Fuzz' | sort | jq -R . | jq -sc .)
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "will fuzz: $targets"
+
   fuzz:
     name: ${{ matrix.target }}
+    needs: targets
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - FuzzParseDataRuns
-          - FuzzParseExtendedAttributes
-          - FuzzParseEAInformation
-          - FuzzParseReparsePoint
-          - FuzzParseSecurityDescriptor
-          - FuzzParseUSNRecord
-          - FuzzParseLogRestartPage
-          - FuzzParseLogRestartTable
-          - FuzzParseLogRecord
-          - FuzzEachLogRecord
-          - FuzzParseLinuxAttributes
-          - FuzzParseLinuxExtendedAttributes
-          - FuzzParseIndexEntries
-          - FuzzParseIndexEntriesRecoverDeleted
-          - FuzzParseIndexRecord
-          - FuzzParseIndexRoot
-          - FuzzParseFileNameAttribute
-          - FuzzParseMFTRecord
-          - FuzzDirEntryAccumulator
+        target: ${{ fromJSON(needs.targets.outputs.targets) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -54,11 +67,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
-      # Carry the corpus each target has already grown between runs, so a
-      # nightly build starts from what previous nights discovered rather than
-      # rediscovering the same inputs.
+      # Carry the corpus each target has already grown between runs, so a run
+      # starts from what previous runs discovered rather than rediscovering the
+      # same inputs.
       - name: Restore the generated corpus
         uses: actions/cache@v4
         with:
@@ -75,7 +88,25 @@ jobs:
         env:
           FUZZTIME: ${{ inputs.fuzztime || '10m' }}
           TARGET: ${{ matrix.target }}
-        run: go test -run '^$' -fuzz "^${TARGET}$" -fuzztime "$FUZZTIME" .
+        run: |
+          set -uo pipefail
+          go test -run '^$' -fuzz "^${TARGET}$" -fuzztime "$FUZZTIME" . 2>&1 | tee fuzz.log
+          status=${PIPESTATUS[0]}
+
+          # A finding is a file written under testdata/fuzz. Check for one
+          # directly instead of trusting the exit code, which conflates a real
+          # crasher with the -fuzztime shutdown race.
+          if [ -n "$(git status --porcelain -- testdata/fuzz)" ]; then
+            echo "::error::$TARGET found a new crasher; see the uploaded artifact"
+            exit 1
+          fi
+
+          if [ "$status" -ne 0 ] && grep -q 'context deadline exceeded' fuzz.log; then
+            echo "::notice::$TARGET ran out its -fuzztime with no finding; the shutdown race is not a failure"
+            exit 0
+          fi
+
+          exit "$status"
 
       # A crash writes its input to testdata/fuzz/<target>/, which becomes a
       # permanent regression case once committed. Upload it so the failure is

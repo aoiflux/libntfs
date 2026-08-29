@@ -27,7 +27,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          # The module has no dependencies and no go.sum, so there is nothing to
+          # cache and the cache step only warns that it cannot find one.
+          cache: false
 
       - name: Build
         run: go build ./...
@@ -35,6 +37,11 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # This also replays every fuzz seed and every crasher committed under
+      # testdata/fuzz as an ordinary subtest, on all three platforms. That is the
+      # part of fuzzing worth gating a push on: it is deterministic, it takes a
+      # second, and it is what stops a fixed parser bug from coming back. Hunting
+      # for new inputs is a search, not a test, and lives in fuzz.yml.
       - name: Test
         run: go test -race ./...
 
@@ -43,27 +50,3 @@ jobs:
       # such file as unformatted regardless of its actual formatting. Gating on
       # it would fail every run for a reason unrelated to the change under test.
       # Format new files locally before committing them.
-
-  fuzz-smoke:
-    name: fuzz smoke
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      # A short run on every change, catching a parser that regressed badly
-      # enough to crash on its own seed corpus. The long runs live in fuzz.yml.
-      - name: Fuzz each target briefly
-        run: |
-          set -euo pipefail
-          targets=$(go test -list 'Fuzz.*' . | grep '^Fuzz')
-          for target in $targets; do
-            echo "::group::$target"
-            go test -run '^$' -fuzz "^${target}$" -fuzztime 20s .
-            echo "::endgroup::"
-          done
