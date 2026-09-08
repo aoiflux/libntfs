@@ -7,6 +7,8 @@ and an API designed for tooling, forensics workflows, and systems integration.
 
 ## Why libntfs
 
+- A reader first: `OpenReadOnly` gives a volume that cannot write, whatever the
+  handle behind it supports
 - Thread-safe public API suitable for concurrent reads
 - Zero external dependencies (Go standard library only)
 - Strong bounds checking and corruption-aware parsing
@@ -43,7 +45,7 @@ func main() {
     }
     defer img.Close()
 
-    vol, err := libntfs.Open(img)
+    vol, err := libntfs.OpenReadOnly(img)
     if err != nil {
         log.Fatal(err)
     }
@@ -69,12 +71,73 @@ func main() {
 }
 ```
 
+## Read-Only and Write Modes
+
+libntfs is a reader. Writing exists only to patch bytes back into an image you
+own, and it is off unless you deliberately switch it on.
+
+`Open` promotes whatever it is given: if the reader also implements
+`io.WriterAt` — and an `*os.File` opened for writing does — the volume is
+writable. That is convenient for image repair and wrong for evidence, so
+read-only is a separate entry point rather than a flag you have to remember:
+
+```go
+vol, err := libntfs.OpenReadOnly(img)
+```
+
+Three states, all distinguishable:
+
+| Opened with | `IsReadOnly()` | `IsWritable()` | Writes return |
+| --- | --- | --- | --- |
+| `OpenReadOnly`, or `Options{ReadOnly: true}` | `true` | `false` | `ErrReadOnlyMode` |
+| `Open` over a reader that is not an `io.WriterAt` | `false` | `false` | `ErrReadOnlyVolume` |
+| `Open` over a reader that is an `io.WriterAt` | `false` | `true` | — |
+
+Read-only mode is a guarantee, not a convention. The handle the volume keeps
+cannot be asserted back to an `io.WriterAt`, so no code path inside or outside
+the library can recover the ability to write, and every write entry point is
+refused before the handle is touched.
+
+`ErrReadOnlyMode` wraps `ErrReadOnlyVolume`, so code matching the general case
+keeps working and code that needs to tell the two apart can:
+
+```go
+_, err := vol.WriteAt(patch, offset)
+
+switch {
+case errors.Is(err, libntfs.ErrReadOnlyMode):
+    // Opened read-only on purpose.
+case errors.Is(err, libntfs.ErrReadOnlyVolume):
+    // The handle itself cannot write.
+}
+```
+
+For a partition inside a whole-disk image, say where it starts instead of
+wrapping the reader:
+
+```go
+vol, err := libntfs.OpenWithOptions(img, libntfs.Options{
+    ReadOnly:   true,
+    BaseOffset: partitionOffset,
+})
+```
+
+Offsets the library reports stay relative to the volume, so they can be compared
+against a report taken from the same partition acquired on its own.
+
+Every method that can modify a volume lives in `write.go` behind a single gate.
+No read path reaches it.
+
 ## Feature Support
 
 Implemented:
 
+- Read-only open mode that refuses every write regardless of the handle behind
+  it, plus a base offset for a partition inside a whole-disk image
 - NTFS boot sector parsing and validation
 - MFT parsing with cache-backed entry lookup
+- Path reconstruction from an MFT record, including for deleted and orphaned
+  entries, and a whole-volume walk that carries paths and parent references
 - Resident and non-resident attribute parsing
 - Data run parsing and sparse run handling
 - File and directory access by MFT entry and path
@@ -112,15 +175,19 @@ Current limitations:
   occurs on real volumes and is described in logfile.go, but not named
 - Standalone $MFT records expose metadata and data run maps, but their content
   cannot be read: that requires cluster access, which only a Volume provides
-- Write support is limited to in-place overwrite on writable handles: no file
-  growth or truncation, no sparse, compressed, or encrypted streams, and a
-  resident value cannot change length
+- Write support is off unless a volume is deliberately opened for it, and is
+  limited to in-place overwrite: no file growth or truncation, no sparse,
+  compressed, or encrypted streams, and a resident value cannot change length
 
 ## API Highlights
 
 Volume-level:
 
+- OpenReadOnly(reader io.ReaderAt) (*Volume, error)
+- OpenWithOptions(reader io.ReaderAt, opts Options) (*Volume, error)
 - Open(reader io.ReaderAt) (*Volume, error)
+- (*Volume).IsReadOnly() bool
+- (*Volume).IsWritable() bool
 - (*Volume).Open(entryNum uint64) (*File, error)
 - (*Volume).OpenPath(path string) (*File, error)
 - (*Volume).GetRootDirectory() (*File, error)
@@ -132,16 +199,39 @@ MFT-level:
 - (*Volume).GetMFTEntry(entryNum uint64) (*MFTEntry, error)
 - (*Volume).MFTEntryCount() (uint64, error)
 - (*Volume).EachMFTEntry(fn func(entryNum uint64, e *MFTEntry) error) error
+- (*Volume).EachMFTEntryContext(ctx context.Context, fn func(entryNum uint64, e *MFTEntry) error) error
+
+Path- and walk-level:
+
+- (*Volume).PathFor(entryNum uint64) (string, error)
+- (*Volume).WalkFiles(ctx context.Context, cfg WalkConfig, fn func(path string, parentRef uint64, parentSeq uint16, e *MFTEntry) error) error
+- (*Volume).WalkMFT(ctx context.Context, cfg WalkConfig, fn func(entryNum uint64, e *MFTEntry) error) error
+- (*Volume).Report() (*NTFSReport, error)
+- (*Volume).ReportContext(ctx context.Context) (*NTFSReport, error)
 
 File-level:
 
 - (*File).Read(p []byte) (int, error)
 - (*File).ReadAt(p []byte, off int64) (int, error)
-- (*File).Write(p []byte) (int, error)
-- (*File).WriteAt(p []byte, off int64) (int, error)
 - (*File).ReadAll() ([]byte, error)
 - (*File).ReadDir() ([]DirEntry, error)
 - (*File).ReadSupport() FileReadSupport
+
+Identity-level:
+
+- (*File).EntryNumber() uint64
+- (*File).SequenceNumber() uint16
+- (*File).FileReference() uint64
+- MakeFileReference(entryNum uint64, sequence uint16) uint64
+- FileReferenceEntry(ref uint64) uint64
+- FileReferenceSequence(ref uint64) uint16
+
+Write-level (requires a volume opened writable):
+
+- (*File).Write(p []byte) (int, error)
+- (*File).WriteAt(p []byte, off int64) (int, error)
+- (*Volume).WriteAt(p []byte, off int64) (int, error)
+- (*Volume).WriteDataRuns(runs []DataRun, off int64, p []byte) (int, error)
 
 Stream-level:
 
@@ -174,17 +264,21 @@ Journal-level:
 
 - ParseUSNRecord(buf []byte) (*USNRecord, int, error)
 - EachUSNRecord(buf []byte, fn func(*USNRecord) error) error
+- EachUSNRecordContext(ctx context.Context, buf []byte, fn func(*USNRecord) error) error
 - (*Volume).OpenUSNJournal() (*File, error)
 - (*Volume).EachUSNRecord(fn func(*USNRecord) error) error
+- (*Volume).EachUSNRecordContext(ctx context.Context, fn func(*USNRecord) error) error
 
 Log-level:
 
 - ParseLogRestartPage(buf []byte) (*LogRestartArea, error)
 - ParseLogRecord(buf []byte) (*LogRecord, int, error)
 - EachLogRecord(buf []byte, fn func(*LogRecord) error) error
+- EachLogRecordContext(ctx context.Context, buf []byte, fn func(*LogRecord) error) error
 - (*Volume).OpenLogFile() (*File, error)
 - (*Volume).LogRestartArea() (*LogRestartArea, error)
 - (*Volume).EachLogRecord(fn func(*LogRecord) error) error
+- (*Volume).EachLogRecordContext(ctx context.Context, fn func(*LogRecord) error) error
 - GroupLogTransactions(records []*LogRecord) []LogTransaction
 - (*Volume).LogAttributeTable() (*LogAttributeTable, error)
 - (*LogAttributeTable).Resolve(record *LogRecord) (LogOpenAttributeEntry, bool)
@@ -237,15 +331,84 @@ Use `ReadSupport` to check whether the primary `$DATA` stream is readable, and
 whether it is resident, sparse, compressed, or encrypted, before calling `Read`,
 `ReadAt`, or `ReadAll`.
 
-`WriteAt` overwrites both non-resident and resident streams in place. A
-non-resident stream is written to its clusters; a resident one, whose content
-sits inside the MFT record, is patched by rewriting that record with its update
-sequence reapplied and evicting the cached entry. Neither path changes a file's
-length, and a resident value cannot grow, since that would mean resizing the
-attribute and shifting every attribute after it in the record.
+`WriteAt` needs a volume opened writable and overwrites both non-resident and
+resident streams in place. A non-resident stream is written to its clusters; a
+resident one, whose content sits inside the MFT record, is patched by rewriting
+that record with its update sequence reapplied and evicting the cached entry.
+Neither path changes a file's length, and a resident value cannot grow, since
+that would mean resizing the attribute and shifting every attribute after it in
+the record.
 
 Use `(*Attribute).ReadSupport()` for alternate or named `$DATA` streams when you
 are inspecting attributes directly.
+
+## Paths, Walks, and Reports
+
+### Where a record was
+
+NTFS stores the tree upwards. A file record names its parent; nothing names its
+children except the directory index, which a deleted file has already fallen out
+of. `OpenPath` answers "what is at this path"; `PathFor` answers the question a
+report actually asks, "where was this record":
+
+```go
+path, err := vol.PathFor(entryNum)
+```
+
+It works for deleted and orphaned entries, because a deleted file's record still
+names its parent long after the parent has stopped naming it. An entry whose
+parent chain cannot be followed to the root — a missing or unparsable ancestor,
+a cycle, or a chain longer than 64 links — is reported under `/$ORPHAN/<entry>`
+with a nil error, since a partial answer beats dropping evidence from a report.
+
+### Walking a volume with paths attached
+
+`WalkFiles` is `WalkMFT` with identity attached, and it builds the parent map
+once instead of re-walking ancestors per entry:
+
+```go
+err := vol.WalkFiles(ctx, libntfs.WalkConfig{}, func(
+    path string, parentRef uint64, parentSeq uint16, e *libntfs.MFTEntry,
+) error {
+    fmt.Printf("%s\tentry=%d seq=%d parent=%d/%d deleted=%v\n",
+        path, e.RecordNumber, e.SequenceNum, parentRef, parentSeq, !e.IsInUse())
+    return nil
+})
+```
+
+`parentSeq` is the field worth not skipping. NTFS reuses MFT records, so a
+parent reference whose sequence number no longer matches the parent record means
+`path` describes where that record sits *now*, not where this file was. Compare
+it against the parent's `SequenceNum` to spot it.
+
+`WalkMFT` parses records on a bounded worker pool and delivers them one at a
+time in ascending entry order, so a parallel walk returns exactly what a
+sequential one returns and the callback needs no locking. It is sequential by
+default; opt into the pool with `WalkConfig{Workers: libntfs.WorkersAuto}` when
+the underlying reader actually serves concurrent reads concurrently.
+
+### Reports
+
+`Report` produces a flat listing of every file and directory, deleted and
+orphaned entries included, ready to marshal as JSON. Each entry carries its own
+identity so two reports of the same volume can be diffed on something sturdier
+than the path string:
+
+```go
+report, err := vol.ReportContext(ctx)
+```
+
+`NTFSFile` carries `EntryNumber`, `SequenceNumber`, `ParentReference`,
+`ParentSequence`, the four `$STANDARD_INFORMATION` timestamps, `FileAttributes`,
+`HardLinkCount`, `Streams`, and `Fragments`. Diffing on `EntryNumber` alone
+reports a deleted file whose record was reused as a modified one; diffing on
+`Filename` alone reports a rename as a delete plus a create.
+
+A report walks the MFT twice — once to map every record's name and parent, once
+to describe the files — which on a volume with tens of millions of records is
+the longest thing this library does. Use `ReportContext` to cancel it. A
+cancelled report returns the context's error and no partial listing, since a
+truncated report that looks complete is worse than none.
 
 ## Parsing a Standalone $MFT
 
@@ -568,6 +731,31 @@ partially damaged journal still yields the records around the damage. Version 4
 extent records carry no timestamp or file name and report that rather than
 inventing one.
 
+`$J` on a real volume is one of the longest reads here, so both walks have an
+`EachUSNRecordContext` variant that stops on cancellation and returns the
+context's error. Records already handed to the callback stay handed over.
+
+`USNRecord` carries JSON tags, so journal evidence serialises directly with no
+parallel DTO:
+
+```json
+{
+  "usn": 4660,
+  "file_reference": 42,
+  "file_sequence": 7,
+  "parent_reference": 5,
+  "parent_sequence": 3,
+  "timestamp": "2025-06-01T12:00:00Z",
+  "reason": 8192,
+  "name": "evidence.txt"
+}
+```
+
+`FileReference` and `ParentReference` are record numbers with the sequence
+number split out beside them, matching `NTFSFile.SequenceNumber` and
+`NTFSFile.ParentSequence` in a volume report, so a report and the journal can be
+joined on the pair.
+
 ## Transaction Log ($LogFile)
 
 `$LogFile` records the metadata operations NTFS was about to perform. It is finer
@@ -744,6 +932,12 @@ if errors.Is(err, libntfs.ErrInvalidIndex) {
 }
 ```
 
+The read-only sentinels nest the same way. `ErrReadOnlyMode`, returned by a
+volume opened read-only on purpose, wraps `ErrReadOnlyVolume`, which is what a
+volume whose handle simply cannot write returns. Match `ErrReadOnlyVolume` to
+catch any refused write, `ErrReadOnlyMode` to catch only the deliberate one. See
+[Read-Only and Write Modes](#read-only-and-write-modes).
+
 ## Platform Notes
 
 Raw volume access usually requires elevated privileges.
@@ -759,6 +953,10 @@ Linux:
 - Prefer read-only/forensic-safe workflows
 
 You can also use disk image files directly on all platforms.
+
+On any platform, open evidence with `OpenReadOnly`. A device or image handle
+opened for writing is an `io.WriterAt`, and `Open` promotes one to a writable
+volume without asking.
 
 ## Examples
 

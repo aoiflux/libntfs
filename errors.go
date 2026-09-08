@@ -65,8 +65,19 @@ var (
 	// ErrVolumeClosed indicates the volume has been closed.
 	ErrVolumeClosed = errors.New("volume is closed")
 
-	// ErrReadOnlyVolume indicates the underlying volume handle does not support writes.
+	// ErrReadOnlyVolume indicates the volume cannot be written to, either because
+	// it was opened read-only or because the underlying handle does not support
+	// writes.
 	ErrReadOnlyVolume = errors.New("volume is read-only")
+
+	// ErrReadOnlyMode indicates the volume was deliberately opened read-only,
+	// with [OpenReadOnly] or Options.ReadOnly, and so refuses every write
+	// regardless of what the underlying handle supports.
+	//
+	// It wraps ErrReadOnlyVolume, so callers already matching that keep matching;
+	// match this one to tell "the caller asked for evidence-safe" apart from "the
+	// handle happens not to be writable".
+	ErrReadOnlyMode = fmt.Errorf("%w: opened with Options.ReadOnly", ErrReadOnlyVolume)
 
 	// ErrWriteUnsupported indicates the requested write operation is unsupported.
 	ErrWriteUnsupported = errors.New("write operation not supported")

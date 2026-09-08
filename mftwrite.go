@@ -40,8 +40,8 @@ func (v *Volume) readMFTRecordRaw(entryNum uint64) ([]byte, int64, error) {
 //
 // The entry is evicted from the MFT cache so later reads see the new bytes.
 func (v *Volume) writeMFTRecord(entryNum uint64, record []byte, offset int64) error {
-	if !v.IsWritable() {
-		return ErrReadOnlyVolume
+	if err := v.checkWritable(); err != nil {
+		return err
 	}
 
 	updateSeqOffset := ReadUint16LE(record, 4)

@@ -196,7 +196,7 @@ func walkStandalone(f *os.File, emit func(*libntfs.USNRecord) error) error {
 
 // walkVolume reads the journal from a mounted volume or image.
 func walkVolume(f *os.File, emit func(*libntfs.USNRecord) error) error {
-	vol, err := libntfs.Open(f)
+	vol, err := libntfs.OpenReadOnly(f)
 	if err != nil {
 		return err
 	}

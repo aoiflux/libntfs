@@ -75,7 +75,7 @@ func main() {
 	defer img.Close()
 
 	openStart := time.Now()
-	vol, err := libntfs.Open(img)
+	vol, err := libntfs.OpenReadOnly(img)
 	if err != nil {
 		log.Fatalf("Failed to parse NTFS volume: %v", err)
 	}

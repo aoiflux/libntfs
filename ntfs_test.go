@@ -1278,7 +1278,7 @@ func buildFileNameAttrValue(parentRef uint64, parentSeq uint16, name string, nam
 	buf := make([]byte, 66+len(nameBytes))
 
 	WriteUint64LE(buf, 0, parentRef)
-	WriteUint16LE(buf, 8, parentSeq)
+	WriteUint16LE(buf, 6, parentSeq)
 	WriteUint64LE(buf, 40, allocatedSize)
 	WriteUint64LE(buf, 48, realSize)
 	WriteUint64LE(buf, 56, attrs)
@@ -1336,6 +1336,8 @@ type testRecordOpts struct {
 	mftChangeTime time.Time
 	accessTime    time.Time
 	securityID    uint32   // $STANDARD_INFORMATION security ID, indexing $Secure
+	parentRef     uint64   // $FILE_NAME parent record number; 0 means the root
+	parentSeq     uint16   // $FILE_NAME parent sequence number
 	extraAttrs    [][]byte // Appended after $STANDARD_INFORMATION and $FILE_NAME
 }
 
@@ -1398,8 +1400,13 @@ func buildTestMFTRecord(t testing.TB, opts testRecordOpts) []byte {
 	si := buildResidentAttr(AttrTypeStandardInfo, 0, buildStandardInfoAttrValue(
 		opts.createTime, opts.modifyTime, opts.mftChangeTime, opts.accessTime, 0x20, opts.securityID,
 	))
+	parentRef := opts.parentRef
+	if parentRef == 0 {
+		parentRef = MFTEntryRoot
+	}
+
 	fn := buildResidentAttr(AttrTypeFileName, 1, buildFileNameAttrValue(
-		5, 5, opts.name, opts.namespace, 4096, 4096, 0x20,
+		parentRef, opts.parentSeq, opts.name, opts.namespace, 4096, 4096, 0x20,
 	))
 
 	offset := firstAttrOffset

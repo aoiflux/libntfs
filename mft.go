@@ -123,7 +123,37 @@ func (v *Volume) EachMFTEntry(fn func(entryNum uint64, e *MFTEntry) error) error
 }
 
 func fileReferenceRecordNumber(ref uint64) uint64 {
-	return ref & 0x0000FFFFFFFFFFFF
+	return ref & fileReferenceRecordMask
+}
+
+// An NTFS file reference is one 64-bit value carrying two things: the MFT record
+// number in the low 48 bits and that record's sequence number in the high 16.
+// The pair is the identity of a file. The record number alone is not: NTFS
+// reuses records, and a reference whose sequence number no longer matches the
+// record's names a file that is gone rather than one that changed.
+const fileReferenceRecordMask = 0x0000FFFFFFFFFFFF
+
+// FileReferenceEntry returns the MFT record number packed into a file reference.
+//
+// Use it on the packed values NTFS stores: [FileName.ParentDirectory],
+// [File.FileReference], [MFTEntry.BaseRecordRef], and the references carried in
+// index entries.
+func FileReferenceEntry(ref uint64) uint64 {
+	return ref & fileReferenceRecordMask
+}
+
+// FileReferenceSequence returns the sequence number packed into a file reference.
+//
+// A reference whose sequence differs from the live record's [MFTEntry.SequenceNum]
+// points at a file that has since been deleted and its record reused.
+func FileReferenceSequence(ref uint64) uint16 {
+	return uint16(ref >> 48)
+}
+
+// MakeFileReference packs an MFT record number and sequence number into the
+// 64-bit reference NTFS stores on disk.
+func MakeFileReference(entryNum uint64, sequence uint16) uint64 {
+	return (entryNum & fileReferenceRecordMask) | uint64(sequence)<<48
 }
 
 func buildRunEnds(runs []DataRun, bytesPerCluster uint32) []uint64 {
@@ -894,83 +924,4 @@ func (v *Volume) ReadDataRuns(runs []DataRun, offset int64, buf []byte) (int, er
 	}
 
 	return bytesRead, nil
-}
-
-// WriteDataRuns writes data into non-resident data runs at the logical stream offset.
-//
-// This method performs in-place overwrites only. It does not allocate clusters,
-// update metadata, or support sparse/compressed/encrypted streams.
-func (v *Volume) WriteDataRuns(runs []DataRun, offset int64, buf []byte) (int, error) {
-	if len(buf) == 0 {
-		return 0, nil
-	}
-	if offset < 0 {
-		return 0, ErrInvalidOffset
-	}
-
-	if !v.IsWritable() {
-		return 0, ErrReadOnlyVolume
-	}
-
-	bytesWritten := 0
-	offsetU := uint64(offset)
-	currentOffset := uint64(0)
-
-	for _, run := range runs {
-		runBytes := run.LengthClusters * uint64(v.bytesPerCluster)
-
-		// Skip runs before our offset.
-		if currentOffset+runBytes <= offsetU {
-			currentOffset += runBytes
-			continue
-		}
-
-		// Calculate write position within this run.
-		offsetInRun := uint64(0)
-		if offsetU > currentOffset {
-			offsetInRun = offsetU - currentOffset
-		}
-
-		bytesToWrite := uint64(len(buf) - bytesWritten)
-		bytesAvailable := runBytes - offsetInRun
-		if bytesToWrite > bytesAvailable {
-			bytesToWrite = bytesAvailable
-		}
-
-		writeLen := int(bytesToWrite)
-
-		if run.IsSparse {
-			return bytesWritten, fmt.Errorf("%w: %v", ErrWriteUnsupported, ErrSparseData)
-		}
-
-		if run.StartCluster < 0 {
-			return bytesWritten, fmt.Errorf("%w: negative start cluster %d", ErrInvalidDataRun, run.StartCluster)
-		}
-
-		cluster := uint64(run.StartCluster)
-		clusterOffset := cluster * uint64(v.bytesPerCluster)
-		writeOffset := int64(clusterOffset + offsetInRun)
-
-		n, err := v.WriteAt(buf[bytesWritten:bytesWritten+writeLen], writeOffset)
-		bytesWritten += n
-		if err != nil {
-			return bytesWritten, err
-		}
-
-		if n != writeLen {
-			return bytesWritten, io.ErrShortWrite
-		}
-
-		currentOffset += runBytes
-
-		if bytesWritten >= len(buf) {
-			break
-		}
-	}
-
-	if bytesWritten < len(buf) {
-		return bytesWritten, io.EOF
-	}
-
-	return bytesWritten, nil
 }

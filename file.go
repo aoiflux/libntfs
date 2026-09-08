@@ -25,15 +25,19 @@ type File struct {
 }
 
 // FileReadSupport summarizes whether and how this file's primary $DATA stream can be read.
+//
+// BlockingError carries why an unreadable stream is unreadable. It is excluded
+// from the JSON form, where an error marshals to nothing useful; the boolean
+// flags alongside it say which condition applies.
 type FileReadSupport struct {
-	HasData       bool
-	Resident      bool
-	NonResident   bool
-	Sparse        bool
-	Compressed    bool
-	Encrypted     bool
-	Readable      bool
-	BlockingError error
+	HasData       bool  `json:"has_data"`
+	Resident      bool  `json:"resident"`
+	NonResident   bool  `json:"non_resident"`
+	Sparse        bool  `json:"sparse"`
+	Compressed    bool  `json:"compressed"`
+	Encrypted     bool  `json:"encrypted"`
+	Readable      bool  `json:"readable"`
+	BlockingError error `json:"-"`
 }
 
 // DirEntry represents a directory entry with basic information.
@@ -450,8 +454,39 @@ func (f *File) Name() string {
 }
 
 // EntryNumber returns the MFT entry number.
+//
+// It identifies the record, not the file: NTFS reuses records, so an entry
+// number recorded at one point in time may name a different file later. Pair it
+// with [File.SequenceNumber], or use [File.FileReference], whenever the identity
+// has to survive being written down.
 func (f *File) EntryNumber() uint64 {
 	return f.entryNum
+}
+
+// SequenceNumber returns the MFT record's sequence number, which NTFS increments
+// each time the record is reused.
+//
+// It is what distinguishes this file from the next one to occupy the same
+// record. A report that carries an entry number without it cannot tell a
+// modified file from a deleted file whose record was handed to something else.
+func (f *File) SequenceNumber() uint16 {
+	if f.entry == nil {
+		return 0
+	}
+	return f.entry.SequenceNum
+}
+
+// FileReference returns the file's 64-bit NTFS file reference: the MFT record
+// number in the low 48 bits and the sequence number in the high 16, exactly as
+// NTFS itself stores it in $FILE_NAME parent references, index entries, and USN
+// records.
+//
+// It is the value to compare against [USNRecord.FileReference] and
+// [USNRecord.FileSequence], and the one to record when a file's identity has to
+// be meaningful across two acquisitions of the same volume. Unpack it with
+// [FileReferenceEntry] and [FileReferenceSequence].
+func (f *File) FileReference() uint64 {
+	return MakeFileReference(f.entryNum, f.SequenceNumber())
 }
 
 // IsDirectory returns true if this is a directory.
@@ -589,99 +624,6 @@ func (f *File) ReadAt(p []byte, offset int64) (int, error) {
 	}
 
 	return 0, fmt.Errorf("no data in $DATA attribute")
-}
-
-// Write writes len(p) bytes to the file at the current file offset.
-// The current offset is advanced by the number of bytes written.
-func (f *File) Write(p []byte) (int, error) {
-	f.readMu.Lock()
-	defer f.readMu.Unlock()
-
-	n, err := f.WriteAt(p, f.readPos)
-	f.readPos += int64(n)
-	return n, err
-}
-
-// WriteAt writes len(p) bytes to the file starting at the logical file offset.
-//
-// Current write support is intentionally narrow to avoid unsafe NTFS metadata edits:
-// - Requires writable underlying handle (io.WriterAt)
-// - Refuses sparse, compressed, and encrypted streams
-// - Does not extend file size
-//
-// Non-resident streams are written directly to their clusters. Resident streams,
-// whose content lives inside the MFT record, are patched by rewriting that record
-// with its fixups reapplied; the value cannot change length, and an attribute
-// merged in from an extension record is refused rather than risking a write to
-// the wrong record.
-func (f *File) WriteAt(p []byte, offset int64) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	if f.volume.IsClosed() {
-		return 0, ErrVolumeClosed
-	}
-
-	if !f.volume.IsWritable() {
-		return 0, ErrReadOnlyVolume
-	}
-
-	if f.isDir {
-		return 0, ErrNotFile
-	}
-
-	if offset < 0 {
-		return 0, ErrInvalidOffset
-	}
-
-	if f.dataAttr == nil {
-		return 0, ErrWriteUnsupported
-	}
-
-	if offset >= int64(f.size) {
-		return 0, io.EOF
-	}
-
-	if f.dataAttr.Resident != nil {
-		return f.writeResidentAt(f.dataAttr, p, offset)
-	}
-
-	if f.dataAttr.NonResident == nil {
-		return 0, ErrWriteUnsupported
-	}
-
-	if f.dataAttr.IsEncrypted() {
-		return 0, fmt.Errorf("%w: %v", ErrWriteUnsupported, ErrEncryptedData)
-	}
-
-	if f.dataAttr.IsCompressed() {
-		return 0, fmt.Errorf("%w: %v", ErrWriteUnsupported, ErrCompressedData)
-	}
-
-	if f.dataAttr.IsSparse() {
-		return 0, fmt.Errorf("%w: %v", ErrWriteUnsupported, ErrSparseData)
-	}
-
-	bytesToWrite := len(p)
-	if offset+int64(bytesToWrite) > int64(f.size) {
-		bytesToWrite = int(int64(f.size) - offset)
-	}
-
-	if bytesToWrite <= 0 {
-		return 0, io.EOF
-	}
-
-	n, err := f.volume.WriteDataRuns(f.dataAttr.NonResident.DataRuns, offset, p[:bytesToWrite])
-	if err != nil {
-		return n, err
-	}
-
-	if bytesToWrite < len(p) {
-		return n, io.EOF
-	}
-
-	return n, nil
 }
 
 // ReadAll reads the entire file contents.

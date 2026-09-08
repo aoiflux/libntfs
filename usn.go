@@ -1,6 +1,7 @@
 package libntfs
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
@@ -28,6 +29,12 @@ const (
 
 	// usnAlignment is the boundary records are laid out on.
 	usnAlignment = 8
+
+	// usnCancelCheckInterval is how many loop steps pass between cancellation
+	// checks while walking a buffer. A step over sparse space advances only 8
+	// bytes, so checking every one would put a ctx.Err call on the hottest path
+	// in the walk to no benefit; a few thousand steps is still sub-millisecond.
+	usnCancelCheckInterval = 4096
 )
 
 // USN change reasons.
@@ -95,19 +102,27 @@ var usnReasonNames = []struct {
 // Version 4 records track extents rather than name changes: they carry no
 // timestamp and no file name, so those fields are zero for them.
 type USNRecord struct {
-	MajorVersion    uint16
-	MinorVersion    uint16
-	USN             int64
-	FileReference   uint64 // MFT entry number of the changed file
-	FileSequence    uint16
-	ParentReference uint64 // MFT entry number of the containing directory
-	ParentSequence  uint16
-	Timestamp       time.Time
-	Reason          uint32
-	SourceInfo      uint32
-	SecurityID      uint32
-	FileAttributes  uint32
-	Name            string
+	MajorVersion uint16 `json:"major_version"`
+	MinorVersion uint16 `json:"minor_version"`
+	USN          int64  `json:"usn"`
+
+	// FileReference is the MFT record number of the changed file and
+	// FileSequence that record's sequence number; ParentReference and
+	// ParentSequence are the same pair for the directory containing it. The
+	// sequence numbers are what let a journal entry be tied to the right
+	// occupant of a reused record, and they match [NTFSFile.SequenceNumber] and
+	// [NTFSFile.ParentSequence] in a volume report.
+	FileReference   uint64 `json:"file_reference"`
+	FileSequence    uint16 `json:"file_sequence"`
+	ParentReference uint64 `json:"parent_reference"`
+	ParentSequence  uint16 `json:"parent_sequence"`
+
+	Timestamp      time.Time `json:"timestamp"`
+	Reason         uint32    `json:"reason"`
+	SourceInfo     uint32    `json:"source_info"`
+	SecurityID     uint32    `json:"security_id"`
+	FileAttributes uint32    `json:"file_attributes"`
+	Name           string    `json:"name"`
 }
 
 // ReasonNames decodes the reason bitmask into readable names. Bits with no known
@@ -290,17 +305,42 @@ func readUSNName(buf []byte, record *USNRecord, lengthOffset, offsetOffset int) 
 // the walk, so damage in one region does not hide the records after it. If fn
 // returns a non-nil error, iteration stops and that error is returned.
 func EachUSNRecord(buf []byte, fn func(*USNRecord) error) error {
-	_, err := walkUSNRecords(buf, true, fn)
+	_, err := walkUSNRecords(context.Background(), buf, true, fn)
+	return err
+}
+
+// EachUSNRecordContext is [EachUSNRecord] with cancellation. Cancelling ctx
+// stops the walk and returns the context's error.
+func EachUSNRecordContext(ctx context.Context, buf []byte, fn func(*USNRecord) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	_, err := walkUSNRecords(ctx, buf, true, fn)
 	return err
 }
 
 // walkUSNRecords is the shared walker. When allowTail is false it stops at the
 // first record that runs past the end of buf and reports how many bytes were
 // consumed, so a chunked reader can carry the remainder into the next chunk.
-func walkUSNRecords(buf []byte, allowTail bool, fn func(*USNRecord) error) (int, error) {
+func walkUSNRecords(ctx context.Context, buf []byte, allowTail bool, fn func(*USNRecord) error) (int, error) {
 	offset := 0
 
+	// Primed so the first iteration checks: a walk started under an already
+	// cancelled context must stop, however short the buffer is.
+	sinceCheck := usnCancelCheckInterval - 1
+
 	for offset+4 <= len(buf) {
+		// After that, cancellation is checked every so many steps rather than
+		// every one: skipping a sparse region advances 8 bytes at a time, and a
+		// ctx.Err call per step would cost more than the scan it guards.
+		if sinceCheck++; sinceCheck >= usnCancelCheckInterval {
+			sinceCheck = 0
+			if err := ctx.Err(); err != nil {
+				return offset, err
+			}
+		}
+
 		// Skip zero-filled space. Records are 8-byte aligned, so stepping by the
 		// alignment is both correct and much faster than a byte-at-a-time scan.
 		if ReadUint32LE(buf, offset) == 0 {
@@ -378,6 +418,19 @@ func (v *Volume) OpenUSNJournal() (*File, error) {
 // stream's data runs. If fn returns a non-nil error, iteration stops and that
 // error is returned.
 func (v *Volume) EachUSNRecord(fn func(*USNRecord) error) error {
+	return v.EachUSNRecordContext(context.Background(), fn)
+}
+
+// EachUSNRecordContext is [Volume.EachUSNRecord] with cancellation.
+//
+// $J routinely runs to gigabytes, so this is one of the long operations on a
+// large volume. Cancelling ctx stops the walk between chunks and returns the
+// context's error; records already handed to fn stay handed over.
+func (v *Volume) EachUSNRecordContext(ctx context.Context, fn func(*USNRecord) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	journal, err := v.OpenUSNJournal()
 	if err != nil {
 		return err
@@ -399,6 +452,10 @@ func (v *Volume) EachUSNRecord(fn func(*USNRecord) error) error {
 	)
 
 	for offset < size {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		n, readErr := journal.ReadAt(chunk, offset)
 		if n == 0 {
 			break
@@ -411,7 +468,7 @@ func (v *Volume) EachUSNRecord(fn func(*USNRecord) error) error {
 
 		atEnd := readErr == io.EOF || offset+int64(n) >= size
 
-		consumed, err := walkUSNRecords(data, atEnd, fn)
+		consumed, err := walkUSNRecords(ctx, data, atEnd, fn)
 		if err != nil {
 			return err
 		}

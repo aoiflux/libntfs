@@ -1,6 +1,7 @@
 package libntfs
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -548,7 +549,7 @@ func TestWalkUSNRecordsCarriesAcrossChunkBoundary(t *testing.T) {
 			return nil
 		}
 
-		consumed, err := walkUSNRecords(journal[:split], false, collect)
+		consumed, err := walkUSNRecords(context.Background(), journal[:split], false, collect)
 		if err != nil {
 			t.Fatalf("split %d: first chunk failed: %v", split, err)
 		}
@@ -556,7 +557,7 @@ func TestWalkUSNRecordsCarriesAcrossChunkBoundary(t *testing.T) {
 		carry := append([]byte{}, journal[consumed:split]...)
 		rest := append(carry, journal[split:]...)
 
-		if _, err := walkUSNRecords(rest, true, collect); err != nil {
+		if _, err := walkUSNRecords(context.Background(), rest, true, collect); err != nil {
 			t.Fatalf("split %d: second chunk failed: %v", split, err)
 		}
 

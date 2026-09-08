@@ -62,7 +62,7 @@ func main() {
 	}
 	defer f.Close()
 
-	volume, err := libntfs.Open(f)
+	volume, err := libntfs.OpenReadOnly(f)
 	if err != nil {
 		log.Fatalf("failed to parse NTFS volume: %v", err)
 	}

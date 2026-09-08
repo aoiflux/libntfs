@@ -28,6 +28,8 @@ go build
    - Handles MFT initialization
    - Provides thread-safe access via `sync.RWMutex`
    - Maintains MFT entry cache
+   - Binds the read and write handles: `Open` promotes an `io.WriterAt`,
+     `OpenReadOnly` wraps the reader so it cannot be asserted back to one
 
 2. **MFT** (`mft.go`)
    - Parses MFT entries
@@ -52,6 +54,17 @@ go build
    - Little-endian integer reading
    - UTF-16 string conversion
    - Time format conversion
+
+6. **Paths** (`path.go`)
+   - Reconstructs a path from an MFT record by following parent references
+   - Builds the whole-volume parent index shared by `WalkFiles` and `Report`
+   - Owns the `/$ORPHAN` fallback, the cycle check, and the depth bound
+
+7. **Writes** (`write.go`)
+   - The only file that can modify a volume
+   - Every entry point passes through `checkWritable`, so read-only mode and a
+     non-writable handle are refused in one place
+   - Nothing in the read API calls into it; keep it that way
 
 ## Thread Safety
 

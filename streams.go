@@ -11,11 +11,11 @@ import (
 // carry any number of alternate data streams alongside it. Directories have no
 // unnamed stream but can still carry alternate streams.
 type StreamInfo struct {
-	Name          string // Stream name; empty for the default unnamed stream
-	Size          uint64 // Stream length in bytes
-	AllocatedSize uint64 // Allocated size on disk; equals Size for resident streams
-	Resident      bool   // True when the content lives inside the MFT record
-	Support       FileReadSupport
+	Name          string          `json:"name"`           // Stream name; empty for the default unnamed stream
+	Size          uint64          `json:"size"`           // Stream length in bytes
+	AllocatedSize uint64          `json:"allocated_size"` // Allocated size on disk; equals Size for resident streams
+	Resident      bool            `json:"resident"`       // True when the content lives inside the MFT record
+	Support       FileReadSupport `json:"support"`
 }
 
 // IsAlternate reports whether this is an alternate data stream rather than the
@@ -34,7 +34,17 @@ func (e *MFTEntry) DataStreams() []*Attribute {
 
 // Streams lists the file's $DATA streams, unnamed first when present.
 func (f *File) Streams() []StreamInfo {
-	attrs := f.entry.DataStreams()
+	return streamsFromEntry(f.entry)
+}
+
+// streamsFromEntry describes an entry's $DATA streams without needing a File,
+// so a report over the whole MFT can list streams without opening every record.
+func streamsFromEntry(e *MFTEntry) []StreamInfo {
+	if e == nil {
+		return nil
+	}
+
+	attrs := e.DataStreams()
 	streams := make([]StreamInfo, 0, len(attrs))
 
 	for _, attr := range attrs {

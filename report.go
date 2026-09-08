@@ -1,8 +1,8 @@
 package libntfs
 
 import (
-	"strconv"
-	"strings"
+	"context"
+	"time"
 )
 
 // NTFSReport holds a summary of an NTFS volume and its files, suitable for
@@ -23,25 +23,99 @@ type NTFSMeta struct {
 }
 
 // NTFSFile describes a single file or directory found on the volume.
+//
+// The identity fields are what make two reports of the same volume comparable.
+// A path is not an identity: it changes when a file is renamed or its parent is,
+// and it is reused when a new file takes an old name. EntryNumber and
+// SequenceNumber together are the identity NTFS itself uses — the record, and
+// which occupant of that record this was. Diffing on EntryNumber alone reports a
+// deleted file whose record was reused as a modified one; diffing on Filename
+// alone reports a rename as a delete plus a create.
 type NTFSFile struct {
-	Filename     string         `json:"filename"`
-	Type         string         `json:"type"`
-	IsFragmented bool           `json:"is_fragmented"`
-	IsDeleted    bool           `json:"is_deleted"`
-	Size         int64          `json:"size"`
-	Fragments    []FileFragment `json:"fragments"`
+	Filename string `json:"filename"`
+	Type     string `json:"type"`
+
+	// EntryNumber is the file's MFT record number.
+	EntryNumber uint64 `json:"entry_number"`
+
+	// SequenceNumber is that record's sequence number, incremented by NTFS each
+	// time the record is reused. It is what tells a modified file apart from a
+	// different file occupying the same record.
+	SequenceNumber uint16 `json:"sequence_number"`
+
+	// ParentReference is the MFT record number of the directory named by this
+	// file's $FILE_NAME, and ParentSequence that record's sequence number. The
+	// pair matches [USNRecord.ParentReference] and [USNRecord.ParentSequence], so
+	// a report and the change journal can be joined on it. A ParentSequence that
+	// no longer matches the parent record means Filename is a reconstruction of
+	// where the file was, not a statement of where it is.
+	ParentReference uint64 `json:"parent_reference"`
+	ParentSequence  uint16 `json:"parent_sequence"`
+
+	IsFragmented bool  `json:"is_fragmented"`
+	IsDeleted    bool  `json:"is_deleted"`
+	Size         int64 `json:"size"`
+
+	// FileAttributes is the $STANDARD_INFORMATION attribute flags word, and
+	// HardLinkCount the MFT record's link count. A link count above one means
+	// Filename is one of several paths the same data is reachable by.
+	FileAttributes uint32 `json:"file_attributes"`
+	HardLinkCount  uint16 `json:"hard_link_count"`
+
+	// Timestamps are the $STANDARD_INFORMATION times: the set a timeline is
+	// built from, and the set that changes when a file is touched.
+	Timestamps NTFSTimestamps `json:"timestamps"`
+
+	// Streams lists every $DATA stream on the record, alternate data streams
+	// included. Size and Fragments describe the default stream only.
+	Streams []StreamInfo `json:"streams,omitempty"`
+
+	Fragments []FileFragment `json:"fragments"`
+}
+
+// NTFSTimestamps is the MACB set from $STANDARD_INFORMATION.
+//
+// These are the times a mounted volume reports, and the ones an anti-forensic
+// tool rewrites. $FILE_NAME carries a second copy that most tools do not touch;
+// read it with [File.GetFileName] when the two need comparing.
+type NTFSTimestamps struct {
+	Created    time.Time `json:"created"`
+	Modified   time.Time `json:"modified"`
+	MFTChanged time.Time `json:"mft_changed"`
+	Accessed   time.Time `json:"accessed"`
 }
 
 // Report scans every MFT entry on the volume and returns an NTFSReport with
 // a flat list of all files and directories — including deleted entries and
 // files that are orphaned (no longer linked to any directory index).
-// Paths are reconstructed by following $FILE_NAME parent references.
-// Files whose parent chain cannot be resolved are placed under /$ORPHAN/.
-// Errors from individual MFT entries are silently skipped so a partial result
-// is always returned.
+//
+// Paths are reconstructed by following $FILE_NAME parent references; files whose
+// parent chain cannot be resolved are placed under [OrphanDir]. Each entry
+// carries its own identity — MFT record number, sequence number, and parent
+// reference — so two reports of the same volume can be diffed on something
+// sturdier than the path string. Errors from individual MFT entries are silently
+// skipped so a partial result is always returned.
+//
+// It reads nothing but the volume and writes nothing to it. Use [ReportContext]
+// to cancel a report over a large volume.
 func (v *Volume) Report() (*NTFSReport, error) {
+	return v.ReportContext(context.Background())
+}
+
+// ReportContext is [Volume.Report] with cancellation.
+//
+// A report walks the MFT twice — once to map every record's name and parent, and
+// once to describe the files — which on a volume with tens of millions of
+// records is the longest thing this library does. Cancelling ctx stops it and
+// returns the context's error; no partial report is returned, since a truncated
+// listing that looks complete is worse than none.
+func (v *Volume) ReportContext(ctx context.Context) (*NTFSReport, error) {
 	if v.IsClosed() {
 		return nil, ErrVolumeClosed
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	report := &NTFSReport{
@@ -60,66 +134,21 @@ func (v *Volume) Report() (*NTFSReport, error) {
 		return report, nil
 	}
 
-	// Pass 1: collect name + parent for every valid MFT entry so we can
-	// reconstruct full paths without re-reading the MFT a second time.
-	type entryMeta struct {
-		name      string
-		parentNum uint64
-		isDir     bool
-	}
-	metaMap := make(map[uint64]entryMeta, maxEntries)
-
-	for i := uint64(0); i < maxEntries; i++ {
-		mftEntry, err := v.GetMFTEntry(i)
-		if err != nil {
-			continue
-		}
-		fn, err := mftEntry.GetFileName()
-		if err != nil || fn == nil || fn.Name == "" {
-			continue
-		}
-		metaMap[i] = entryMeta{
-			name:      fn.Name,
-			parentNum: fileReferenceRecordNumber(fn.ParentDirectory),
-			isDir:     mftEntry.IsDirectory(),
-		}
-	}
-
-	// buildPath walks parent references up to the root, returning the
-	// absolute path for the given entry.  Cycle detection prevents infinite
-	// loops on corrupt or deleted directory trees.
-	buildPath := func(entryNum uint64) string {
-		const maxDepth = 64
-		parts := make([]string, 0, 8)
-		cur := entryNum
-		seen := make(map[uint64]bool, maxDepth)
-
-		for cur != MFTEntryRoot {
-			if seen[cur] {
-				// Cycle — treat as orphan.
-				return "/$ORPHAN/" + strconv.FormatUint(entryNum, 10)
-			}
-			seen[cur] = true
-
-			meta, ok := metaMap[cur]
-			if !ok {
-				return "/$ORPHAN/" + strconv.FormatUint(entryNum, 10)
-			}
-			parts = append(parts, meta.name)
-			cur = meta.parentNum
-		}
-
-		// Reverse so root comes first.
-		for lo, hi := 0, len(parts)-1; lo < hi; lo, hi = lo+1, hi-1 {
-			parts[lo], parts[hi] = parts[hi], parts[lo]
-		}
-		return "/" + strings.Join(parts, "/")
+	// Pass 1: name and parent for every valid record, so paths can be
+	// reconstructed without walking ancestors once per file.
+	idx, err := v.buildPathIndex(ctx, WalkConfig{})
+	if err != nil {
+		return nil, err
 	}
 
 	// Pass 2: emit one NTFSFile per user-space MFT entry.
 	// Skip the 12 reserved system metadata entries (0–11).
 	for i := uint64(MFTEntryExtend + 1); i < maxEntries; i++ {
-		meta, ok := metaMap[i]
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		meta, ok := idx.meta[i]
 		if !ok {
 			continue
 		}
@@ -129,35 +158,63 @@ func (v *Volume) Report() (*NTFSReport, error) {
 			continue
 		}
 
-		fileType := "file"
-		if meta.isDir {
-			fileType = "directory"
-		}
-
-		ntfsFile := NTFSFile{
-			Filename:  buildPath(i),
-			Type:      fileType,
-			IsDeleted: !mftEntry.IsInUse(),
-		}
-
-		dataAttr := mftEntry.FindPrimaryDataAttribute()
-		if dataAttr != nil {
-			if dataAttr.Resident != nil {
-				ntfsFile.Size = int64(len(dataAttr.Resident.Value))
-			} else if dataAttr.NonResident != nil {
-				ntfsFile.Size = int64(dataAttr.NonResident.RealSize)
-				if !meta.isDir {
-					frags := v.allocatedFragments(dataAttr)
-					ntfsFile.Fragments = frags
-					ntfsFile.IsFragmented = len(frags) > 1
-				}
-			}
-		}
-
-		report.Files = append(report.Files, ntfsFile)
+		report.Files = append(report.Files, v.describeEntry(i, meta, idx, mftEntry))
 	}
 
 	return report, nil
+}
+
+// describeEntry turns one MFT record into its report entry.
+func (v *Volume) describeEntry(entryNum uint64, meta pathMeta, idx *pathIndex, entry *MFTEntry) NTFSFile {
+	fileType := "file"
+	if meta.isDir {
+		fileType = "directory"
+	}
+
+	ntfsFile := NTFSFile{
+		Filename:        idx.pathFor(entryNum),
+		Type:            fileType,
+		EntryNumber:     entryNum,
+		SequenceNumber:  entry.SequenceNum,
+		ParentReference: meta.parent,
+		ParentSequence:  meta.parentSeq,
+		IsDeleted:       !entry.IsInUse(),
+		HardLinkCount:   entry.HardLinkCount,
+		Streams:         streamsFromEntry(entry),
+	}
+
+	// A record with no readable $STANDARD_INFORMATION still belongs in the
+	// report; it simply has no timestamps to contribute.
+	if si, err := entry.GetStandardInformation(); err == nil && si != nil {
+		ntfsFile.FileAttributes = si.FileAttributes
+		ntfsFile.Timestamps = NTFSTimestamps{
+			Created:    si.CreateTime,
+			Modified:   si.ModifyTime,
+			MFTChanged: si.MFTChangeTime,
+			Accessed:   si.AccessTime,
+		}
+	}
+
+	dataAttr := entry.FindPrimaryDataAttribute()
+	if dataAttr == nil {
+		return ntfsFile
+	}
+
+	if dataAttr.Resident != nil {
+		ntfsFile.Size = int64(len(dataAttr.Resident.Value))
+		return ntfsFile
+	}
+
+	if dataAttr.NonResident != nil {
+		ntfsFile.Size = int64(dataAttr.NonResident.RealSize)
+		if !meta.isDir {
+			frags := v.allocatedFragments(dataAttr)
+			ntfsFile.Fragments = frags
+			ntfsFile.IsFragmented = len(frags) > 1
+		}
+	}
+
+	return ntfsFile
 }
 
 // getVolumeName reads the $VOLUME_NAME attribute from the $Volume MFT entry.

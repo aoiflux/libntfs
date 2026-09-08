@@ -80,7 +80,7 @@ func main() {
 
 	// A full volume parses as one; anything else is treated as a standalone
 	// $LogFile, which is how KAPE and FTK Imager hand it over.
-	vol, volErr := libntfs.Open(f)
+	vol, volErr := libntfs.OpenReadOnly(f)
 	if volErr == nil {
 		defer vol.Close()
 

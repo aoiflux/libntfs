@@ -76,11 +76,17 @@ func main() {
 	}
 	defer unlockVolume()
 
+	// Open, not OpenReadOnly: this is the one example that modifies a volume, so
+	// it needs the handle promoted to a writer. Every other example here reads.
 	vol, err := libntfs.Open(fh)
 	if err != nil {
 		log.Fatalf("failed to parse NTFS volume: %v", err)
 	}
 	defer vol.Close()
+
+	if !vol.IsWritable() {
+		log.Fatal("volume is not writable; the handle must support io.WriterAt")
+	}
 
 	f, err := vol.OpenPath(filePath)
 	if err != nil {

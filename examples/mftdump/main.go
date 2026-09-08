@@ -145,7 +145,7 @@ func dumpStandaloneMFT(r io.ReaderAt, recordSize uint32, limit int, showUnused b
 
 // dumpVolume walks the MFT of a live volume or image.
 func dumpVolume(r io.ReaderAt, limit int, showUnused bool) error {
-	vol, err := libntfs.Open(r)
+	vol, err := libntfs.OpenReadOnly(r)
 	if err != nil {
 		return err
 	}

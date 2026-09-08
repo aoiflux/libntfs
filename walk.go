@@ -66,8 +66,9 @@ func (v *Volume) EachMFTEntryContext(ctx context.Context, fn func(entryNum uint6
 // WalkMFT walks every parsable MFT record, parsing on a bounded pool of workers
 // and delivering to fn in ascending entry order.
 //
-// The zero WalkConfig chooses a worker count from the machine. Set Workers to
-// [WorkersSequential] for the single-threaded walk.
+// The zero WalkConfig runs the walk single-threaded, which is the right default
+// for a volume backed by a file handle. Set Workers to [WorkersAuto] to take a
+// count from the machine, or to a count of your own.
 //
 // fn is called from one goroutine at a time and in order, so it needs no
 // synchronisation of its own, and a parallel walk produces exactly the sequence

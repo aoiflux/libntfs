@@ -52,19 +52,84 @@ type Volume struct {
 	securityInit bool                           // True when securityMap has been populated
 	securityErr  error                          // Sticky error from the $SDS load
 
+	// readOnly records that the caller asked for a read-only volume. It is set
+	// once during Open and never mutated, so it needs no lock: every write entry
+	// point consults it before touching the handle.
+	readOnly bool
+
 	// State
 	closed  bool
 	closeMu sync.RWMutex
 }
 
+// Options configures how a volume is opened.
+//
+// The zero value reproduces [Open]: the boot sector is expected at offset zero,
+// and a reader that also implements [io.WriterAt] yields a writable volume.
+type Options struct {
+	// ReadOnly opens the volume for reading only.
+	//
+	// A read-only volume never writes, whatever the reader turns out to support.
+	// The [io.WriterAt] promotion [Open] performs is skipped, the handle is
+	// wrapped so it cannot be recovered by a type assertion, [Volume.IsWritable]
+	// reports false, and every write entry point returns [ErrReadOnlyMode]
+	// without touching the underlying handle.
+	//
+	// This is the mode to use on evidence. It costs nothing and removes the
+	// possibility of an accidental write entirely.
+	ReadOnly bool
+
+	// BaseOffset is the byte offset within reader at which the NTFS boot sector
+	// begins, for a partition inside a whole-disk image.
+	//
+	// Zero means the volume starts at the beginning of the reader. Every read
+	// and write is shifted by this amount, so volume offsets reported by the
+	// library — fragment locations, MFT record offsets — remain relative to the
+	// volume rather than to the containing image.
+	//
+	// It is an alternative to wrapping the reader in [io.SectionReader] yourself;
+	// the section reader remains the right tool when the volume's length also
+	// needs bounding.
+	BaseOffset int64
+}
+
 // Open opens an NTFS volume from the given reader.
 // The reader should provide access to the raw volume data (e.g., a disk or disk image).
+//
+// If reader also implements [io.WriterAt], the volume is writable. Callers
+// working on evidence should use [OpenReadOnly] instead, which refuses writes
+// whatever the reader supports.
 func Open(reader io.ReaderAt) (*Volume, error) {
+	return OpenWithOptions(reader, Options{})
+}
+
+// OpenReadOnly opens an NTFS volume that can never be written to.
+//
+// It is [Open] with Options.ReadOnly set: the [io.WriterAt] promotion is
+// skipped, so a reader that happens to support writes — an *os.File opened
+// O_RDWR, a memory-backed image, a device handle — cannot be used to modify the
+// volume through this library. Every write entry point returns [ErrReadOnlyMode].
+//
+// Prefer it for forensic work, where a mutable handle on evidence is a hazard
+// rather than a feature.
+func OpenReadOnly(reader io.ReaderAt) (*Volume, error) {
+	return OpenWithOptions(reader, Options{ReadOnly: true})
+}
+
+// OpenWithOptions opens an NTFS volume with explicit options.
+// See [Options] for what each one does.
+func OpenWithOptions(reader io.ReaderAt, opts Options) (*Volume, error) {
 	if reader == nil {
 		return nil, wrapVolumeError("open", fmt.Errorf("reader is nil"))
 	}
 
-	// If the reader can be stat'ed, reject directory inputs explicitly.
+	if opts.BaseOffset < 0 {
+		return nil, wrapVolumeError("open",
+			fmt.Errorf("%w: negative base offset %d", ErrInvalidOffset, opts.BaseOffset))
+	}
+
+	// If the reader can be stat'ed, reject directory inputs explicitly. This runs
+	// before any wrapping, which would hide the Stat method.
 	type statReader interface {
 		Stat() (fs.FileInfo, error)
 	}
@@ -75,7 +140,7 @@ func Open(reader io.ReaderAt) (*Volume, error) {
 	}
 
 	v := &Volume{
-		reader:   reader,
+		readOnly: opts.ReadOnly,
 		mftCache: make(map[uint64]*MFTEntry, DefaultMFTCacheSize),
 		bufferPool: &sync.Pool{
 			New: func() interface{} {
@@ -85,9 +150,7 @@ func Open(reader io.ReaderAt) (*Volume, error) {
 		},
 	}
 
-	if writer, ok := reader.(io.WriterAt); ok {
-		v.writer = writer
-	}
+	v.reader, v.writer = bindHandles(reader, opts)
 
 	// Parse boot sector
 	if err := v.parseBootSector(); err != nil {
@@ -100,6 +163,76 @@ func Open(reader io.ReaderAt) (*Volume, error) {
 	}
 
 	return v, nil
+}
+
+// bindHandles decides what the volume reads through and whether it can write at
+// all.
+//
+// A read-only volume gets its reader wrapped in a type that exposes nothing but
+// ReadAt, so the io.WriterAt promotion cannot fire here and the writable handle
+// cannot be recovered later by a type assertion on the stored reader. That is
+// belt and braces — nothing in the library asserts on v.reader — but the whole
+// point of the mode is that no code path can reach a write, and a wrapper is a
+// cheaper guarantee than a review.
+func bindHandles(reader io.ReaderAt, opts Options) (io.ReaderAt, io.WriterAt) {
+	if opts.ReadOnly {
+		return readOnlyReaderAt{r: reader, base: opts.BaseOffset}, nil
+	}
+
+	writer, _ := reader.(io.WriterAt)
+
+	if opts.BaseOffset == 0 {
+		return reader, writer
+	}
+
+	shifted := &offsetHandle{r: reader, w: writer, base: opts.BaseOffset}
+	if writer == nil {
+		// Returning the struct as an io.WriterAt would hand back a non-nil
+		// interface holding a nil-writing value, and IsWritable would lie.
+		return shifted, nil
+	}
+
+	return shifted, shifted
+}
+
+// readOnlyReaderAt exposes ReadAt and nothing else, optionally shifted by base.
+//
+// It is deliberately not a pointer type and carries no writer: an assertion to
+// io.WriterAt on it cannot succeed.
+type readOnlyReaderAt struct {
+	r    io.ReaderAt
+	base int64
+}
+
+func (ro readOnlyReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, ErrInvalidOffset
+	}
+	return ro.r.ReadAt(p, ro.base+off)
+}
+
+// offsetHandle shifts a read/write handle so volume offset zero lands at base.
+type offsetHandle struct {
+	r    io.ReaderAt
+	w    io.WriterAt
+	base int64
+}
+
+func (o *offsetHandle) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, ErrInvalidOffset
+	}
+	return o.r.ReadAt(p, o.base+off)
+}
+
+func (o *offsetHandle) WriteAt(p []byte, off int64) (int, error) {
+	if o.w == nil {
+		return 0, ErrReadOnlyVolume
+	}
+	if off < 0 {
+		return 0, ErrInvalidOffset
+	}
+	return o.w.WriteAt(p, o.base+off)
 }
 
 // Close closes the volume and releases resources.
@@ -126,6 +259,15 @@ func (v *Volume) IsClosed() bool {
 	v.closeMu.RLock()
 	defer v.closeMu.RUnlock()
 	return v.closed
+}
+
+// IsReadOnly reports whether the volume was opened read-only.
+//
+// It answers a different question from [Volume.IsWritable]: a volume opened
+// normally over a reader that cannot write is not writable but is also not in
+// read-only mode, and one opened with [OpenReadOnly] is both.
+func (v *Volume) IsReadOnly() bool {
+	return v.readOnly
 }
 
 // parseBootSector reads and parses the NTFS boot sector.
@@ -355,69 +497,6 @@ func (v *Volume) readAtSectorAligned(p []byte, offset, sectorSize int64) (int, e
 	return readLen, nil
 }
 
-// WriteAt writes len(p) bytes to the volume at the specified absolute offset.
-// This method is thread-safe and requires the underlying handle to implement io.WriterAt.
-func (v *Volume) WriteAt(p []byte, offset int64) (int, error) {
-	if v.IsClosed() {
-		return 0, ErrVolumeClosed
-	}
-
-	if v.writer == nil {
-		return 0, ErrReadOnlyVolume
-	}
-
-	if offset < 0 {
-		return 0, ErrInvalidOffset
-	}
-
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	sectorSize := int64(v.bytesPerSector)
-	if sectorSize > 0 {
-		unalignedOffset := offset%sectorSize != 0
-		unalignedLength := int64(len(p))%sectorSize != 0
-		if unalignedOffset || unalignedLength {
-			return v.writeAtSectorAligned(p, offset, sectorSize)
-		}
-	}
-
-	n, err := v.writer.WriteAt(p, offset)
-	if err != nil {
-		return n, wrapIOError("write", offset, len(p), err)
-	}
-
-	return n, nil
-}
-
-func (v *Volume) writeAtSectorAligned(p []byte, offset, sectorSize int64) (int, error) {
-	alignedStart := offset - (offset % sectorSize)
-	alignedEnd := alignUpInt64(offset+int64(len(p)), sectorSize)
-	if alignedEnd <= alignedStart {
-		return 0, ErrInvalidOffset
-	}
-
-	bufLen := alignedEnd - alignedStart
-	buf := make([]byte, bufLen)
-
-	if _, err := v.reader.ReadAt(buf, alignedStart); err != nil {
-		return 0, wrapIOError("read", alignedStart, len(buf), err)
-	}
-
-	copy(buf[offset-alignedStart:], p)
-
-	n, err := v.writer.WriteAt(buf, alignedStart)
-	if err != nil {
-		return 0, wrapIOError("write", alignedStart, len(buf), err)
-	}
-	if n != len(buf) {
-		return 0, wrapIOError("write", alignedStart, len(buf), io.ErrShortWrite)
-	}
-
-	return len(p), nil
-}
-
 func alignUpInt64(v, align int64) int64 {
 	if align <= 0 {
 		return v
@@ -427,11 +506,6 @@ func alignUpInt64(v, align int64) int64 {
 		return v
 	}
 	return v + (align - rem)
-}
-
-// IsWritable reports whether this volume supports in-place writes.
-func (v *Volume) IsWritable() bool {
-	return v.writer != nil
 }
 
 // ReadClusters reads the specified number of clusters starting at the given cluster.

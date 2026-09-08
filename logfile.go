@@ -1,6 +1,7 @@
 package libntfs
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sort"
@@ -788,10 +789,24 @@ func sliceLogPayload(data []byte, offset, length int) []byte {
 // hide the records after it. If fn returns a non-nil error, iteration stops and
 // that error is returned.
 func EachLogRecord(buf []byte, fn func(*LogRecord) error) error {
+	return EachLogRecordContext(context.Background(), buf, fn)
+}
+
+// EachLogRecordContext is [EachLogRecord] with cancellation. Cancelling ctx
+// stops the walk at the next page boundary and returns the context's error.
+func EachLogRecordContext(ctx context.Context, buf []byte, fn func(*LogRecord) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	pageSize, bounds := logGeometryFrom(buf)
 	walker := &logPageWalker{fn: fn, bounds: bounds}
 
 	for offset := 0; offset+pageSize <= len(buf); offset += pageSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if err := walker.feed(buf[offset : offset+pageSize]); err != nil {
 			return err
 		}
@@ -1046,6 +1061,19 @@ func (v *Volume) LogRestartArea() (*LogRestartArea, error) {
 // the oldest, so records appear in whatever order the ring currently holds
 // rather than oldest-first. Sort by LSN for a timeline.
 func (v *Volume) EachLogRecord(fn func(*LogRecord) error) error {
+	return v.EachLogRecordContext(context.Background(), fn)
+}
+
+// EachLogRecordContext is [Volume.EachLogRecord] with cancellation.
+//
+// $LogFile is commonly 64 MB and can be far larger, and every page in it is
+// parsed. Cancelling ctx stops the walk at the next page boundary and returns
+// the context's error; records already handed to fn stay handed over.
+func (v *Volume) EachLogRecordContext(ctx context.Context, fn func(*LogRecord) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	logFile, err := v.OpenLogFile()
 	if err != nil {
 		return err
@@ -1067,6 +1095,10 @@ func (v *Volume) EachLogRecord(fn func(*LogRecord) error) error {
 	walker := &logPageWalker{fn: fn, bounds: bounds}
 
 	for offset := int64(0); offset < size; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		n, readErr := logFile.ReadAt(chunk, offset)
 		if n == 0 {
 			break
