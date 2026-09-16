@@ -7,19 +7,47 @@ import (
 
 // NTFSReport holds a summary of an NTFS volume and its files, suitable for
 // consumption by callers of the library.
+//
+// A report is evidence, and evidence has to stay readable by a tool built
+// against a different version of this library. SchemaVersion is what lets such
+// a tool refuse a document it does not understand instead of misreading it, and
+// LibraryVersion and Generated say what produced it and when.
 type NTFSReport struct {
-	Name        string     `json:"name"`
-	StartOffset int64      `json:"start_offset"`
-	EndOffset   int64      `json:"end_offset"`
-	Filesystem  NTFSMeta   `json:"ntfs_meta"`
-	Files       []NTFSFile `json:"files"`
+	// SchemaVersion is the shape of this document, not the version of the
+	// volume or of the library. Compare it against [ReportSchemaVersion].
+	SchemaVersion int `json:"schema_version"`
+
+	// LibraryVersion is the libntfs release that produced this document, and
+	// Generated the moment it did, in UTC.
+	LibraryVersion string    `json:"library_version"`
+	Generated      time.Time `json:"generated"`
+
+	Name string `json:"name"`
+
+	// StartOffset and EndOffset span the volume in the image it was read from:
+	// StartOffset is Options.BaseOffset and EndOffset is one byte past the last,
+	// so the span is half-open and EndOffset-StartOffset is the volume size.
+	//
+	// They are in the same image-absolute space as [FileFragment.StartOffset],
+	// so every offset in a report can be compared with every other without
+	// knowing where any of them came from.
+	StartOffset int64 `json:"start_offset"`
+	EndOffset   int64 `json:"end_offset"`
+
+	Filesystem NTFSMeta   `json:"ntfs_meta"`
+	Files      []NTFSFile `json:"files"`
 }
 
 // NTFSMeta describes the file-system geometry.
 type NTFSMeta struct {
 	Type      string `json:"type"`
 	BlockSize int    `json:"block_size"`
-	Offset    int64  `json:"offset"`
+
+	// Offset locates the $MFT, not the volume. It is image-absolute like every
+	// other offset here, so on a volume opened with a non-zero
+	// Options.BaseOffset it is the base plus the MFT's position within the
+	// volume. Use [NTFSReport.StartOffset] for where the volume itself begins.
+	Offset int64 `json:"offset"`
 }
 
 // NTFSFile describes a single file or directory found on the volume.
@@ -119,9 +147,12 @@ func (v *Volume) ReportContext(ctx context.Context) (*NTFSReport, error) {
 	}
 
 	report := &NTFSReport{
-		Name:        v.getVolumeName(),
-		StartOffset: 0,
-		EndOffset:   int64(v.VolumeSize()),
+		SchemaVersion:  ReportSchemaVersion,
+		LibraryVersion: Version,
+		Generated:      time.Now().UTC(),
+		Name:           v.getVolumeName(),
+		StartOffset:    v.baseOffset,
+		EndOffset:      v.baseOffset + int64(v.VolumeSize()),
 		Filesystem: NTFSMeta{
 			Type:      "NTFS",
 			BlockSize: int(v.BytesPerCluster()),

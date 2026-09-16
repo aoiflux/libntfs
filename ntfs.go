@@ -43,11 +43,18 @@
 //		BaseOffset: partitionOffset,
 //	})
 //
-// Every offset the library then reports stays relative to the volume, so it can
-// be compared against a report taken from the same partition acquired on its
-// own. Wrapping the file in an [io.SectionReader] and calling [Open] still
-// works and is equivalent, except that a section reader over an *os.File is not
-// an [io.WriterAt] and so is read-only by accident rather than by declaration.
+// BaseOffset does two things. It shifts every read, so the library finds the
+// volume; and it is added to every disk offset the library reports, so those
+// offsets locate bytes in the image rather than within the partition. A
+// fragment offset can then be intersected with a range in whole-disk
+// coordinates, or handed straight back to [Volume.ReadAt].
+//
+// Wrapping the file in an [io.SectionReader] and calling [Open] still works,
+// but it is not equivalent: a section reader cannot say where the partition
+// sits, so the offsets reported are relative to the section. It is also
+// read-only by accident rather than by declaration, since a section reader over
+// an *os.File is not an [io.WriterAt]. Prefer BaseOffset, and reach for a
+// section reader when the volume needs its length bounded too.
 //
 // # Reading and writing
 //
@@ -197,3 +204,23 @@
 // rejects candidates that do not look like real names, because a phantom file in
 // a forensic report is worse than a missing one.
 package libntfs
+
+// Version is the libntfs release this build was cut from.
+//
+// It is maintained by hand and is only as accurate as the last person to bump
+// it; nothing here can check it against the git tag. It is recorded on
+// [NTFSReport] so a document can say what produced it.
+const Version = "v0.3.3"
+
+// ReportSchemaVersion is the schema [NTFSReport] documents are written against,
+// and the value of their SchemaVersion field.
+//
+// Increment it when a field is removed, renamed, or changes meaning. Adding a
+// field does not, since a consumer that ignores unknown keys is unaffected by
+// one. Nothing in the test suite can detect a forgotten increment, so it is on
+// whoever changes the shape.
+//
+// 1 is the first published schema. It is also the schema in which StartOffset,
+// EndOffset and [FileFragment] offsets became image-absolute rather than
+// volume-relative.
+const ReportSchemaVersion = 1

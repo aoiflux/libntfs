@@ -6,14 +6,14 @@ import "fmt"
 // the buffer in the same form parseMFTRecordCore works on. It also returns the
 // record's byte offset on the volume, ready for a write-back.
 func (v *Volume) readMFTRecordRaw(entryNum uint64) ([]byte, int64, error) {
-	offset, err := v.getMFTEntryOffset(entryNum)
+	offset, err := v.mftEntryVolumeOffset(entryNum)
 	if err != nil {
 		return nil, 0, wrapMFTError(entryNum, "calculate offset", err)
 	}
 
 	buf := make([]byte, v.mftRecordSize)
 	if _, err := v.reader.ReadAt(buf, offset); err != nil {
-		return nil, 0, wrapIOError("read", offset, int(v.mftRecordSize), err)
+		return nil, 0, v.ioErrorAt("read", offset, int(v.mftRecordSize), err)
 	}
 
 	if magic := ReadUint32LE(buf, 0); magic != MFTMagicFILE {
@@ -51,12 +51,13 @@ func (v *Volume) writeMFTRecord(entryNum uint64, record []byte, offset int64) er
 		return err
 	}
 
-	n, err := v.WriteAt(record, offset)
+	// offset came from mftEntryVolumeOffset, so it is volume-relative.
+	n, err := v.writeAtVolume(record, offset)
 	if err != nil {
 		return err
 	}
 	if n != len(record) {
-		return wrapIOError("write", offset, len(record), ErrBufferTooSmall)
+		return v.ioErrorAt("write", offset, len(record), ErrBufferTooSmall)
 	}
 
 	// Evict so later reads see the new bytes. Clearing the saturation flag with

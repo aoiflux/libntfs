@@ -87,7 +87,7 @@ func (v *Volume) readSingleCluster(cluster int64, dst []byte) error {
 
 	off := int64(cluster) * int64(v.bytesPerCluster)
 	if err := readAtFull(v.reader, dst, off); err != nil {
-		return wrapIOError("read", off, len(dst), err)
+		return v.ioErrorAt("read", off, len(dst), err)
 	}
 
 	return nil

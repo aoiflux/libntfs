@@ -288,6 +288,17 @@ func wrapIOError(op string, offset int64, size int, err error) error {
 	return &IOError{Op: op, Offset: offset, Size: size, Err: err}
 }
 
+// ioErrorAt is wrapIOError for a failure at a volume-relative offset.
+//
+// It lifts the offset into image space before reporting it, so IOError.Offset
+// speaks the same coordinates as every other offset the library hands out. The
+// read and write paths work in volume space throughout; this is the one place
+// that matters to a caller, because the offset in the error is the only part of
+// it they see.
+func (v *Volume) ioErrorAt(op string, volumeOffset int64, size int, err error) error {
+	return wrapIOError(op, v.baseOffset+volumeOffset, size, err)
+}
+
 // wrapPathError creates a PathError.
 func wrapPathError(op, fullPath, component string, err error) error {
 	if err == nil {

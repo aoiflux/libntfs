@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 var updateGolden = flag.Bool("update", false, "rewrite the golden files instead of comparing against them")
@@ -108,6 +109,20 @@ func TestReportGolden(t *testing.T) {
 		t.Fatalf("Report failed: %v", err)
 	}
 
+	// Two fields on the report root are deliberately volatile: Generated is the
+	// moment the report was taken and LibraryVersion changes at every release.
+	// Pinning either would make this test fail for reasons that have nothing to
+	// do with the report's shape, so they are checked for presence and then
+	// blanked. TestReportProvenance is what actually asserts their values.
+	if report.Generated.IsZero() {
+		t.Error("expected the report to carry a generation timestamp")
+	}
+	if report.LibraryVersion == "" {
+		t.Error("expected the report to carry a library version")
+	}
+	report.Generated = time.Time{}
+	report.LibraryVersion = ""
+
 	got, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		t.Fatalf("marshalling the report failed: %v", err)
@@ -183,4 +198,86 @@ func TestReportFragmentsExcludeHoles(t *testing.T) {
 // checks the output rather than the checkout.
 func normalizeNewlines(text string) string {
 	return strings.ReplaceAll(text, "\r\n", "\n")
+}
+
+// TestReportProvenance covers what TestReportGolden deliberately blanks.
+//
+// The golden test zeroes Generated and LibraryVersion so a release or the
+// passage of a second does not fail it, which means it would keep passing if
+// neither field were ever assigned. This is the test that says they are.
+func TestReportProvenance(t *testing.T) {
+	vol, err := Open(&mockReaderAt{data: buildReportFixtureImage(t)})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer vol.Close()
+
+	before := time.Now().UTC()
+	report, err := vol.Report()
+	if err != nil {
+		t.Fatalf("Report failed: %v", err)
+	}
+	after := time.Now().UTC()
+
+	if report.SchemaVersion != ReportSchemaVersion {
+		t.Errorf("SchemaVersion = %d, want %d", report.SchemaVersion, ReportSchemaVersion)
+	}
+	if report.SchemaVersion == 0 {
+		t.Error("SchemaVersion must be non-zero, or a consumer cannot tell it apart from an absent field")
+	}
+	if report.LibraryVersion != Version {
+		t.Errorf("LibraryVersion = %q, want %q", report.LibraryVersion, Version)
+	}
+	if report.Generated.Before(before) || report.Generated.After(after) {
+		t.Errorf("Generated = %v, want a time within [%v, %v]", report.Generated, before, after)
+	}
+	if loc := report.Generated.Location(); loc != time.UTC {
+		t.Errorf("Generated is in %v, want UTC so two reports are comparable", loc)
+	}
+}
+
+// TestNTFSReportRoundTrip pins the one property a machine consumer depends on:
+// that a document written today can be read back and still say which schema it
+// was written against.
+func TestNTFSReportRoundTrip(t *testing.T) {
+	vol, err := Open(&mockReaderAt{data: buildReportFixtureImage(t)})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer vol.Close()
+
+	report, err := vol.Report()
+	if err != nil {
+		t.Fatalf("Report failed: %v", err)
+	}
+
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshalling the report failed: %v", err)
+	}
+
+	var decoded NTFSReport
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshalling the report failed: %v", err)
+	}
+
+	if decoded.SchemaVersion == 0 {
+		t.Fatal("SchemaVersion did not survive the round trip")
+	}
+	if decoded.SchemaVersion != report.SchemaVersion {
+		t.Errorf("SchemaVersion = %d after the round trip, want %d",
+			decoded.SchemaVersion, report.SchemaVersion)
+	}
+	if decoded.LibraryVersion != report.LibraryVersion {
+		t.Errorf("LibraryVersion = %q after the round trip, want %q",
+			decoded.LibraryVersion, report.LibraryVersion)
+	}
+	if !decoded.Generated.Equal(report.Generated) {
+		t.Errorf("Generated = %v after the round trip, want %v",
+			decoded.Generated, report.Generated)
+	}
+	if len(decoded.Files) != len(report.Files) {
+		t.Errorf("Files = %d after the round trip, want %d",
+			len(decoded.Files), len(report.Files))
+	}
 }

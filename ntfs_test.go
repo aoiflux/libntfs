@@ -919,9 +919,9 @@ func TestGetMFTEntryOffsetAcrossMultipleDataRuns(t *testing.T) {
 		},
 	}
 
-	offset, err := v.getMFTEntryOffset(4)
+	offset, err := v.mftEntryVolumeOffset(4)
 	if err != nil {
-		t.Fatalf("getMFTEntryOffset failed: %v", err)
+		t.Fatalf("mftEntryVolumeOffset failed: %v", err)
 	}
 
 	expected := int64(105 * 4096)
@@ -2444,8 +2444,8 @@ func BenchmarkGetMFTEntryOffsetManyRuns(b *testing.B) {
 	entryNum := (uint64(runCount)*uint64(clusterSize))/uint64(v.mftRecordSize) - 2
 
 	for b.Loop() {
-		if _, err := v.getMFTEntryOffset(entryNum); err != nil {
-			b.Fatalf("getMFTEntryOffset failed: %v", err)
+		if _, err := v.mftEntryVolumeOffset(entryNum); err != nil {
+			b.Fatalf("mftEntryVolumeOffset failed: %v", err)
 		}
 	}
 }

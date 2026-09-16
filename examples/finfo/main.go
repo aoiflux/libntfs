@@ -33,7 +33,11 @@ type FileInfoReport struct {
 }
 
 // FileFragmentReport describes one contiguous region of the stream, on both the
-// volume and the stream's own offset axis.
+// disk and the stream's own offset axis.
+//
+// StartOffset and EndOffset are image-absolute: they include the volume's base
+// offset, so they locate bytes in the image rather than within the partition. A
+// sparse region has no location and reports zero for both.
 type FileFragmentReport struct {
 	StartOffset int64 `json:"start_offset"`
 	EndOffset   int64 `json:"end_offset"`

@@ -87,7 +87,12 @@ func TestCorpusDirEntryTypeMatchesMFT(t *testing.T) {
 func TestCorpusFragmentsTileEveryStream(t *testing.T) {
 	vol := openCorpus(t)
 
-	volumeSize := int64(vol.VolumeSize())
+	// Fragment offsets are image-absolute, so the volume occupies
+	// [BaseOffset, BaseOffset+VolumeSize) in the reader rather than starting at
+	// zero. Every bound below is expressed against that span so the invariant
+	// holds whether the corpus entry is a whole disk or a bare partition.
+	volumeStart := vol.BaseOffset()
+	volumeEnd := volumeStart + int64(vol.VolumeSize())
 	checked, fragmented, holes := 0, 0, 0
 
 	walkCorpus(t, vol, func(path string, entries []DirEntry) {
@@ -134,12 +139,12 @@ func TestCorpusFragmentsTileEveryStream(t *testing.T) {
 				case frag.Sparse:
 					holes++
 				case !frag.Resident:
-					if frag.StartOffset < 0 || frag.EndOffset > volumeSize {
-						t.Errorf("%s/%s fragment %d: [%d,%d) is outside the %d byte volume",
-							path, entry.Name, i, frag.StartOffset, frag.EndOffset, volumeSize)
+					if frag.StartOffset < volumeStart || frag.EndOffset > volumeEnd {
+						t.Errorf("%s/%s fragment %d: [%d,%d) is outside the volume span [%d,%d)",
+							path, entry.Name, i, frag.StartOffset, frag.EndOffset, volumeStart, volumeEnd)
 					}
 					if frag.EndOffset-frag.StartOffset != frag.Length {
-						t.Errorf("%s/%s fragment %d: volume span %d does not match length %d",
+						t.Errorf("%s/%s fragment %d: disk span %d does not match length %d",
 							path, entry.Name, i, frag.EndOffset-frag.StartOffset, frag.Length)
 					}
 				}

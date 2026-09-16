@@ -446,7 +446,7 @@ func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
 // readMFTEntry reads an MFT entry from disk.
 func (v *Volume) readMFTEntry(entryNum uint64) (*MFTEntry, error) {
 	// Calculate the offset of the MFT entry
-	offset, err := v.getMFTEntryOffset(entryNum)
+	offset, err := v.mftEntryVolumeOffset(entryNum)
 	if err != nil {
 		return nil, wrapMFTError(entryNum, "calculate offset", err)
 	}
@@ -459,7 +459,7 @@ func (v *Volume) readMFTEntryAt(entryNum uint64, offset int64) (*MFTEntry, error
 	// Read MFT entry data
 	buf := make([]byte, v.mftRecordSize)
 	if _, err := v.reader.ReadAt(buf, offset); err != nil {
-		return nil, wrapIOError("read", offset, int(v.mftRecordSize), err)
+		return nil, v.ioErrorAt("read", offset, int(v.mftRecordSize), err)
 	}
 
 	// Parse MFT entry
@@ -471,8 +471,14 @@ func (v *Volume) readMFTEntryAt(entryNum uint64, offset int64) (*MFTEntry, error
 	return entry, nil
 }
 
-// getMFTEntryOffset calculates the byte offset for a given MFT entry number.
-func (v *Volume) getMFTEntryOffset(entryNum uint64) (int64, error) {
+// mftEntryVolumeOffset calculates the volume-relative byte offset of an MFT
+// entry.
+//
+// The result is in the space v.reader reads in, which is what the two read
+// paths here want. residentFragments is the one caller that reports the offset
+// rather than reading from it, and it adds Options.BaseOffset itself — hence
+// the name, so neither use has to guess.
+func (v *Volume) mftEntryVolumeOffset(entryNum uint64) (int64, error) {
 	// Calculate which cluster the MFT entry is in
 	entryOffset := entryNum * uint64(v.mftRecordSize)
 
@@ -909,7 +915,9 @@ func (v *Volume) ReadDataRuns(runs []DataRun, offset int64, buf []byte) (int, er
 			clusterOffset := cluster * uint64(v.bytesPerCluster)
 			readOffset := int64(clusterOffset + offsetInRun)
 
-			n, err := v.ReadAt(buf[bytesRead:bytesRead+readLen], readOffset)
+			// readOffset came from raw cluster arithmetic, so it is
+			// volume-relative.
+			n, err := v.readAtVolume(buf[bytesRead:bytesRead+readLen], readOffset)
 			bytesRead += n
 			if err != nil {
 				return bytesRead, err

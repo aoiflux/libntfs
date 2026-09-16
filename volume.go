@@ -52,10 +52,28 @@ type Volume struct {
 	securityInit bool                           // True when securityMap has been populated
 	securityErr  error                          // Sticky error from the $SDS load
 
+	// changeJournal caches whether $UsnJrnl is present and carrying records on
+	// this volume, since answering costs a directory read of $Extend and
+	// Capabilities has no error to return. changeJournalInit is deliberately not
+	// set when the lookup failed because the volume was closed, so a probe on a
+	// closed handle does not pin the answer for a volume that was fine.
+	changeJournal     bool
+	changeJournalMu   sync.RWMutex
+	changeJournalInit bool
+	changeJournalErr  error
+
 	// readOnly records that the caller asked for a read-only volume. It is set
 	// once during Open and never mutated, so it needs no lock: every write entry
 	// point consults it before touching the handle.
 	readOnly bool
+
+	// baseOffset is where the volume begins inside the reader handed to Open.
+	//
+	// It is the single translation constant between the two coordinate spaces
+	// this library uses: image = volume + baseOffset. The reader wrappers built
+	// by bindHandles already apply it to every read, so everything unexported
+	// here speaks volume space; the exported surface speaks image space.
+	baseOffset int64
 
 	// State
 	closed  bool
@@ -82,14 +100,30 @@ type Options struct {
 	// BaseOffset is the byte offset within reader at which the NTFS boot sector
 	// begins, for a partition inside a whole-disk image.
 	//
-	// Zero means the volume starts at the beginning of the reader. Every read
-	// and write is shifted by this amount, so volume offsets reported by the
-	// library — fragment locations, MFT record offsets — remain relative to the
-	// volume rather than to the containing image.
+	// It does two jobs. Every read and write is shifted by this amount, so the
+	// library finds the volume at all; and it is added to every absolute disk
+	// offset the library reports, so those offsets are image-absolute —
+	// [FileFragment] locations, the [NTFSReport] span, [Volume.ClusterToOffset].
+	// Zero means the volume starts at the beginning of the reader, and the two
+	// spaces coincide.
 	//
-	// It is an alternative to wrapping the reader in [io.SectionReader] yourself;
-	// the section reader remains the right tool when the volume's length also
-	// needs bounding.
+	// That second job is the one worth stating plainly. An offset reported
+	// relative to the volume cannot be intersected with a range expressed in
+	// whole-disk coordinates, and nothing about the two makes the mismatch
+	// visible: the intersection succeeds and is wrong. Reporting image-absolute
+	// offsets removes that failure rather than documenting it.
+	// [Volume.ReadAt] and [Volume.WriteAt] accept image offsets to match, so a
+	// fragment offset can be handed straight back to them.
+	//
+	// It is an alternative to wrapping the reader in [io.SectionReader], and no
+	// longer an equivalent one: a section reader cannot say where the partition
+	// sits, so a volume opened over one reports offsets relative to the section.
+	// Prefer this field, and reach for a section reader when the volume's length
+	// also needs bounding.
+	//
+	// It must be a whole number of sectors. A partition never begins mid-sector,
+	// and allowing one that did would misalign the read-modify-write underneath
+	// [Volume.WriteAt].
 	BaseOffset int64
 }
 
@@ -140,8 +174,9 @@ func OpenWithOptions(reader io.ReaderAt, opts Options) (*Volume, error) {
 	}
 
 	v := &Volume{
-		readOnly: opts.ReadOnly,
-		mftCache: make(map[uint64]*MFTEntry, DefaultMFTCacheSize),
+		readOnly:   opts.ReadOnly,
+		baseOffset: opts.BaseOffset,
+		mftCache:   make(map[uint64]*MFTEntry, DefaultMFTCacheSize),
 		bufferPool: &sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, DefaultBufferSize)
@@ -155,6 +190,16 @@ func OpenWithOptions(reader io.ReaderAt, opts Options) (*Volume, error) {
 	// Parse boot sector
 	if err := v.parseBootSector(); err != nil {
 		return nil, wrapVolumeError("open", err)
+	}
+
+	// The sector size is only known once the boot sector has parsed, so the
+	// alignment of BaseOffset can only be checked here. A base that is not a
+	// whole number of sectors would misalign readAtSectorAligned and, worse,
+	// the read-modify-write in writeAtSectorAligned.
+	if v.bytesPerSector > 0 && opts.BaseOffset%int64(v.bytesPerSector) != 0 {
+		return nil, wrapVolumeError("open",
+			fmt.Errorf("%w: base offset %d is not a multiple of the %d-byte sector",
+				ErrInvalidOffset, opts.BaseOffset, v.bytesPerSector))
 	}
 
 	// Initialize MFT
@@ -261,6 +306,17 @@ func (v *Volume) IsClosed() bool {
 	return v.closed
 }
 
+// BaseOffset returns where this volume begins inside the reader it was opened
+// over, as given by Options.BaseOffset.
+//
+// It is the constant relating the two coordinate spaces in this package: an
+// offset the library reports, minus this, is the offset within the volume
+// itself. A caller comparing reports taken from a whole-disk image and from the
+// same partition acquired on its own needs it to line them up.
+func (v *Volume) BaseOffset() int64 {
+	return v.baseOffset
+}
+
 // IsReadOnly reports whether the volume was opened read-only.
 //
 // It answers a different question from [Volume.IsWritable]: a volume opened
@@ -275,7 +331,7 @@ func (v *Volume) parseBootSector() error {
 	// Read boot sector (sector 0)
 	buf := make([]byte, BootSectorSize)
 	if _, err := v.reader.ReadAt(buf, 0); err != nil {
-		return wrapIOError("read", 0, BootSectorSize, err)
+		return v.ioErrorAt("read", 0, BootSectorSize, err)
 	}
 
 	r := NewBinaryReader(buf)
@@ -403,7 +459,7 @@ func (v *Volume) parseBootSector() error {
 func (v *Volume) initializeMFT() error {
 	// Read the first MFT entry (entry 0 = $MFT itself)
 	// The $MFT entry describes where the MFT is located on disk
-	mftOffset := v.ClusterToOffset(v.mftCluster)
+	mftOffset := v.clusterToVolumeOffset(v.mftCluster)
 
 	mftEntry, err := v.readMFTEntryAt(0, mftOffset)
 	if err != nil {
@@ -432,19 +488,66 @@ func (v *Volume) initializeMFT() error {
 	return nil
 }
 
-// ClusterToOffset converts a cluster number to a byte offset.
+// ClusterToOffset converts a cluster number to an image-absolute byte offset.
+//
+// The result includes Options.BaseOffset, so it locates the cluster in the
+// reader the volume was opened over rather than within the volume. It is the
+// inverse of [Volume.OffsetToCluster].
 func (v *Volume) ClusterToOffset(cluster uint64) int64 {
+	return v.baseOffset + v.clusterToVolumeOffset(cluster)
+}
+
+// clusterToVolumeOffset converts a cluster number to a volume-relative byte
+// offset, which is the space v.reader reads in. Every internal caller wants
+// this one; [Volume.ClusterToOffset] is for callers outside the package.
+func (v *Volume) clusterToVolumeOffset(cluster uint64) int64 {
 	return int64(cluster * uint64(v.bytesPerCluster))
 }
 
-// OffsetToCluster converts a byte offset to a cluster number.
+// OffsetToCluster converts an image-absolute byte offset to a cluster number.
+//
+// It expects the same space [Volume.ClusterToOffset] produces, so an offset
+// below Options.BaseOffset is not on this volume at all. Having no error to
+// return, it answers zero for that and for a volume with no geometry, rather
+// than wrapping a negative offset into an enormous cluster number.
 func (v *Volume) OffsetToCluster(offset int64) uint64 {
-	return uint64(offset) / uint64(v.bytesPerCluster)
+	if v.bytesPerCluster == 0 || offset < v.baseOffset {
+		return 0
+	}
+	return uint64(offset-v.baseOffset) / uint64(v.bytesPerCluster)
 }
 
-// ReadAt reads len(p) bytes from the volume at the specified offset.
+// ReadAt reads len(p) bytes from the volume at the given image-absolute offset.
+//
+// The offset is in the same space the library reports offsets in, so a
+// [FileFragment]'s StartOffset can be passed straight in. It includes
+// Options.BaseOffset; an offset below that is not on this volume and returns
+// [ErrInvalidOffset].
+//
 // This method is thread-safe.
 func (v *Volume) ReadAt(p []byte, offset int64) (int, error) {
+	// A closed volume is closed whatever it was handed, matching how
+	// [Volume.WriteAt] reports its gate before looking at the offset. The cost
+	// is one extra read lock on a path that is about to do I/O anyway.
+	if v.IsClosed() {
+		return 0, ErrVolumeClosed
+	}
+
+	if offset < v.baseOffset {
+		return 0, ErrInvalidOffset
+	}
+
+	return v.readAtVolume(p, offset-v.baseOffset)
+}
+
+// readAtVolume is [Volume.ReadAt] in volume space, which is what v.reader
+// speaks.
+//
+// The whole body lives below the image-to-volume translation deliberately. The
+// sector alignment below rounds the offset down to a sector boundary and hands
+// the result to v.reader, which then adds the base itself; doing that rounding
+// on an image offset would land the read on a boundary in the wrong space.
+func (v *Volume) readAtVolume(p []byte, offset int64) (int, error) {
 	if v.IsClosed() {
 		return 0, ErrVolumeClosed
 	}
@@ -481,7 +584,7 @@ func (v *Volume) readAtSectorAligned(p []byte, offset, sectorSize int64) (int, e
 
 	n, err := v.reader.ReadAt(buf, alignedStart)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return 0, wrapIOError("read", alignedStart, len(buf), err)
+		return 0, v.ioErrorAt("read", alignedStart, len(buf), err)
 	}
 
 	start := offset - alignedStart
@@ -521,10 +624,10 @@ func (v *Volume) ReadClusters(cluster uint64, count uint32) ([]byte, error) {
 
 	size := uint32(count) * v.bytesPerCluster
 	buf := make([]byte, size)
-	offset := v.ClusterToOffset(cluster)
+	offset := v.clusterToVolumeOffset(cluster)
 
 	if _, err := v.reader.ReadAt(buf, offset); err != nil {
-		return nil, wrapIOError("read", offset, int(size), err)
+		return nil, v.ioErrorAt("read", offset, int(size), err)
 	}
 
 	return buf, nil

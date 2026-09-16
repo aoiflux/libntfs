@@ -8,26 +8,48 @@ import (
 // FileFragment describes a contiguous region of a stream.
 //
 // A fragment carries both axes a forensic caller needs: where the region sits
-// inside the stream (FileOffset, Length) and where its bytes sit on the volume
+// inside the stream (FileOffset, Length) and where its bytes sit on disk
 // (StartOffset, EndOffset). Consecutive fragments tile the stream without gaps,
 // so FileOffset+Length of one fragment is the FileOffset of the next.
 //
+// # Which offsets these are
+//
+// StartOffset and EndOffset are image-absolute: they include Options.BaseOffset
+// and so locate the bytes in the reader the volume was opened over, not within
+// the volume. For a volume opened at the start of its reader, which is the
+// ordinary case, the two are the same number.
+//
+// That is what makes a fragment directly comparable with a range expressed in
+// whole-disk coordinates, and it is why [Volume.ReadAt] takes the same space —
+// vol.ReadAt(buf, frag.StartOffset) reads this fragment's bytes at any base.
+//
+// EndOffset is exclusive: it is StartOffset+Length, the first byte past the
+// region.
+//
+// Fragments are returned in stream order, and the run-list they come from is
+// reported as NTFS recorded it: adjacent runs are not coalesced, so two
+// physically contiguous fragments may be reported separately.
+//
+// # The zero sentinels
+//
 // Sparse fragments occupy stream space but no disk space. They carry a
-// FileOffset and Length but no volume location, and StartOffset and EndOffset
-// are left at zero. Callers carving disk regions should skip them; callers
-// mapping stream offsets must not.
+// FileOffset and Length but no disk location, and StartOffset and EndOffset are
+// left at zero rather than at the base. Callers carving disk regions should skip
+// them; callers mapping stream offsets must not. A zero StartOffset therefore
+// means "nowhere", never "the first byte of the image" — nothing real is ever
+// reported at zero, because the boot sector occupies it.
 //
 // Resident fragments locate a value stored inside its MFT record rather than in
-// allocated clusters. Their StartOffset points at those bytes on the volume, but
-// the record they live in carries update sequence fixups: the last two bytes of
-// every sector hold the record's sequence number rather than real content. A
-// resident value that spans a sector boundary therefore cannot be read straight
-// off the volume at StartOffset — read it through (*File).ReadAt, which applies
-// the fixups. StartOffset and EndOffset are zero when the attribute was merged
-// from an extension record whose origin was not recorded.
+// allocated clusters. Their StartOffset points at those bytes, but the record
+// they live in carries update sequence fixups: the last two bytes of every
+// sector hold the record's sequence number rather than real content. A resident
+// value that spans a sector boundary therefore cannot be read straight off the
+// disk at StartOffset — read it through (*File).ReadAt, which applies the
+// fixups. StartOffset and EndOffset are zero, the same sentinel, when the
+// attribute was merged from an extension record whose origin was not recorded.
 type FileFragment struct {
-	StartOffset int64 `json:"start_offset"` // Volume byte offset; 0 when Sparse
-	EndOffset   int64 `json:"end_offset"`   // Volume byte offset of the end; 0 when Sparse
+	StartOffset int64 `json:"start_offset"` // Image byte offset, including Options.BaseOffset; 0 when Sparse
+	EndOffset   int64 `json:"end_offset"`   // Image byte offset one past the end; 0 when Sparse
 	FileOffset  int64 `json:"file_offset"`  // Byte offset within the stream
 	Length      int64 `json:"length"`       // Length in bytes
 	Sparse      bool  `json:"sparse"`       // Region is a hole with no allocated clusters
@@ -128,17 +150,21 @@ func (v *Volume) residentFragments(attr *Attribute) ([]FileFragment, error) {
 
 	// The recorded offset is only meaningful for the record the attribute was
 	// parsed from. An attribute synthesised by $ATTRIBUTE_LIST merging has bytes
-	// in no single record, so it gets no volume location rather than a wrong one.
+	// in no single record, so it gets no disk location rather than a wrong one.
+	//
+	// That zero is a sentinel and must stay zero. The base offset is added below
+	// rather than to frag, so a fragment with no known location does not come
+	// back pointing at the start of the volume.
 	if !attr.sourceKnown {
 		return []FileFragment{frag}, nil
 	}
 
-	recordOffset, err := v.getMFTEntryOffset(attr.sourceRecord)
+	recordOffset, err := v.mftEntryVolumeOffset(attr.sourceRecord)
 	if err != nil {
 		return nil, wrapMFTError(attr.sourceRecord, "calculate offset", err)
 	}
 
-	frag.StartOffset = recordOffset +
+	frag.StartOffset = v.baseOffset + recordOffset +
 		int64(attr.Header.RecordOffset) +
 		int64(attr.Resident.ValueOffset)
 	frag.EndOffset = frag.StartOffset + length
@@ -184,8 +210,10 @@ func (v *Volume) nonResidentFragments(attr *Attribute) []FileFragment {
 			Sparse:     run.IsSparse,
 		}
 
+		// A sparse run occupies no disk, so its offsets stay at the zero
+		// sentinel rather than gaining the base like a real location would.
 		if !run.IsSparse {
-			fragment.StartOffset = run.StartCluster * bytesPerCluster
+			fragment.StartOffset = v.baseOffset + run.StartCluster*bytesPerCluster
 			fragment.EndOffset = fragment.StartOffset + length
 		}
 

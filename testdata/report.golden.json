@@ -1,4 +1,7 @@
 {
+  "schema_version": 1,
+  "library_version": "",
+  "generated": "0001-01-01T00:00:00Z",
   "name": "TESTVOL",
   "start_offset": 0,
   "end_offset": 65536,

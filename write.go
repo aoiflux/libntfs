@@ -64,13 +64,41 @@ func (v *Volume) checkWritable() error {
 	return nil
 }
 
-// WriteAt writes len(p) bytes to the volume at the specified absolute offset.
+// WriteAt writes len(p) bytes to the volume at the given image-absolute offset.
+//
+// The offset is in the space the library reports offsets in, matching
+// [Volume.ReadAt]: it includes Options.BaseOffset, and one below that is not on
+// this volume and returns [ErrInvalidOffset].
 //
 // This method is thread-safe and requires a writable volume: one opened with
 // [Open] over a handle implementing [io.WriterAt]. A read-only volume returns
 // [ErrReadOnlyMode] and a non-writable handle returns [ErrReadOnlyVolume],
 // in both cases without writing anything.
 func (v *Volume) WriteAt(p []byte, offset int64) (int, error) {
+	// The write gate comes first, before any arithmetic on the offset. A volume
+	// that refuses writes must say so whatever it was handed; reporting a bad
+	// offset for a handle that was never going to write would be the wrong
+	// answer to the wrong question.
+	if err := v.checkWritable(); err != nil {
+		return 0, err
+	}
+
+	if offset < v.baseOffset {
+		return 0, ErrInvalidOffset
+	}
+
+	return v.writeAtVolume(p, offset-v.baseOffset)
+}
+
+// writeAtVolume is [Volume.WriteAt] in volume space, which is what v.writer
+// speaks.
+//
+// As with readAtVolume, the whole body sits below the translation on purpose:
+// the sector alignment further down rounds to a boundary and then reads and
+// writes back a window around it, and rounding an image offset here would
+// centre that window in the wrong space — a read-modify-write that writes back
+// bytes it never read.
+func (v *Volume) writeAtVolume(p []byte, offset int64) (int, error) {
 	if err := v.checkWritable(); err != nil {
 		return 0, err
 	}
@@ -94,7 +122,7 @@ func (v *Volume) WriteAt(p []byte, offset int64) (int, error) {
 
 	n, err := v.writer.WriteAt(p, offset)
 	if err != nil {
-		return n, wrapIOError("write", offset, len(p), err)
+		return n, v.ioErrorAt("write", offset, len(p), err)
 	}
 
 	return n, nil
@@ -111,17 +139,17 @@ func (v *Volume) writeAtSectorAligned(p []byte, offset, sectorSize int64) (int, 
 	buf := make([]byte, bufLen)
 
 	if _, err := v.reader.ReadAt(buf, alignedStart); err != nil {
-		return 0, wrapIOError("read", alignedStart, len(buf), err)
+		return 0, v.ioErrorAt("read", alignedStart, len(buf), err)
 	}
 
 	copy(buf[offset-alignedStart:], p)
 
 	n, err := v.writer.WriteAt(buf, alignedStart)
 	if err != nil {
-		return 0, wrapIOError("write", alignedStart, len(buf), err)
+		return 0, v.ioErrorAt("write", alignedStart, len(buf), err)
 	}
 	if n != len(buf) {
-		return 0, wrapIOError("write", alignedStart, len(buf), io.ErrShortWrite)
+		return 0, v.ioErrorAt("write", alignedStart, len(buf), io.ErrShortWrite)
 	}
 
 	return len(p), nil
@@ -183,7 +211,8 @@ func (v *Volume) WriteDataRuns(runs []DataRun, offset int64, buf []byte) (int, e
 		clusterOffset := cluster * uint64(v.bytesPerCluster)
 		writeOffset := int64(clusterOffset + offsetInRun)
 
-		n, err := v.WriteAt(buf[bytesWritten:bytesWritten+writeLen], writeOffset)
+		// writeOffset came from raw cluster arithmetic, so it is volume-relative.
+		n, err := v.writeAtVolume(buf[bytesWritten:bytesWritten+writeLen], writeOffset)
 		bytesWritten += n
 		if err != nil {
 			return bytesWritten, err

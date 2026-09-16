@@ -122,8 +122,16 @@ vol, err := libntfs.OpenWithOptions(img, libntfs.Options{
 })
 ```
 
-Offsets the library reports stay relative to the volume, so they can be compared
-against a report taken from the same partition acquired on its own.
+`BaseOffset` does two things. It shifts every read, so the library finds the
+volume; and it is added to every disk offset the library reports, so a fragment
+offset locates bytes in the image rather than within the partition. That is what
+lets those offsets be intersected with ranges expressed in whole-disk
+coordinates, and `(*Volume).ReadAt` takes the same space so an offset can be
+handed straight back to it. `(*Volume).BaseOffset` returns the value in use.
+
+Wrapping the reader in an `io.SectionReader` still works but is not equivalent: a
+section reader cannot say where the partition sits, so the offsets reported are
+relative to the section.
 
 Every method that can modify a volume lives in `write.go` behind a single gate.
 No read path reaches it.
@@ -133,7 +141,10 @@ No read path reaches it.
 Implemented:
 
 - Read-only open mode that refuses every write regardless of the handle behind
-  it, plus a base offset for a partition inside a whole-disk image
+  it, plus a base offset for a partition inside a whole-disk image, which every
+  reported offset includes
+- Capability introspection, separating what NTFS cannot record from what this
+  volume happens not to have
 - NTFS boot sector parsing and validation
 - MFT parsing with cache-backed entry lookup
 - Path reconstruction from an MFT record, including for deleted and orphaned
@@ -553,13 +564,18 @@ for _, f := range frags {
         fmt.Printf("hole   stream %d..%d\n", f.FileOffset, f.FileOffset+f.Length)
         continue
     }
-    fmt.Printf("extent stream %d..%d -> volume %d..%d\n",
+    fmt.Printf("extent stream %d..%d -> image %d..%d\n",
         f.FileOffset, f.FileOffset+f.Length, f.StartOffset, f.EndOffset)
 }
 ```
 
+`StartOffset` and `EndOffset` are image-absolute: they include `BaseOffset`, so
+they locate bytes in the reader the volume was opened over, and `EndOffset` is
+exclusive. A sparse hole has no location at all and reports zero for both, which
+is unambiguous because nothing real is ever at zero — the boot sector is there.
+
 Fragments tile the stream with no gaps, so a byte range of the file maps onto the
-volume by walking them. Sparse holes are reported rather than dropped, because
+disk by walking them. Sparse holes are reported rather than dropped, because
 dropping one would silently shift every later fragment's position in the stream.
 The last fragment is clamped to the stream's real size, so allocation slack at
 the tail of the final cluster is not reported as content.
@@ -577,12 +593,12 @@ frags, err := ads.Fragments()
 
 A resident stream, whose content lives inside the MFT record, reports a single
 fragment with `Resident` set and `StartOffset` pointing at those bytes. Read it
-through `ReadAt` rather than off the volume directly: the record carries update
-sequence fixups, so the last two bytes of each sector hold the record's sequence
-number rather than content.
+through `(*File).ReadAt` rather than off the disk directly: the record carries
+update sequence fixups, so the last two bytes of each sector hold the record's
+sequence number rather than content.
 
 `IsFragmented` reports whether the stream is split across more than one region of
-the volume. A hole is not fragmentation — a file stored in one run with a hole
+the disk. A hole is not fragmentation — a file stored in one run with a hole
 punched in it is not scattered across the disk.
 
 For a compressed stream the data runs describe compression units rather than

@@ -199,9 +199,9 @@ func TestOpenWithOptionsBaseOffset(t *testing.T) {
 		t.Fatalf("read %q, want %q", data, "offset content")
 	}
 
-	// Offsets the library reports stay relative to the volume, not to the disk
-	// image containing it, so a caller can compare them against a report taken
-	// from the same partition acquired on its own.
+	// VolumeSize is read from the boot sector and describes the volume itself,
+	// so unlike the offsets the library reports it does not shift with the base.
+	// See TestBaseOffsetReportedOffsetsAreImageAbsolute for the ones that do.
 	if got := vol.VolumeSize(); got != uint64(len(image)) {
 		t.Fatalf("VolumeSize = %d, want %d", got, len(image))
 	}
