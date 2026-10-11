@@ -2,10 +2,10 @@
 
 All notable changes to libntfs are recorded here. Versions follow the git tags.
 
-## v0.4.0
+## v0.3.4
 
-This release readies libntfs to be the reader behind fsagen, which generates NTFS
-images byte by byte and checks them by reading them back. libntfs stays a
+This release readies libntfs to be the reader behind fsagen, which generates
+NTFS images byte by byte and checks them by reading them back. libntfs stays a
 parser: what it gains on the writing side are pure codecs over bytes (fixups,
 runlists, FILETIME, reparse buffers, `$UpCase` collation), never builders of
 records, attributes, indexes or volumes.
@@ -17,23 +17,25 @@ records, attributes, indexes or volumes.
 - `MaxClusterSize` is now 2 MiB, the largest cluster Windows formats.
 - Entries of an INDX block that `$BITMAP:$I30` marks free now come back from
   `ReadDir` with `Deleted` set; they used to be listed as live.
-- The unexported `parseDataRuns` and `parseFileNameAttribute` are now exported as
-  `DecodeRunlist` and `ParseFileName`, and the constants `IndexRecordHeaderSize`,
-  `ReparseHeaderSize` and `SymlinkFlagRelative` are exported under those names.
+- The unexported `parseDataRuns` and `parseFileNameAttribute` are now exported
+  as `DecodeRunlist` and `ParseFileName`, and the constants
+  `IndexRecordHeaderSize`, `ReparseHeaderSize` and `SymlinkFlagRelative` are
+  exported under those names.
 
 ### Fixed
 
 - FILETIME conversion covered only 1970 to 2262. `NTFSTimeToTime` returned the
-  zero time for anything before the Unix epoch, and `TimeToNTFSTime` went through
-  `UnixNano`, which returns 0 before 1970 and overflows after 2262. Both now
-  cover the whole FILETIME range; 0 still means "not set".
+  zero time for anything before the Unix epoch, and `TimeToNTFSTime` went
+  through `UnixNano`, which returns 0 before 1970 and overflows after 2262. Both
+  now cover the whole FILETIME range; 0 still means "not set".
 - `$FILE_NAME` was read with a 64-bit `FileAttributes`, which folded the reparse
   tag (or packed EA size) at 0x3C into the attributes and never set
-  `FileName.ReparseValue`. Both fields are now read as the 32-bit values they are.
+  `FileName.ReparseValue`. Both fields are now read as the 32-bit values they
+  are.
 - `ReadDir` ignored `$BITMAP:$I30` and listed every INDX block it found as live,
   including blocks the directory had released. Free blocks' names are now
-  `Deleted`, and a free block that fails to parse no longer counts as skipped.
-  A directory with no `$BITMAP` is read as before.
+  `Deleted`, and a free block that fails to parse no longer counts as skipped. A
+  directory with no `$BITMAP` is read as before.
 - Volumes with clusters larger than 64 KiB were refused. The boot sector encodes
   such a cluster as a negative power of two (0xF8 is 256 sectors), which the
   parser rejected as more than 128 sectors. Clusters up to 2 MiB now open, and
@@ -55,16 +57,17 @@ records, attributes, indexes or volumes.
   `ErrInvalidUpCase`.
 - Reparse encoders: `EncodeSymlinkReparse` and `EncodeMountPointReparse`, which
   produce the buffers `ParseReparsePoint` decodes.
-- `(*MFTEntry).FileNames` returns every `$FILE_NAME`, extension records included.
+- `(*MFTEntry).FileNames` returns every `$FILE_NAME`, extension records
+  included.
 - `DirEntry` gained `MFTChangeTime`, `Namespace`, `ParentReference` and
   `FileName`.
 - Index access: `(*File).ReadIndexRoot`, `ReadIndexBlock`, `IndexBitmap` and
-  `WalkIndex`, over `$I30` and the view indexes alike, and the `IndexBlock` type.
-  `IndexEntry` gained `Key` and `Data`.
+  `WalkIndex`, over `$I30` and the view indexes alike, and the `IndexBlock`
+  type. `IndexEntry` gained `Key` and `Data`.
 - `Options.Strict`, `(*Volume).IsStrict`, `(*Volume).VerifyReparseIndex`,
   `ErrStrictViolation` and `StrictError`: opt-in checks that turn tolerated
-  damage into errors naming the record, index and VCN. See the README's
-  "Strict mode". The default stays tolerant.
+  damage into errors naming the record, index and VCN. See the README's "Strict
+  mode". The default stays tolerant.
 - Constants: `RecordSize`, `IndexBlockSize`, `UpCaseSize`, `FirstUserEntry`,
   `SystemEntryCount`, `AttrTypeEnd`, `FileAttrViewIndex`, `MFTFlagIsExtend`,
   `MFTFlagViewIndex`, and the `$AttrDef` flags `AttrDefIndexable` to
@@ -86,12 +89,12 @@ records, attributes, indexes or volumes.
 `Options.BaseOffset`.** It used to be relative to the volume.
 
 A volume opened at the start of its reader — `Open`, `OpenReadOnly`, or
-`OpenWithOptions` with `BaseOffset` left at zero — is completely unaffected. Every
-number it reports is the number it reported before. **If you have never set
-`BaseOffset`, nothing in this section applies to you.**
+`OpenWithOptions` with `BaseOffset` left at zero — is completely unaffected.
+Every number it reports is the number it reported before. **If you have never
+set `BaseOffset`, nothing in this section applies to you.**
 
-For a volume opened with a non-zero `BaseOffset`, these now return a value larger
-by exactly that base:
+For a volume opened with a non-zero `BaseOffset`, these now return a value
+larger by exactly that base:
 
 - `FileFragment.StartOffset` and `FileFragment.EndOffset`, from
   `(*File).Fragments` and `(*Volume).AttributeFragments`
@@ -99,7 +102,8 @@ by exactly that base:
 - `(*Volume).ClusterToOffset`
 - `IOError.Offset`
 
-and these now *expect* an image-absolute offset rather than a volume-relative one:
+and these now _expect_ an image-absolute offset rather than a volume-relative
+one:
 
 - `(*Volume).ReadAt` and `(*Volume).WriteAt`, which reject an offset below
   `BaseOffset` with `ErrInvalidOffset`
@@ -109,13 +113,13 @@ Stream-relative offsets are a separate axis and are unchanged: `(*File).ReadAt`,
 `(*File).WriteAt`, `(*Volume).ReadDataRuns`, `FileFragment.FileOffset`, and the
 `$LogFile` and `$UsnJrnl` walks.
 
-**Why.** The old behaviour made `BaseOffset` a way to *find* a volume; it is now
-also a way to *describe* where the volume's contents sit. An offset reported
-relative to the volume cannot be intersected with a range expressed in whole-disk
-coordinates, and nothing about the mismatch is visible at the point of use — the
-intersection succeeds and is quietly wrong. This also aligns libntfs with libext,
-libfat, libhfs, libxfat and libxfs, so a consumer joining reports from several of
-them does not have to special-case this one.
+**Why.** The old behaviour made `BaseOffset` a way to _find_ a volume; it is now
+also a way to _describe_ where the volume's contents sit. An offset reported
+relative to the volume cannot be intersected with a range expressed in
+whole-disk coordinates, and nothing about the mismatch is visible at the point
+of use — the intersection succeeds and is quietly wrong. This also aligns
+libntfs with libext, libfat, libhfs, libxfat and libxfs, so a consumer joining
+reports from several of them does not have to special-case this one.
 
 **To migrate.** If you were adding the partition start to libntfs offsets
 yourself, stop. If you need the volume-relative value, subtract the new
@@ -123,14 +127,14 @@ yourself, stop. If you need the volume-relative value, subtract the new
 
 ### Added
 
-- `(*Volume).BaseOffset` returns where the volume begins inside the reader it was
-  opened over, so the two coordinate spaces can be converted between.
+- `(*Volume).BaseOffset` returns where the volume begins inside the reader it
+  was opened over, so the two coordinate spaces can be converted between.
 - `Capabilities` and `(*Volume).Capabilities` report what NTFS can record, as
   distinct from what a particular volume happens to record. Every field's doc
   comment says which of the two it is.
-- `(*Volume).HasChangeJournal` answers `Capabilities.ChangeJournal` with the error
-  kept, so a deleted `$UsnJrnl` can be told apart from an `$Extend` directory too
-  damaged to read.
+- `(*Volume).HasChangeJournal` answers `Capabilities.ChangeJournal` with the
+  error kept, so a deleted `$UsnJrnl` can be told apart from an `$Extend`
+  directory too damaged to read.
 - `NTFSReport` gained `SchemaVersion`, `LibraryVersion` and `Generated`
   (`schema_version`, `library_version`, `generated`), so a report stays readable
   by a tool built against a different version of this library.
@@ -144,11 +148,11 @@ yourself, stop. If you need the volume-relative value, subtract the new
   geometry, and no longer wraps a below-base offset into a cluster number near
   2^64. Both now return zero.
 - `OpenWithOptions` rejects a `BaseOffset` that is not a whole number of the
-  volume's own sectors, which would otherwise place every sector-aligned read off
-  a sector boundary in the image.
+  volume's own sectors, which would otherwise place every sector-aligned read
+  off a sector boundary in the image.
 
 ### Unchanged
 
 The read-only guarantee introduced in v0.3.2 is untouched. `bindHandles` and the
-handle wrappers were deliberately not modified, and `go test -run ReadOnly` passes
-every subtest.
+handle wrappers were deliberately not modified, and `go test -run ReadOnly`
+passes every subtest.
