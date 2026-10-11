@@ -33,13 +33,16 @@ go build
 
 2. **MFT** (`mft.go`)
    - Parses MFT entries
-   - Handles update sequence arrays (fixups)
+   - Handles update sequence arrays (fixups); `ApplyFixup` and `ProtectFixup`
+     are the exported codec
+   - Merges `$ATTRIBUTE_LIST` extension records, matching by attribute ID
    - Implements data run resolution
    - Provides MFT entry caching
 
 3. **Attributes** (`attributes.go`)
    - Parses resident and non-resident attributes
-   - Handles data run parsing
+   - Handles data run parsing; `DecodeRunlist` and `EncodeRunlist` are the
+     exported codec
    - Supports all standard NTFS attribute types
    - Parses complex structures like $INDEX_ROOT
 
@@ -53,14 +56,27 @@ go build
    - Low-level binary parsing utilities
    - Little-endian integer reading
    - UTF-16 string conversion
-   - Time format conversion
+   - FILETIME conversion over the full range (`FiletimeToTime`, `TimeToFiletime`)
 
 6. **Paths** (`path.go`)
    - Reconstructs a path from an MFT record by following parent references
    - Builds the whole-volume parent index shared by `WalkFiles` and `Report`
    - Owns the `/$ORPHAN` fallback, the cycle check, and the depth bound
 
-7. **Writes** (`write.go`)
+7. **Indexes** (`index.go`)
+   - Reads any index B-tree node by node: `ReadIndexRoot`, `ReadIndexBlock`,
+     `IndexBitmap`, `WalkIndex`
+   - Index VCNs count clusters, or 512-byte units when a block is smaller than
+     a cluster
+
+8. **Collation** (`upcase.go`)
+   - `$UpCase` table, `DefaultUpCase`, `Volume.UpCase`, ULONG(S) collation
+
+9. **Strict mode** (`strict.go`)
+   - Checks run only when `Options.Strict` is set, plus `VerifyReparseIndex`
+   - Every failure is a `*StrictError` naming record, index and VCN
+
+10. **Writes** (`write.go`)
    - The only file that can modify a volume
    - Every entry point passes through `checkWritable`, so read-only mode and a
      non-writable handle are refused in one place

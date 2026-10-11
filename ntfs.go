@@ -123,6 +123,12 @@
 //
 // The MFT — [Volume.GetMFTEntry], [Volume.EachMFTEntry], [Volume.MFTEntryCount],
 // and [ParseMFTRecord] for a standalone $MFT extracted with KAPE or FTK Imager.
+// [MFTEntry.FileNames] returns every hard link's $FILE_NAME.
+//
+// Indexes — [File.ReadIndexRoot], [File.ReadIndexBlock], [File.IndexBitmap]
+// and [File.WalkIndex] read any index B-tree node by node: $I30 directories and
+// the view indexes such as $Reparse:$R and $Secure:$SII. [Volume.UpCase] and
+// [UpCase.Compare] give NTFS's own file name collation.
 //
 // Metadata — [File.ExtendedAttributes] and [File.EAInformation] for $EA,
 // [File.ReparsePoint] for symlinks and junctions, [File.SecurityDescriptor] for
@@ -143,14 +149,21 @@
 // extracted from an image by another tool: [ParseMFTRecord], [ParseUSNRecord],
 // [EachUSNRecord], [ParseLogRestartPage], [ParseLogRecord], [EachLogRecord],
 // [ParseSecurityDescriptor], [ParseExtendedAttributes], [ParseReparsePoint],
-// [ParseLinuxAttributes], and [ParseLinuxExtendedAttributes].
+// [ParseLinuxAttributes], [ParseLinuxExtendedAttributes], and [ParseFileName].
+//
+// A few pure codecs run in both directions, for tools that generate images and
+// check them with this reader: [ApplyFixup] and [ProtectFixup],
+// [DecodeRunlist] and [EncodeRunlist], [FiletimeToTime] and [TimeToFiletime],
+// [EncodeSymlinkReparse] and [EncodeMountPointReparse], and [DefaultUpCase]
+// with [CollateULong] and [CollateULongs]. They encode values, never records,
+// attributes, indexes or volumes.
 //
 // # Concurrency
 //
 // A [Volume] is safe for concurrent use. Its geometry is written once during
 // [Open] and read-only afterwards; the MFT cache, the security descriptor map,
-// and the parent-link map are each guarded by their own lock, so contention on
-// one does not block the others.
+// the parent-link map and the $UpCase table are each guarded by their own lock,
+// so contention on one does not block the others.
 //
 // A [File] carries its own read offset, so each goroutine should open its own
 // rather than sharing one. Opening is cheap: the MFT record behind it is cached
@@ -203,6 +216,12 @@
 // to reporting something plausible. Recovering a deleted name from index slack
 // rejects candidates that do not look like real names, because a phantom file in
 // a forensic report is worse than a missing one.
+//
+// A caller that needs the opposite — to know a volume is exactly well formed,
+// such as a tool checking images it generated — sets Options.Strict. Damage
+// the default reader reads past then fails the call with a [*StrictError]
+// naming the record, index and VCN; [Volume.VerifyReparseIndex] applies the
+// same discipline to $Extend\$Reparse.
 package libntfs
 
 // Version is the libntfs release this build was cut from.

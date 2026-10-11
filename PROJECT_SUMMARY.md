@@ -23,7 +23,12 @@ Implemented:
 - Resident and non-resident attribute parsing
 - Data run parsing with sparse run support
 - Path-based and entry-based open operations
-- Directory index parsing ($INDEX_ROOT and $INDEX_ALLOCATION)
+- Directory index parsing ($INDEX_ROOT and $INDEX_ALLOCATION), honouring
+  $BITMAP:$I30
+- Index B-tree access for $I30 and view indexes, with $UpCase collation
+- Opt-in strict mode (Options.Strict) and $Reparse:$R verification
+- Pure codecs: fixups, runlists, FILETIME, reparse buffers, $UpCase
+- Clusters from 512 bytes to 2 MiB
 - Update sequence (fixup) validation
 - File name namespace handling (DOS, Win32, WinDOS, POSIX)
 - Typed error model with context wrappers (including path traversal context)
@@ -46,8 +51,12 @@ The implementation is organized in layers:
 - Security descriptors and $Secure lookup: security.go, secure.go
 - USN change journal parsing: usn.go
 - MFT record write-back and resident writes: mftwrite.go
-- Attribute parsing: attributes.go
+- Attribute parsing and runlist codec: attributes.go
 - File and directory API surface: file.go
+- Index B-tree access: index.go
+- $UpCase table and collation: upcase.go
+- Reparse point parsing and encoding: reparse.go
+- Strict-mode checks: strict.go
 - Error model: errors.go
 
 ## Thread-Safety Model

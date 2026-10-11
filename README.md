@@ -145,16 +145,26 @@ Implemented:
   reported offset includes
 - Capability introspection, separating what NTFS cannot record from what this
   volume happens not to have
-- NTFS boot sector parsing and validation
+- NTFS boot sector parsing and validation, for clusters from 512 bytes to 2 MiB
 - MFT parsing with cache-backed entry lookup
 - Path reconstruction from an MFT record, including for deleted and orphaned
   entries, and a whole-volume walk that carries paths and parent references
 - Resident and non-resident attribute parsing
 - Data run parsing and sparse run handling
 - File and directory access by MFT entry and path
-- Directory index parsing ($INDEX_ROOT and $INDEX_ALLOCATION)
-- Deleted directory entry recovery from index slack (flagged via
-  DirEntry.Deleted)
+- Directory index parsing ($INDEX_ROOT and $INDEX_ALLOCATION), honouring
+  $BITMAP:$I30
+- Deleted directory entry recovery from index slack and from freed INDX blocks
+  (flagged via DirEntry.Deleted)
+- Node-by-node access to any index B-tree: $I30 and the view indexes ($R, $SII,
+  $SDH, $O, $Q)
+- NTFS file name collation through the volume's $UpCase, and the default table
+  Windows and mkntfs write
+- Every $FILE_NAME of a file, including hard links held in extension records
+- Opt-in strict mode that turns tolerated damage into errors naming the record,
+  index and VCN
+- Pure codecs for image generators: fixups, runlists, FILETIME, reparse buffers
+  and $UpCase
 - Update sequence (fixup) validation
 - Standalone $MFT record parsing without a volume
 - Alternate data stream enumeration and reading
@@ -189,6 +199,9 @@ Current limitations:
 - Write support is off unless a volume is deliberately opened for it, and is
   limited to in-place overwrite: no file growth or truncation, no sparse,
   compressed, or encrypted streams, and a resident value cannot change length
+- The codecs encode values only: libntfs builds no records, attributes, index
+  B-trees or volumes
+- Strict mode does not check SID or Unicode collations
 
 ## API Highlights
 
