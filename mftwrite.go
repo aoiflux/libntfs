@@ -72,6 +72,22 @@ func (v *Volume) writeMFTRecord(entryNum uint64, record []byte, offset int64) er
 	return nil
 }
 
+// ProtectFixup applies update sequence protection to a multi-sector record
+// in place, the inverse of [ApplyFixup].
+//
+// buf must hold the whole record with its update sequence array's offset and
+// count already at bytes 4 and 6. usn is written to the head of the array; the
+// last two bytes of each 512-byte sector are moved into the array and replaced
+// by usn. Windows never uses 0 or 0xFFFF and increments usn on every write.
+func ProtectFixup(buf []byte, usn uint16) error {
+	offset, count, err := fixupArray(buf)
+	if err != nil {
+		return err
+	}
+	WriteUint16LE(buf, int(offset), usn)
+	return reverseUpdateSequence(buf, offset, count)
+}
+
 // reverseUpdateSequence converts a fixed-up record back to its on-disk form by
 // moving each sector's trailing two bytes into the update sequence array and
 // writing the sequence number in their place.

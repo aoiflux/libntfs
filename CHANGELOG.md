@@ -2,6 +2,82 @@
 
 All notable changes to libntfs are recorded here. Versions follow the git tags.
 
+## v0.4.0
+
+This release readies libntfs to be the reader behind fsagen, which generates NTFS
+images byte by byte and checks them by reading them back. libntfs stays a
+parser: what it gains on the writing side are pure codecs over bytes (fixups,
+runlists, FILETIME, reparse buffers, `$UpCase` collation), never builders of
+records, attributes, indexes or volumes.
+
+### Changed — breaking
+
+- `FileName.FileAttributes` is now `uint32`, which is what `$FILE_NAME` stores
+  at 0x38. Code assigning it to or from a `uint64` needs a conversion.
+- `MaxClusterSize` is now 2 MiB, the largest cluster Windows formats.
+- Entries of an INDX block that `$BITMAP:$I30` marks free now come back from
+  `ReadDir` with `Deleted` set; they used to be listed as live.
+- The unexported `parseDataRuns` and `parseFileNameAttribute` are now exported as
+  `DecodeRunlist` and `ParseFileName`, and the constants `IndexRecordHeaderSize`,
+  `ReparseHeaderSize` and `SymlinkFlagRelative` are exported under those names.
+
+### Fixed
+
+- FILETIME conversion covered only 1970 to 2262. `NTFSTimeToTime` returned the
+  zero time for anything before the Unix epoch, and `TimeToNTFSTime` went through
+  `UnixNano`, which returns 0 before 1970 and overflows after 2262. Both now
+  cover the whole FILETIME range; 0 still means "not set".
+- `$FILE_NAME` was read with a 64-bit `FileAttributes`, which folded the reparse
+  tag (or packed EA size) at 0x3C into the attributes and never set
+  `FileName.ReparseValue`. Both fields are now read as the 32-bit values they are.
+- `ReadDir` ignored `$BITMAP:$I30` and listed every INDX block it found as live,
+  including blocks the directory had released. Free blocks' names are now
+  `Deleted`, and a free block that fails to parse no longer counts as skipped.
+  A directory with no `$BITMAP` is read as before.
+- Volumes with clusters larger than 64 KiB were refused. The boot sector encodes
+  such a cluster as a negative power of two (0xF8 is 256 sectors), which the
+  parser rejected as more than 128 sectors. Clusters up to 2 MiB now open, and
+  index VCNs on them address 512-byte units as NTFS defines.
+- `$ATTRIBUTE_LIST` resolution matched extension attributes by type and name
+  only, so two `$FILE_NAME`s in one extension record both resolved to the first,
+  and a resident extension attribute was dropped whenever the base record held
+  one of the same type. A file with many hard links lost names. Attributes are
+  now matched by attribute ID, and each resident extension attribute is kept.
+
+### Added
+
+- Codecs: `ApplyFixup` and `ProtectFixup` (update sequence arrays),
+  `DecodeRunlist` and `EncodeRunlist` (mapping pairs, minimal signed widths as
+  Windows writes them), `ParseFileName`, `FiletimeToTime` and `TimeToFiletime`.
+- `$UpCase` and collation: the `UpCase` type with `Compare`, `ToUpper` and
+  `Bytes`; `DefaultUpCase` (the table Windows 8+ and mkntfs write);
+  `ParseUpCase`; `(*Volume).UpCase`; `CollateULong` and `CollateULongs`; and
+  `ErrInvalidUpCase`.
+- Reparse encoders: `EncodeSymlinkReparse` and `EncodeMountPointReparse`, which
+  produce the buffers `ParseReparsePoint` decodes.
+- `(*MFTEntry).FileNames` returns every `$FILE_NAME`, extension records included.
+- `DirEntry` gained `MFTChangeTime`, `Namespace`, `ParentReference` and
+  `FileName`.
+- Index access: `(*File).ReadIndexRoot`, `ReadIndexBlock`, `IndexBitmap` and
+  `WalkIndex`, over `$I30` and the view indexes alike, and the `IndexBlock` type.
+  `IndexEntry` gained `Key` and `Data`.
+- `Options.Strict`, `(*Volume).IsStrict`, `(*Volume).VerifyReparseIndex`,
+  `ErrStrictViolation` and `StrictError`: opt-in checks that turn tolerated
+  damage into errors naming the record, index and VCN. See the README's
+  "Strict mode". The default stays tolerant.
+- Constants: `RecordSize`, `IndexBlockSize`, `UpCaseSize`, `FirstUserEntry`,
+  `SystemEntryCount`, `AttrTypeEnd`, `FileAttrViewIndex`, `MFTFlagIsExtend`,
+  `MFTFlagViewIndex`, and the `$AttrDef` flags `AttrDefIndexable` to
+  `AttrDefAlwaysLog`.
+- Fuzz targets `FuzzRunlistRoundTrip`, `FuzzFixupRoundTrip` and
+  `FuzzParseIndexNode`.
+
+### Documented
+
+- `ReadDir`'s times and sizes come from the directory index's copy of
+  `$FILE_NAME`, not from the file's own record.
+- `OpenPath` matches names with `strings.EqualFold`, not `$UpCase`.
+
 ## v0.3.3
 
 ### Changed — breaking for callers that set `Options.BaseOffset`

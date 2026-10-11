@@ -302,11 +302,16 @@ func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
 
 	// Collect extension-record chunks per logical attribute (type + name).
 	// We keep startVCN from the attribute list entry, not from the attribute
-	// header, because NTFS guarantees the list is sorted by VCN.
+	// header, because NTFS guarantees the list is sorted by VCN. keyOrder keeps
+	// the merge in list order, so the attributes it appends come out the same
+	// way on every call.
 	chunksByKey := make(map[attrKey][]attrChunk)
+	var keyOrder []attrKey
 
-	// Cache loaded extension entries so each record is read at most once.
+	// Cache loaded extension entries so each record is read at most once, and
+	// remember which of their attributes a list entry has already claimed.
 	extCache := make(map[uint64]*MFTEntry)
+	claimed := make(map[*Attribute]bool)
 
 	for _, listEntry := range listEntries {
 		extNum := listEntry.BaseFileRef
@@ -325,39 +330,57 @@ func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
 			extCache[extNum] = extEntry
 		}
 
-		key := attrKey{listEntry.AttributeType, listEntry.Name}
-		for _, attr := range extEntry.Attributes {
-			if attr.Header.Type != listEntry.AttributeType {
-				continue
-			}
-			if attributeName(attr) != listEntry.Name {
-				continue
-			}
-			chunksByKey[key] = append(chunksByKey[key], attrChunk{
-				startVCN: listEntry.StartingVCN,
-				attr:     attr,
-			})
-			break // one match per attribute-list entry
+		attr := matchAttributeListEntry(extEntry, listEntry, claimed)
+		if attr == nil {
+			continue
 		}
+		claimed[attr] = true
+
+		key := attrKey{listEntry.AttributeType, listEntry.Name}
+		if _, seen := chunksByKey[key]; !seen {
+			keyOrder = append(keyOrder, key)
+		}
+		chunksByKey[key] = append(chunksByKey[key], attrChunk{
+			startVCN: listEntry.StartingVCN,
+			attr:     attr,
+		})
 	}
 
 	// Merge each logical attribute's chunks into the base entry.
-	for key, chunks := range chunksByKey {
+	for _, key := range keyOrder {
 		// Sort fragments by starting VCN so run-lists are contiguous.
-		sort.Slice(chunks, func(i, j int) bool {
+		chunks := chunksByKey[key]
+		sort.SliceStable(chunks, func(i, j int) bool {
 			return chunks[i].startVCN < chunks[j].startVCN
 		})
 
-		// Find the base-record attribute for this (type, name) if present.
+		// A resident attribute cannot be split across records, so each
+		// resident chunk is an attribute in its own right -- the second and
+		// later $FILE_NAMEs of a file with many hard links, for instance -- and
+		// is exposed as such. Only non-resident chunks are fragments to stitch.
+		nonResident := chunks[:0:0]
+		for _, chunk := range chunks {
+			if chunk.attr.NonResident == nil {
+				entry.Attributes = append(entry.Attributes, chunk.attr)
+				continue
+			}
+			nonResident = append(nonResident, chunk)
+		}
+		chunks = nonResident
+		if len(chunks) == 0 {
+			continue
+		}
+
+		// Find the base-record fragment for this (type, name) if present.
 		var baseAttr *Attribute
 		for _, attr := range entry.Attributes {
-			if attr.Header.Type == key.attrType && attributeName(attr) == key.name {
+			if attr.Header.Type == key.attrType && attributeName(attr) == key.name && attr.NonResident != nil {
 				baseAttr = attr
 				break
 			}
 		}
 
-		if baseAttr != nil && baseAttr.NonResident != nil {
+		if baseAttr != nil {
 			// Stitch extension runs onto the base attribute's run-list.
 			for _, chunk := range chunks {
 				if chunk.attr.NonResident == nil {
@@ -388,8 +411,8 @@ func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
 				}
 			}
 		} else {
-			// No base-record attribute exists; expose the first extension chunk
-			// (or all of them for non-resident, stitched together).
+			// No base-record fragment exists; expose the extension fragment,
+			// or stitch several together.
 			if len(chunks) == 1 {
 				entry.Attributes = append(entry.Attributes, chunks[0].attr)
 				continue
@@ -397,11 +420,6 @@ func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
 
 			// Multiple chunks with no base: stitch into a synthetic attribute.
 			first := chunks[0].attr
-			if first.NonResident == nil {
-				entry.Attributes = append(entry.Attributes, first)
-				continue
-			}
-
 			merged := &Attribute{
 				Header:      first.Header,
 				NonResident: &NonResidentAttribute{},
@@ -441,6 +459,29 @@ func (v *Volume) resolveAttributeList(entry *MFTEntry, entryNum uint64) error {
 	}
 
 	return nil
+}
+
+// matchAttributeListEntry finds the attribute an $ATTRIBUTE_LIST entry names
+// in the extension record holding it.
+//
+// The attribute ID is what identifies it: a record can hold several attributes
+// of one type and name, such as the $FILE_NAMEs of a file with many hard links.
+// A list whose IDs do not match falls back to the first unclaimed attribute of
+// that type and name, which is all a damaged list leaves to go on.
+func matchAttributeListEntry(ext *MFTEntry, listEntry AttributeListEntry, claimed map[*Attribute]bool) *Attribute {
+	var fallback *Attribute
+	for _, attr := range ext.Attributes {
+		if attr.Header.Type != listEntry.AttributeType || attributeName(attr) != listEntry.Name || claimed[attr] {
+			continue
+		}
+		if attr.Header.AttributeID == listEntry.AttributeID {
+			return attr
+		}
+		if fallback == nil {
+			fallback = attr
+		}
+	}
+	return fallback
 }
 
 // readMFTEntry reads an MFT entry from disk.
@@ -604,6 +645,41 @@ func parseMFTRecordCore(entry *MFTEntry, buf []byte, entryNum uint64, recordSize
 	return nil
 }
 
+// ApplyFixup checks and removes the update sequence protection of a
+// multi-sector record (FILE, INDX, RCRD, RSTR) in place.
+//
+// buf must hold the whole record. The update sequence array's offset and count
+// are read from bytes 4 and 6, as every protected NTFS record stores them. The
+// last two bytes of each 512-byte sector must equal the update sequence number;
+// a sector where they do not was torn by an interrupted write, and ApplyFixup
+// returns an error wrapping ErrUpdateSequence. buf is modified even then, up to
+// the torn sector.
+//
+// [ProtectFixup] is the inverse.
+func ApplyFixup(buf []byte) error {
+	offset, count, err := fixupArray(buf)
+	if err != nil {
+		return err
+	}
+	return applyUpdateSequence(buf, offset, count)
+}
+
+// fixupArray returns the update sequence array's offset and count from a
+// record header, checked against the record: the array has to fit, and so do
+// the count-1 sectors it protects.
+func fixupArray(buf []byte) (offset, count uint16, err error) {
+	if len(buf) < 8 {
+		return 0, 0, fmt.Errorf("%w: record is %d bytes, too short for a header", ErrUpdateSequence, len(buf))
+	}
+	offset, count = ReadUint16LE(buf, 4), ReadUint16LE(buf, 6)
+	if count == 0 || int(offset) < 8 || int(offset)+2*int(count) > len(buf) ||
+		(int(count)-1)*UpdateSequenceStride > len(buf) {
+		return 0, 0, fmt.Errorf("%w: malformed update sequence array (offset %d, count %d, record %d bytes)",
+			ErrUpdateSequence, offset, count, len(buf))
+	}
+	return offset, count, nil
+}
+
 // applyUpdateSequence applies the update sequence array to fix torn writes.
 // The update sequence array is NTFS's mechanism for detecting incomplete writes.
 func applyUpdateSequence(buf []byte, offset, size uint16) error {
@@ -658,7 +734,7 @@ func parseAttributesInto(dst []*Attribute, buf []byte, startOffset, endOffset in
 		}
 
 		attrType := ReadUint32LE(buf, offset)
-		if attrType == 0xFFFFFFFF {
+		if attrType == AttrTypeEnd {
 			// End of attributes
 			break
 		}
@@ -800,6 +876,39 @@ func (e *MFTEntry) FindPrimaryNonResidentDataAttribute() *Attribute {
 	return dataAttrs[0]
 }
 
+// FileNames returns every $FILE_NAME of the entry in attribute order: those in
+// the base record first, then those $ATTRIBUTE_LIST brought in from extension
+// records. A file with several hard links has one per link, and a long name
+// usually has a DOS 8.3 twin.
+//
+// It returns ErrAttributeNotFound when the entry has none. A $FILE_NAME that
+// does not parse is skipped, and the error for the first such one is returned
+// alongside the names that did.
+func (e *MFTEntry) FileNames() ([]*FileName, error) {
+	attrs := e.FindAllAttributes(AttrTypeFileName)
+	if len(attrs) == 0 {
+		return nil, ErrAttributeNotFound
+	}
+
+	names := make([]*FileName, 0, len(attrs))
+	var firstErr error
+	for _, attr := range attrs {
+		var fn *FileName
+		err := fmt.Errorf("%w: $FILE_NAME is not resident", ErrInvalidAttribute)
+		if attr.Resident != nil {
+			fn, err = ParseFileName(attr.Resident.Value)
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = wrapAttributeError(AttrTypeFileName, "", "parse", err)
+			}
+			continue
+		}
+		names = append(names, fn)
+	}
+	return names, firstErr
+}
+
 // GetFileName returns the primary file name for this entry.
 // It prefers Win32 namespace over DOS namespace.
 func (e *MFTEntry) GetFileName() (*FileName, error) {
@@ -816,7 +925,7 @@ func (e *MFTEntry) GetFileName() (*FileName, error) {
 			continue
 		}
 
-		fn, err := parseFileNameAttribute(attr.Resident.Value)
+		fn, err := ParseFileName(attr.Resident.Value)
 		if err != nil {
 			continue
 		}

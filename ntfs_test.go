@@ -251,7 +251,7 @@ func TestDataRunParsing(t *testing.T) {
 	// Offset: 0x64 (100)
 	dataRuns := []byte{0x11, 0x01, 0x64, 0x00}
 
-	runs, err := parseDataRuns(dataRuns)
+	runs, err := DecodeRunlist(dataRuns)
 	if err != nil {
 		t.Fatalf("Failed to parse data runs: %v", err)
 	}
@@ -1147,7 +1147,7 @@ func TestAddIndexDirEntryResolverFallbackOnError(t *testing.T) {
 		FileName: &FileName{
 			Name:           "known-file",
 			Namespace:      NamespaceWin32,
-			FileAttributes: uint64(FileAttrArchive),
+			FileAttributes: uint32(FileAttrArchive),
 		},
 	}
 
@@ -1550,14 +1550,40 @@ func buildTestNTFSImage(t testing.TB, records [][]byte) []byte {
 // Entry 0 is always generated as $MFT and must not be supplied.
 func buildTestNTFSImageAt(t testing.TB, records map[uint64][]byte) []byte {
 	t.Helper()
+	return buildTestNTFSImageGeometry(t, defaultTestGeometry, records)
+}
 
-	const (
-		bytesPerSector    = 512
-		sectorsPerCluster = 8
-		clusterSize       = bytesPerSector * sectorsPerCluster
+// testGeometry describes the cluster layout of a test image.
+type testGeometry struct {
+	bytesPerSector    int
+	sectorsPerCluster uint8 // The raw boot-sector byte; above 0x80 it is a negative shift
+	clusterSize       int   // Must agree with sectorsPerCluster
+	mftCluster        int
+	totalClusters     int
+}
+
+// defaultTestGeometry is the 4 KiB-cluster layout most fixtures assume:
+// $MFT at cluster 4 of 16.
+var defaultTestGeometry = testGeometry{
+	bytesPerSector:    512,
+	sectorsPerCluster: 8,
+	clusterSize:       4096,
+	mftCluster:        4,
+	totalClusters:     16,
+}
+
+// buildTestNTFSImageGeometry is buildTestNTFSImageAt over an explicit cluster
+// layout.
+func buildTestNTFSImageGeometry(t testing.TB, g testGeometry, records map[uint64][]byte) []byte {
+	t.Helper()
+
+	var (
+		bytesPerSector    = g.bytesPerSector
+		sectorsPerCluster = g.sectorsPerCluster
+		clusterSize       = g.clusterSize
 		recordSize        = DefaultMFTRecordSize
-		mftCluster        = 4
-		totalClusters     = 16
+		mftCluster        = g.mftCluster
+		totalClusters     = g.totalClusters
 	)
 
 	if _, exists := records[0]; exists {
@@ -1583,13 +1609,13 @@ func buildTestNTFSImageAt(t testing.TB, records map[uint64][]byte) []byte {
 		name:      "$MFT",
 		namespace: NamespaceWin32,
 		extraAttrs: [][]byte{
-			buildNonResidentDataAttr(t, 2, mftCluster, mftClusters, clusterSize),
+			buildNonResidentDataAttr(t, 2, uint64(mftCluster), mftClusters, uint32(clusterSize)),
 		},
 	})
 
 	image := make([]byte, totalClusters*clusterSize)
-	copy(image, buildTestBootSector(bytesPerSector, sectorsPerCluster,
-		totalClusters*sectorsPerCluster, mftCluster))
+	copy(image, buildTestBootSector(uint16(bytesPerSector), sectorsPerCluster,
+		uint64(totalClusters*clusterSize/bytesPerSector), uint64(mftCluster)))
 
 	place := func(entryNum uint64, record []byte) {
 		offset := mftCluster*clusterSize + int(entryNum)*recordSize

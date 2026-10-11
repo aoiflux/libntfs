@@ -52,6 +52,11 @@ type Volume struct {
 	securityInit bool                           // True when securityMap has been populated
 	securityErr  error                          // Sticky error from the $SDS load
 
+	upcase     UpCase     // $UpCase, loaded on first use
+	upcaseMu   sync.Mutex // Protects upcase state
+	upcaseInit bool       // True when upcase has been loaded
+	upcaseErr  error      // Sticky error from the $UpCase load
+
 	// changeJournal caches whether $UsnJrnl is present and carrying records on
 	// this volume, since answering costs a directory read of $Extend and
 	// Capabilities has no error to return. changeJournalInit is deliberately not
@@ -66,6 +71,9 @@ type Volume struct {
 	// once during Open and never mutated, so it needs no lock: every write entry
 	// point consults it before touching the handle.
 	readOnly bool
+
+	// strict records Options.Strict. Like readOnly it is set once during Open.
+	strict bool
 
 	// baseOffset is where the volume begins inside the reader handed to Open.
 	//
@@ -125,6 +133,35 @@ type Options struct {
 	// and allowing one that did would misalign the read-modify-write underneath
 	// [Volume.WriteAt].
 	BaseOffset int64
+
+	// Strict turns the structural damage the library otherwise tolerates into
+	// errors, for a caller that needs to know a volume is exactly well formed
+	// rather than to recover what it can from it.
+	//
+	// By default libntfs reads past damage: a directory with an unreadable INDX
+	// block yields its other names with a [PartialDirError], and a freed block's
+	// names come back marked Deleted. With Strict set, every check below fails
+	// the call with a [*StrictError] naming the record, index and VCN:
+	//
+	//   - [File.ReadDir] and [File.WalkIndex] check the index B-tree: every
+	//     block is reached at most once from the root, at most 32 levels down,
+	//     on a block boundary, and carries a valid INDX header, update sequence
+	//     and its own VCN; the $BITMAP exists and marks in use exactly the
+	//     blocks reached; every entry of a node, and none of a leaf, points at a
+	//     sub-node; and the keys come out in collation order ($UpCase for
+	//     $I30, ULONG or ULONGS for the view indexes; SID and Unicode
+	//     collations are not checked). A partial listing is an error.
+	//   - [File.ReadDir] also checks each live entry against the record it
+	//     names: the record is in use, its sequence number matches the
+	//     reference, it holds a $FILE_NAME with the entry's parent and name, and
+	//     its directory flag, its $I30 index and the entry's directory attribute
+	//     agree.
+	//   - [Volume.Open] checks that the runs of every non-resident $DATA cover
+	//     exactly its allocated size, and that its real size fits inside it.
+	//
+	// [Volume.VerifyReparseIndex] applies the same checks to $Reparse:$R
+	// whatever this setting.
+	Strict bool
 }
 
 // Open opens an NTFS volume from the given reader.
@@ -175,6 +212,7 @@ func OpenWithOptions(reader io.ReaderAt, opts Options) (*Volume, error) {
 
 	v := &Volume{
 		readOnly:   opts.ReadOnly,
+		strict:     opts.Strict,
 		baseOffset: opts.BaseOffset,
 		mftCache:   make(map[uint64]*MFTEntry, DefaultMFTCacheSize),
 		bufferPool: &sync.Pool{
@@ -397,14 +435,15 @@ func (v *Volume) parseBootSector() error {
 		return fmt.Errorf("%w: invalid sector size %d", ErrInvalidBootSector, bs.BytesPerSector)
 	}
 
-	if bs.SectorsPerCluster == 0 || bs.SectorsPerCluster > 128 {
+	sectorsPerCluster, ok := decodeSectorsPerCluster(bs.SectorsPerCluster)
+	if !ok {
 		return fmt.Errorf("%w: invalid sectors per cluster %d", ErrInvalidBootSector, bs.SectorsPerCluster)
 	}
 
 	// Calculate derived values
 	v.bootSector = bs
 	v.bytesPerSector = uint32(bs.BytesPerSector)
-	v.sectorsPerCluster = uint32(bs.SectorsPerCluster)
+	v.sectorsPerCluster = sectorsPerCluster
 	v.bytesPerCluster = v.bytesPerSector * v.sectorsPerCluster
 	v.mftCluster = bs.MFTCluster
 	v.volumeSize = bs.TotalSectors * uint64(bs.BytesPerSector)
@@ -453,6 +492,27 @@ func (v *Volume) parseBootSector() error {
 	}
 
 	return nil
+}
+
+// decodeSectorsPerCluster decodes the boot sector's sectors-per-cluster byte.
+//
+// Up to 0x80 the byte is the count itself. Above it, the byte is a negative
+// exponent: the count is 2^(256-b), so 0xF8 is 256 sectors and 0xF4 is 4096.
+// That encoding is how Windows formats clusters larger than 64 KiB. A shift too
+// large to describe a cluster NTFS supports is rejected here; the resulting
+// cluster size is checked against MaxClusterSize by the caller.
+func decodeSectorsPerCluster(b uint8) (uint32, bool) {
+	switch {
+	case b == 0:
+		return 0, false
+	case b <= 0x80:
+		return uint32(b), true
+	}
+	shift := 256 - int(b)
+	if shift > 21 { // 2^21 sectors is 1 GiB at 512 bytes, far past MaxClusterSize
+		return 0, false
+	}
+	return 1 << shift, true
 }
 
 // initializeMFT reads the $MFT entry and extracts its data runs.

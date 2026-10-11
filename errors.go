@@ -117,7 +117,59 @@ var (
 
 	// ErrInvalidLogRecord indicates a malformed $LogFile page or record.
 	ErrInvalidLogRecord = errors.New("invalid or malformed log record")
+
+	// ErrInvalidUpCase indicates an $UpCase table that is not the 128 KiB
+	// NTFS requires.
+	ErrInvalidUpCase = errors.New("invalid or malformed $UpCase table")
+
+	// ErrStrictViolation indicates a structure that the default, tolerant
+	// reader would have read past but Options.Strict rejects. Every
+	// [*StrictError] matches it.
+	ErrStrictViolation = errors.New("strict check failed")
 )
+
+// StrictError reports a structural check that failed under Options.Strict, or
+// in [Volume.VerifyReparseIndex].
+//
+// It names where the damage is: the MFT record, the index within it, and the
+// VCN of the INDX block (-1 for $INDEX_ROOT, or when no block is involved).
+// Entry, when non-zero, is the MFT record an index entry points at. Check is a
+// short, stable name for the failed check, suitable for tests and reports. It
+// matches ErrStrictViolation as well as Err.
+type StrictError struct {
+	Record uint64 // MFT record holding the structure
+	Index  string // Index name ("$I30", "$R", ...); empty when not an index check
+	VCN    int64  // INDX block VCN; -1 for $INDEX_ROOT or no block
+	Entry  uint64 // MFT record an index entry refers to; 0 when none
+	Check  string // Name of the failed check
+	Err    error  // Detail
+}
+
+func (e *StrictError) Error() string {
+	msg := fmt.Sprintf("strict: record %d", e.Record)
+	if e.Index != "" {
+		msg += fmt.Sprintf(" index %s", e.Index)
+		if e.VCN >= 0 {
+			msg += fmt.Sprintf(" vcn %d", e.VCN)
+		} else {
+			msg += " root"
+		}
+	}
+	if e.Entry != 0 {
+		msg += fmt.Sprintf(" entry %d", e.Entry)
+	}
+	return fmt.Sprintf("%s: %s: %v", msg, e.Check, e.Err)
+}
+
+func (e *StrictError) Unwrap() error {
+	return e.Err
+}
+
+// Is reports whether target is ErrStrictViolation, so errors.Is matches every
+// StrictError without callers having to know the detail error.
+func (e *StrictError) Is(target error) bool {
+	return target == ErrStrictViolation
+}
 
 // PartialDirError reports that a directory listing is incomplete.
 //

@@ -16,7 +16,7 @@ import "testing"
 func TestIsDirectoryFileAttributes(t *testing.T) {
 	tests := []struct {
 		name       string
-		attributes uint64
+		attributes uint32
 		want       bool
 	}{
 		{

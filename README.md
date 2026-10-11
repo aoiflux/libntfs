@@ -202,6 +202,9 @@ Volume-level:
 - (*Volume).Open(entryNum uint64) (*File, error)
 - (*Volume).OpenPath(path string) (*File, error)
 - (*Volume).GetRootDirectory() (*File, error)
+- (*Volume).IsStrict() bool
+- (*Volume).UpCase() (UpCase, error)
+- (*Volume).VerifyReparseIndex() error
 
 MFT-level:
 
@@ -211,6 +214,7 @@ MFT-level:
 - (*Volume).MFTEntryCount() (uint64, error)
 - (*Volume).EachMFTEntry(fn func(entryNum uint64, e *MFTEntry) error) error
 - (*Volume).EachMFTEntryContext(ctx context.Context, fn func(entryNum uint64, e *MFTEntry) error) error
+- (*MFTEntry).FileNames() ([]*FileName, error)
 
 Path- and walk-level:
 
@@ -227,6 +231,32 @@ File-level:
 - (*File).ReadAll() ([]byte, error)
 - (*File).ReadDir() ([]DirEntry, error)
 - (*File).ReadSupport() FileReadSupport
+
+Index-level:
+
+- (*File).ReadIndexRoot(name string) (*IndexRoot, error)
+- (*File).ReadIndexBlock(name string, vcn int64) (*IndexBlock, error)
+- (*File).IndexBitmap(name string) ([]byte, error)
+- (*File).WalkIndex(name string, fn func(e IndexEntry, depth int, vcn int64) error) error
+
+Codec-level (pure functions over bytes, no Volume needed):
+
+- ApplyFixup(buf []byte) error
+- ProtectFixup(buf []byte, usn uint16) error
+- DecodeRunlist(buf []byte) ([]DataRun, error)
+- EncodeRunlist(runs []DataRun) []byte
+- ParseFileName(data []byte) (*FileName, error)
+- FiletimeToTime(v uint64) time.Time
+- TimeToFiletime(t time.Time) uint64
+- DefaultUpCase() UpCase
+- ParseUpCase(b []byte) (UpCase, error)
+- (UpCase).Bytes() []byte
+- (UpCase).ToUpper(c uint16) uint16
+- (UpCase).Compare(a, b string) int
+- CollateULong(a, b []byte) int
+- CollateULongs(a, b []byte) int
+- EncodeSymlinkReparse(substitute, print string, relative bool) ([]byte, error)
+- EncodeMountPointReparse(substitute, print string) ([]byte, error)
 
 Identity-level:
 
@@ -310,7 +340,17 @@ Attribute-level:
 - (*Attribute).ReadSupport() FileReadSupport
 
 `ReadDir` returns both allocated and recoverable deleted names. Use
-`DirEntry.Deleted` to distinguish deleted entries.
+`DirEntry.Deleted` to distinguish deleted entries. Names still sitting in an INDX
+block that the directory's `$BITMAP:$I30` marks free come back `Deleted` too.
+
+A `DirEntry`'s times, sizes and attributes come from the copy of `$FILE_NAME` the
+directory index keeps, which NTFS updates only when the name changes, so they can
+lag the file itself; `(*File).GetMetadata` returns the current
+`$STANDARD_INFORMATION`. `DirEntry.FileName` carries that whole index copy.
+
+`OpenPath` matches each component with `strings.EqualFold`, not through the
+volume's `$UpCase`. Use `(*Volume).UpCase` and `UpCase.Compare` for NTFS's own
+collation.
 
 On a damaged volume `ReadDir` returns the entries it could parse *together with*
 a `*PartialDirError`, so both return values can be non-nil. A walk over a whole
@@ -337,6 +377,34 @@ A nil slice with a non-nil error means nothing could be read; the error wraps
 `ErrCorruptIndex` or `ErrNotDirectory`. Code that only wants complete listings
 can keep testing `err != nil` and ignore the entries. `ListFiles` and
 `ListDirectories` follow the same contract.
+
+### Strict mode
+
+By default libntfs reads past damage, as above. A caller that needs to know a
+volume is exactly well formed, such as a tool checking images it generated, can
+set `Options.Strict`:
+
+```go
+v, err := libntfs.OpenWithOptions(dev, libntfs.Options{ReadOnly: true, Strict: true})
+```
+
+Every check then fails the call with a `*StrictError` naming the MFT record, the
+index and the INDX block VCN, and matching `ErrStrictViolation`:
+
+- `ReadDir` and `WalkIndex` check the index B-tree: each block reached once, on a
+  block boundary, with valid INDX header, update sequence and VCN; `$BITMAP`
+  present and marking exactly the blocks reached; node flags consistent; keys in
+  collation order (`$UpCase` for `$I30`, ULONG or ULONGS for view indexes). A
+  partial listing is an error rather than a `*PartialDirError`.
+- `ReadDir` checks each live entry against its record: in use, matching sequence
+  number, a `$FILE_NAME` with the same parent and name, and the record's directory
+  flag, `$I30` index and the entry's directory attribute in agreement.
+- `(*Volume).Open` checks that every non-resident `$DATA`'s runs cover exactly its
+  allocated size, with the real size inside it.
+
+`(*Volume).VerifyReparseIndex` runs the same checks over `$Extend\$Reparse:$R`
+and compares its keys with every reparse point on the volume, whatever `Strict`
+says.
 
 Use `ReadSupport` to check whether the primary `$DATA` stream is readable, and
 whether it is resident, sparse, compressed, or encrypted, before calling `Read`,

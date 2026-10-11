@@ -2,6 +2,7 @@ package libntfs
 
 import (
 	"encoding/binary"
+	"math"
 	"time"
 	"unicode/utf16"
 )
@@ -209,38 +210,74 @@ func (r *BinaryReader) PeekUint64() (uint64, error) {
 
 // Utility functions for time conversion
 
+// utf16LE encodes s as the little-endian UTF-16 NTFS stores names in.
+func utf16LE(s string) []byte {
+	units := utf16.Encode([]rune(s))
+	out := make([]byte, 2*len(units))
+	for i, u := range units {
+		binary.LittleEndian.PutUint16(out[2*i:], u)
+	}
+	return out
+}
+
+func appendUint16LE(b []byte, v uint16) []byte { return binary.LittleEndian.AppendUint16(b, v) }
+func appendUint32LE(b []byte, v uint32) []byte { return binary.LittleEndian.AppendUint32(b, v) }
+
+// filetimeTicksPerSecond is the number of 100-nanosecond FILETIME ticks in a second.
+const filetimeTicksPerSecond = 10000000
+
+// filetimeEpochSeconds is the number of seconds from 1601-01-01 to 1970-01-01.
+const filetimeEpochSeconds = NTFSTimeOffset / filetimeTicksPerSecond
+
+// FiletimeToTime converts a FILETIME (100-nanosecond intervals since
+// 1601-01-01 UTC) to a UTC time.Time.
+//
+// Every uint64 value maps to a distinct instant, including those before 1970
+// and after 2262 that time.UnixNano cannot represent. 0 is 1601-01-01; use
+// [NTFSTimeToTime] where 0 means "not set".
+func FiletimeToTime(v uint64) time.Time {
+	seconds := int64(v/filetimeTicksPerSecond) - filetimeEpochSeconds
+	nanos := int64(v%filetimeTicksPerSecond) * 100
+	return time.Unix(seconds, nanos).UTC()
+}
+
+// TimeToFiletime converts t to a FILETIME, the inverse of [FiletimeToTime].
+//
+// Sub-100ns precision is truncated. A time before 1601-01-01 clamps to 0 and
+// one past the end of the uint64 range clamps to math.MaxUint64.
+func TimeToFiletime(t time.Time) uint64 {
+	seconds := t.Unix() + filetimeEpochSeconds
+	if seconds < 0 {
+		return 0
+	}
+	ticks := uint64(t.Nanosecond() / 100)
+	if uint64(seconds) > (math.MaxUint64-ticks)/filetimeTicksPerSecond {
+		return math.MaxUint64
+	}
+	return uint64(seconds)*filetimeTicksPerSecond + ticks
+}
+
 // NTFSTimeToTime converts NTFS time (100-nanosecond intervals since 1601-01-01)
 // to Go time.Time.
+//
+// It treats 0 as "not set" and returns the zero time.Time for it; every other
+// value converts as [FiletimeToTime] does, over the full FILETIME range.
 func NTFSTimeToTime(ntfsTime uint64) time.Time {
 	if ntfsTime == 0 {
 		return time.Time{}
 	}
-
-	// Convert to Unix time
-	if ntfsTime < NTFSTimeOffset {
-		return time.Time{} // Before Unix epoch
-	}
-
-	intervals := ntfsTime - NTFSTimeOffset
-	seconds := intervals / 10000000
-	nanos := (intervals % 10000000) * 100
-
-	return time.Unix(int64(seconds), int64(nanos)).UTC()
+	return FiletimeToTime(ntfsTime)
 }
 
 // TimeToNTFSTime converts Go time.Time to NTFS time format.
+//
+// The zero time.Time converts to 0 ("not set"); every other time converts as
+// [TimeToFiletime] does.
 func TimeToNTFSTime(t time.Time) uint64 {
 	if t.IsZero() {
 		return 0
 	}
-
-	unixNano := t.UnixNano()
-	if unixNano < 0 {
-		return 0 // Before Unix epoch
-	}
-
-	intervals := uint64(unixNano) / 100
-	return intervals + NTFSTimeOffset
+	return TimeToFiletime(t)
 }
 
 // Utility functions for reading specific structures

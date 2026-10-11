@@ -1,7 +1,9 @@
 package libntfs
 
 import (
+	"bytes"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -83,7 +85,7 @@ func FuzzParseDataRuns(f *testing.F) {
 	f.Add([]byte{})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		runs, err := parseDataRuns(data)
+		runs, err := DecodeRunlist(data)
 		if err != nil {
 			return
 		}
@@ -372,7 +374,7 @@ func FuzzParseIndexRecord(f *testing.F) {
 
 	// A well-formed record whose node bounds point outside it.
 	bogusBounds := buildIndexAllocationRecord(f, 4096, 0)
-	WriteUint32LE(bogusBounds, indexRecordHeaderSize+8, 0xFFFFFFFF)
+	WriteUint32LE(bogusBounds, IndexRecordHeaderSize+8, 0xFFFFFFFF)
 	f.Add(bogusBounds)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -523,12 +525,12 @@ func FuzzParseFileNameAttribute(f *testing.F) {
 	f.Add(overrun)
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		fn, err := parseFileNameAttribute(data)
+		fn, err := ParseFileName(data)
 		if err != nil {
 			return
 		}
 		if fn == nil {
-			t.Fatal("parseFileNameAttribute returned no name and no error")
+			t.Fatal("ParseFileName returned no name and no error")
 		}
 		// Each rune costs at least one 2-byte UTF-16 code unit in the buffer.
 		if utf8.RuneCountInString(fn.Name) > len(data)/2 {
@@ -586,5 +588,94 @@ func FuzzParseMFTRecord(f *testing.F) {
 		_, _ = entry.GetFileName()
 		_, _ = entry.GetStandardInformation()
 		_ = entry.DataStreams()
+	})
+}
+
+// The codecs fsagen writes images with have to invert the parsers exactly, so
+// their targets check round trips rather than only the absence of a panic.
+
+func FuzzRunlistRoundTrip(f *testing.F) {
+	f.Add([]byte{0x11, 0x08, 0x04, 0x00})
+	f.Add([]byte{0x11, 0x10, 0x64, 0x01, 0x04, 0x11, 0x02, 0xCE, 0x00})
+	f.Add([]byte{0x22, 0x80, 0x00, 0x00, 0x01, 0x00})
+	f.Add([]byte{0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00})
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		runs, err := DecodeRunlist(data)
+		if err != nil {
+			return
+		}
+		// Encoding is canonical, so a decoded list re-encodes to bytes that
+		// decode to the same runs, and re-encoding those is a fixed point.
+		encoded := EncodeRunlist(runs)
+		back, err := DecodeRunlist(encoded)
+		if err != nil {
+			t.Fatalf("DecodeRunlist(EncodeRunlist(%+v)): %v", runs, err)
+		}
+		if !slices.Equal(back, normalizeRuns(runs)) {
+			t.Fatalf("round trip of %+v = %+v", runs, back)
+		}
+		if again := EncodeRunlist(back); !bytes.Equal(again, encoded) {
+			t.Fatalf("EncodeRunlist is not canonical: % x then % x", encoded, again)
+		}
+	})
+}
+
+func FuzzFixupRoundTrip(f *testing.F) {
+	f.Add(testFixupRecord(1024, 1), uint16(0x0102))
+	f.Add(testFixupRecord(512, 2), uint16(0))
+	f.Add(testIndexBlock(f, 4096, 0, false, testIndexEnd(noSubNode)), uint16(7))
+	f.Add([]byte{}, uint16(1))
+
+	f.Fuzz(func(t *testing.T, data []byte, usn uint16) {
+		buf := slices.Clone(data)
+		if err := ProtectFixup(buf, usn); err != nil {
+			if err := ApplyFixup(slices.Clone(data)); err == nil {
+				t.Fatal("ApplyFixup accepted a record ProtectFixup rejected")
+			}
+			return
+		}
+		if err := ApplyFixup(buf); err != nil {
+			t.Fatalf("ApplyFixup(ProtectFixup(x)): %v", err)
+		}
+		// Everything outside the update sequence array is restored.
+		offset, count := int(ReadUint16LE(data, 4)), int(ReadUint16LE(data, 6))
+		for i := range buf {
+			if i >= offset && i < offset+2*count {
+				continue
+			}
+			if buf[i] != data[i] {
+				t.Fatalf("byte %d is %#x after the round trip, was %#x", i, buf[i], data[i])
+			}
+		}
+	})
+}
+
+func FuzzParseIndexNode(f *testing.F) {
+	f.Add(testIndexBlock(f, 4096, 0, false,
+		testIndexEntry(30, 1, testFileNameKey(5, "seed.txt", FileAttrArchive), noSubNode),
+		testIndexEnd(noSubNode)), uint32(AttrTypeFileName))
+	f.Add(testIndexBlock(f, 4096, 3, true,
+		testIndexEntry(30, 1, testFileNameKey(5, "seed.txt", FileAttrArchive), 1),
+		testIndexEnd(2)), uint32(AttrTypeFileName))
+	f.Add(testIndexBlock(f, 512, 0, false,
+		testViewIndexEntry(appendUint32LE(nil, 1), []byte("data"), noSubNode),
+		testIndexEnd(noSubNode)), uint32(0))
+	f.Add([]byte{}, uint32(0))
+
+	f.Fuzz(func(t *testing.T, data []byte, indexedType uint32) {
+		block, err := parseIndexBlock(slices.Clone(data), indexedType)
+		if err != nil {
+			return
+		}
+		if len(block.Entries) == 0 || block.Entries[len(block.Entries)-1].Flags&IndexFlagLast == 0 {
+			t.Fatal("a parsed node does not end with its end entry")
+		}
+		for _, e := range block.Entries {
+			if len(e.Key)+len(e.Data) > len(data) {
+				t.Fatalf("entry holds %d bytes of a %d byte block", len(e.Key)+len(e.Data), len(data))
+			}
+		}
 	})
 }

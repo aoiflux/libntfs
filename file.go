@@ -41,6 +41,14 @@ type FileReadSupport struct {
 }
 
 // DirEntry represents a directory entry with basic information.
+//
+// The times, sizes and Attributes come from the copy of $FILE_NAME the
+// directory index holds, not from the file's own record. NTFS updates that copy
+// only when the name itself changes, so its values can lag the file's
+// $STANDARD_INFORMATION and $DATA; use [File.GetMetadata] for current times.
+// The one exception is a Size of 0 on a file, which ReadDir replaces with the
+// size of its $DATA, since Windows leaves it 0 for several system files.
+// IsDirectory comes from the index entry's attributes as well.
 type DirEntry struct {
 	Name          string
 	EntryNum      uint64
@@ -51,8 +59,20 @@ type DirEntry struct {
 	AllocatedSize uint64
 	CreateTime    time.Time
 	ModifyTime    time.Time
+	MFTChangeTime time.Time
 	AccessTime    time.Time
 	Attributes    uint32
+
+	// Namespace is the name's namespace: NamespacePOSIX, NamespaceWin32,
+	// NamespaceDOS or NamespaceWinDOS.
+	Namespace uint8
+
+	// ParentReference is the parent directory's packed file reference, as
+	// [MakeFileReference] builds it, recorded in the entry's $FILE_NAME.
+	ParentReference uint64
+
+	// FileName is the index entry's whole $FILE_NAME.
+	FileName *FileName
 }
 
 type dirTypeResolver func(entryNum uint64) (bool, error)
@@ -78,8 +98,8 @@ func resolveDirEntryIsDirectory(idxEntry IndexEntry, resolveType dirTypeResolver
 // FileAttrDirectory bit clear, so the former is what an index entry actually
 // carries. The Win32 bit is accepted as well, since tools that synthesise NTFS
 // structures from a Win32 view do set it, and accepting both costs nothing.
-func isDirectoryFileAttributes(attributes uint64) bool {
-	const directoryBits = uint64(FileAttrDupFileNameIndexPresent) | uint64(FileAttrDirectory)
+func isDirectoryFileAttributes(attributes uint32) bool {
+	const directoryBits = uint32(FileAttrDupFileNameIndexPresent) | uint32(FileAttrDirectory)
 	return attributes&directoryBits != 0
 }
 
@@ -171,8 +191,13 @@ func (a *dirEntryAccumulator) add(idxEntry IndexEntry) {
 		AllocatedSize: idxEntry.FileName.AllocatedSize,
 		CreateTime:    idxEntry.FileName.CreateTime,
 		ModifyTime:    idxEntry.FileName.ModifyTime,
+		MFTChangeTime: idxEntry.FileName.MFTChangeTime,
 		AccessTime:    idxEntry.FileName.AccessTime,
-		Attributes:    uint32(idxEntry.FileName.FileAttributes),
+		Attributes:    idxEntry.FileName.FileAttributes,
+
+		Namespace:       idxEntry.FileName.Namespace,
+		ParentReference: MakeFileReference(idxEntry.FileName.ParentDirectory, idxEntry.FileName.ParentSeqNum),
+		FileName:        idxEntry.FileName,
 	}
 
 	if entry.Name == "." || entry.Name == ".." {
@@ -274,7 +299,7 @@ func (v *Volume) ensureMFTParentMap() {
 				continue
 			}
 
-			fn, err := parseFileNameAttribute(attr.Resident.Value)
+			fn, err := ParseFileName(attr.Resident.Value)
 			if err != nil || fn.Name == "" {
 				continue
 			}
@@ -337,6 +362,12 @@ func (v *Volume) Open(entryNum uint64) (*File, error) {
 		return nil, fmt.Errorf("MFT entry %d is not in use", entryNum)
 	}
 
+	if v.strict {
+		if err := v.verifyDataCoverage(entryNum, entry); err != nil {
+			return nil, err
+		}
+	}
+
 	// Get file name
 	fn, err := entry.GetFileName()
 	if err != nil {
@@ -376,6 +407,16 @@ func (v *Volume) Open(entryNum uint64) (*File, error) {
 }
 
 // OpenPath opens a file or directory by its path (e.g., "/Windows/System32/ntdll.dll").
+//
+// Each component is matched against the directory's live names with
+// strings.EqualFold, which folds case by Unicode rules rather than through the
+// volume's $UpCase table. The two agree for every name a mainstream formatter
+// produces; use [Volume.UpCase] and [UpCase.Compare] over [File.ReadDir] for
+// NTFS's own rule.
+//
+// A directory that is only partly readable is searched as far as it goes; the
+// damage is reported only if the component is not found. Under Options.Strict
+// that damage is fatal instead.
 func (v *Volume) OpenPath(filePath string) (*File, error) {
 	if v.IsClosed() {
 		return nil, ErrVolumeClosed
@@ -719,7 +760,7 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 		// A damaged $INDEX_ALLOCATION must not cost the caller the entries
 		// $INDEX_ROOT already yielded, so the records that fail are counted
 		// and reported rather than aborting the listing.
-		skipped, indexErr = f.readIndexAllocation(indexAllocAttr.NonResident, acc)
+		skipped, indexErr = f.readIndexAllocation(indexAllocAttr.NonResident, f.volume.indexBlockSize(indexRoot), acc)
 		f.resolveZeroSizedEntries(acc.entries)
 	}
 
@@ -735,30 +776,43 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 		if indexErr == nil {
 			indexErr = ErrCorruptIndex
 		}
-		return acc.entries, &PartialDirError{
+		partial := &PartialDirError{
 			EntryNum:  f.entryNum,
 			Recovered: len(acc.entries),
 			Skipped:   skipped,
 			Err:       indexErr,
+		}
+		if f.volume.strict {
+			return nil, &StrictError{Record: f.entryNum, Index: "$I30", VCN: -1, Check: "partial-listing", Err: partial}
+		}
+		return acc.entries, partial
+	}
+
+	if f.volume.strict {
+		if err := f.verifyDirectory(); err != nil {
+			return nil, err
 		}
 	}
 
 	return acc.entries, nil
 }
 
-// indexRecordHeaderSize is the INDX record header that precedes the node
-// header: magic, update sequence offset and size, LSN, VCN.
-const indexRecordHeaderSize = 24
-
 // readIndexAllocation merges the entries of the $INDEX_ALLOCATION attribute
 // into acc.
+//
+// Block i of the allocation sits at i*indexRecordSize and is in use when bit i
+// of $BITMAP:$I30 is set. The entries of a block whose bit is clear are merged
+// as Deleted: the directory released the block, so its names are history. A
+// directory with no $BITMAP:$I30 at all is damaged; every block is then read as
+// in use, which is what ReadDir did before it consulted the bitmap.
 //
 // It returns the number of index records it had to skip. A skipped record is
 // not fatal on its own -- a directory whose INDX blocks are partly damaged
 // still yields the names in the blocks that survived -- but it is never
 // silent, because a caller cannot otherwise tell a small directory from a
-// truncated one.
-func (f *File) readIndexAllocation(attr *NonResidentAttribute, acc *dirEntryAccumulator) (int, error) {
+// truncated one. A free block that fails to parse is not counted: nothing live
+// was lost with it.
+func (f *File) readIndexAllocation(attr *NonResidentAttribute, indexRecordSize int, acc *dirEntryAccumulator) (int, error) {
 	// Read all index allocation data
 	size := attr.RealSize
 	if size > 1<<30 {
@@ -772,19 +826,25 @@ func (f *File) readIndexAllocation(attr *NonResidentAttribute, acc *dirEntryAccu
 		return 0, fmt.Errorf("failed to read index allocation: %w", err)
 	}
 
-	// Parse index records. The record size comes from the boot sector, so a
+	// Parse index records. The record size can come from the boot sector, so a
 	// damaged one can make it too small to hold even the INDX header the
 	// reads below assume.
-	indexRecordSize := int(f.volume.IndexRecordSize())
-	if indexRecordSize < indexRecordHeaderSize {
+	if indexRecordSize < IndexRecordHeaderSize {
 		return 0, fmt.Errorf("%w: invalid index record size: %d", ErrCorruptIndex, indexRecordSize)
 	}
 
+	bitmap, err := f.loadIndexBitmap("$I30")
+	if err != nil {
+		return 0, err
+	}
+
 	var skipped int
-	for offset := 0; offset+indexRecordSize <= len(data); offset += indexRecordSize {
+	for offset, block := 0, 0; offset+indexRecordSize <= len(data); offset, block = offset+indexRecordSize, block+1 {
+		inUse := bitmap == nil || bitmapBit(bitmap, block)
+
 		idxEntries, err := parseIndexRecord(data[offset : offset+indexRecordSize])
 		if err != nil {
-			if !errors.Is(err, errNotIndexRecord) {
+			if inUse && !errors.Is(err, errNotIndexRecord) {
 				// Unallocated blocks in the run are expected and carry no
 				// magic; anything that claims to be an INDX record and then
 				// fails to parse is a real loss and is counted.
@@ -796,6 +856,9 @@ func (f *File) readIndexAllocation(attr *NonResidentAttribute, acc *dirEntryAccu
 		for _, idxEntry := range idxEntries {
 			if idxEntry.Flags&IndexFlagLast != 0 && idxEntry.FileName == nil {
 				continue
+			}
+			if !inUse {
+				idxEntry.Deleted = true
 			}
 
 			acc.add(idxEntry)
@@ -824,9 +887,9 @@ func parseIndexRecord(record []byte) ([]IndexEntry, error) {
 	// header that follows it, so the record has to be long enough for both
 	// before any of them happen. The record size comes from the boot sector,
 	// which on a damaged volume can describe something far smaller.
-	if len(record) < indexRecordHeaderSize+IndexNodeHeaderSize {
+	if len(record) < IndexRecordHeaderSize+IndexNodeHeaderSize {
 		return nil, fmt.Errorf("%w: index record is %d bytes, need %d",
-			ErrTruncatedRecord, len(record), indexRecordHeaderSize+IndexNodeHeaderSize)
+			ErrTruncatedRecord, len(record), IndexRecordHeaderSize+IndexNodeHeaderSize)
 	}
 
 	if ReadUint32LE(record, 0) != IndexAllocationMagic {
@@ -840,7 +903,7 @@ func parseIndexRecord(record []byte) ([]IndexEntry, error) {
 	}
 
 	// Node header offsets are relative to the node header itself.
-	const nodeHeaderOffset = indexRecordHeaderSize
+	const nodeHeaderOffset = IndexRecordHeaderSize
 	entryListOffset := ReadUint32LE(record, nodeHeaderOffset)
 	entryListEnd := ReadUint32LE(record, nodeHeaderOffset+4)
 	entryListAlloc := ReadUint32LE(record, nodeHeaderOffset+8)

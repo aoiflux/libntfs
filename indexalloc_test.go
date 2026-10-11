@@ -45,7 +45,7 @@ func buildIndexAllocationRecord(t testing.TB, recordSize int, vcn uint64, entrie
 	WriteUint64LE(buf, 16, vcn)
 
 	// Node header offsets are relative to the node header itself, at byte 24.
-	const nodeHeader = indexRecordHeaderSize
+	const nodeHeader = IndexRecordHeaderSize
 	WriteUint32LE(buf, nodeHeader, uint32(entriesStart-nodeHeader))
 	WriteUint32LE(buf, nodeHeader+4, uint32(entriesStart+len(body)-nodeHeader))
 	WriteUint32LE(buf, nodeHeader+8, uint32(recordSize-nodeHeader))

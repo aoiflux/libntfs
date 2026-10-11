@@ -57,7 +57,9 @@ type MFTEntry struct {
 // MFT entry flags
 const (
 	MFTFlagInUse     = 0x0001 // Entry is in use
-	MFTFlagDirectory = 0x0002 // Entry is a directory
+	MFTFlagDirectory = 0x0002 // Entry has a $I30 index (a directory)
+	MFTFlagIsExtend  = 0x0004 // Entry is in $Extend (libntfs-3g MFT_RECORD_IS_4)
+	MFTFlagViewIndex = 0x0008 // Entry has a view index ($Secure, $Quota, $ObjId, $Reparse)
 )
 
 // MFT magic values
@@ -81,6 +83,16 @@ const (
 	MFTEntrySecure  = 9  // $Secure - Security descriptors
 	MFTEntryUpCase  = 10 // $UpCase - Uppercase conversion table
 	MFTEntryExtend  = 11 // $Extend - Extended metadata directory
+
+	// SystemEntryCount is the number of entries reserved for NTFS metadata
+	// files: 0 to 15. 0 to 11 are the named files above; 12 to 15 are
+	// reserved and unnamed.
+	SystemEntryCount = 16
+
+	// FirstUserEntry is the first entry that is not reserved. Windows and
+	// mkntfs mark 0 to 23 in use and allocate $Extend's children and every
+	// ordinary file from 24 on.
+	FirstUserEntry = 24
 )
 
 // AttributeHeader is the common header for all NTFS attributes.
@@ -170,6 +182,25 @@ const (
 	AttrTypeEA              = 0xE0  // EA
 	AttrTypePropertySet     = 0xF0  // Property set
 	AttrTypeLoggedUtility   = 0x100 // Logged utility stream
+
+	// AttrTypeEnd is the type that ends a record's attribute list.
+	AttrTypeEnd = 0xFFFFFFFF
+)
+
+// $AttrDef flags, as libntfs-3g's layout.h names them. Each $AttrDef entry
+// carries them in the le32 at offset 0x8C.
+const (
+	AttrDefIndexable      = 0x02 // The attribute can be indexed
+	AttrDefMultiple       = 0x04 // A record can hold more than one
+	AttrDefNotZero        = 0x08 // The value must hold at least one non-zero byte
+	AttrDefIndexedUnique  = 0x10 // An indexed value must be unique
+	AttrDefNamedUnique    = 0x20 // A named attribute's name must be unique
+	AttrDefMustBeResident = 0x40 // The attribute is always resident
+	// AttrDefAlwaysLog marks an attribute whose changes are always logged,
+	// resident or not. Some references call 0x80 "always non-resident"; on
+	// disk it is set for $ATTRIBUTE_LIST, $DATA, $EA and
+	// $LOGGED_UTILITY_STREAM, which can all be resident.
+	AttrDefAlwaysLog = 0x80
 )
 
 // StandardInformation represents the $STANDARD_INFORMATION attribute.
@@ -218,6 +249,11 @@ const (
 	// the record is available; this bit is what an index entry carries, which is
 	// all a directory listing has to work from.
 	FileAttrDupFileNameIndexPresent = 0x10000000
+
+	// FileAttrViewIndex is how NTFS marks a record holding a view index (an
+	// index over something other than $FILE_NAME, such as $Secure's $SII and
+	// $SDH) in the FileAttributes field of $FILE_NAME and $STANDARD_INFORMATION.
+	FileAttrViewIndex = 0x20000000
 )
 
 // FileName represents the $FILE_NAME attribute.
@@ -230,8 +266,8 @@ type FileName struct {
 	AccessTime      time.Time // File access time
 	AllocatedSize   uint64    // Allocated size
 	RealSize        uint64    // Real size
-	FileAttributes  uint64    // File attributes
-	ReparseValue    uint32    // Reparse point value
+	FileAttributes  uint32    // File attributes (le32 at 0x38)
+	ReparseValue    uint32    // Reparse tag if FileAttrReparsePoint is set, else packed EA size (le32 at 0x3C)
 	NameLength      uint8     // Length of file name
 	Namespace       uint8     // Namespace
 	Name            string    // File name (UTF-16 converted to UTF-8)
@@ -281,6 +317,19 @@ type IndexEntry struct {
 	Reserved      [3]byte
 	Stream        []byte // Stream data (e.g., FileName attribute)
 	SubNodeVCN    uint64 // VCN of sub-node (if IndexFlagNode)
+
+	// Key is the indexed value: a $FILE_NAME in $I30, the tag and file
+	// reference in $Reparse:$R, the security ID in $Secure:$SII. It holds the
+	// same bytes as Stream.
+	Key []byte
+
+	// Data is a view index entry's value, located by the data offset and
+	// length at the start of the entry: the security descriptor header in
+	// $SII and $SDH, the quota record in $Quota:$Q. It is nil for $I30, whose
+	// entries carry a file reference there instead, and when the entry has
+	// none. It is filled by [File.ReadIndexRoot], [File.ReadIndexBlock] and
+	// [File.WalkIndex].
+	Data []byte
 
 	// Parsed data
 	FileName *FileName // Parsed file name (if available)

@@ -32,7 +32,7 @@ func buildNameBuffer(headerSize int, substitute, print string, flags uint32) []b
 func buildSymlinkData(substitute, print string, relative bool) []byte {
 	var flags uint32
 	if relative {
-		flags = symlinkFlagRelative
+		flags = SymlinkFlagRelative
 	}
 	return buildNameBuffer(12, substitute, print, flags)
 }
@@ -44,21 +44,21 @@ func buildMountPointData(substitute, print string) []byte {
 // buildReparseValue assembles a Microsoft-owned reparse buffer, which carries no
 // owner GUID.
 func buildReparseValue(tag uint32, data []byte) []byte {
-	buf := make([]byte, reparseHeaderSize+len(data))
+	buf := make([]byte, ReparseHeaderSize+len(data))
 	WriteUint32LE(buf, 0, tag)
 	WriteUint16LE(buf, 4, uint16(len(data)))
-	copy(buf[reparseHeaderSize:], data)
+	copy(buf[ReparseHeaderSize:], data)
 	return buf
 }
 
 // buildReparseGUIDValue assembles a third-party reparse buffer, whose data
 // follows a 16-byte owner GUID.
 func buildReparseGUIDValue(tag uint32, guid [16]byte, data []byte) []byte {
-	buf := make([]byte, reparseHeaderSize+reparseGUIDSize+len(data))
+	buf := make([]byte, ReparseHeaderSize+reparseGUIDSize+len(data))
 	WriteUint32LE(buf, 0, tag)
 	WriteUint16LE(buf, 4, uint16(len(data)))
-	copy(buf[reparseHeaderSize:], guid[:])
-	copy(buf[reparseHeaderSize+reparseGUIDSize:], data)
+	copy(buf[ReparseHeaderSize:], guid[:])
+	copy(buf[ReparseHeaderSize+reparseGUIDSize:], data)
 	return buf
 }
 
@@ -188,7 +188,7 @@ func TestParseReparsePointThirdParty(t *testing.T) {
 }
 
 func TestParseReparsePointThirdPartyRejectsMissingGUID(t *testing.T) {
-	buf := make([]byte, reparseHeaderSize+4)
+	buf := make([]byte, ReparseHeaderSize+4)
 	WriteUint32LE(buf, 0, 0x00000001)
 	WriteUint16LE(buf, 4, 4)
 

@@ -11,6 +11,7 @@ const (
 
 	// MFT constants
 	MFTEntryHeaderSize = 48   // Size of MFT entry header (without attributes)
+	RecordSize         = 1024 // MFT record size Windows and mkntfs format with
 	MinMFTEntrySize    = 512  // Minimum MFT entry size
 	MaxMFTEntrySize    = 4096 // Maximum MFT entry size
 
@@ -25,9 +26,18 @@ const (
 	IndexEntryHeaderSize = 16
 	IndexAllocationMagic = 0x58444E49 // "INDX"
 
+	// IndexBlockSize is the INDX block size Windows and mkntfs format with,
+	// whatever the cluster size.
+	IndexBlockSize = 4096
+
+	// IndexRecordHeaderSize is the INDX record header that precedes the node
+	// header: magic, update sequence offset and size, LSN, VCN.
+	IndexRecordHeaderSize = 24
+
 	// An INDX record carries a fixup array over 512-byte sectors, so it can
-	// never be smaller than one sector. The upper bound matches the largest
-	// cluster NTFS supports.
+	// never be smaller than one sector. Windows always writes 4 KiB index
+	// records whatever the cluster size; the upper bound allows for formatters
+	// that size them to a cluster of up to 64 KiB.
 	MinIndexRecordSize = 512   // Minimum $INDEX_ALLOCATION record size
 	MaxIndexRecordSize = 65536 // Maximum $INDEX_ALLOCATION record size
 
@@ -37,9 +47,9 @@ const (
 	NTFSTimePrecision = 100 // nanoseconds per NTFS time unit
 
 	// Cluster and sector limits
-	MaxClusterSize = 65536 // Maximum cluster size (64 KB)
-	MaxSectorSize  = 4096  // Maximum sector size (4 KB)
-	MinSectorSize  = 512   // Minimum sector size
+	MaxClusterSize = 2 << 20 // Maximum cluster size (2 MiB, Windows 10 1709 and later)
+	MaxSectorSize  = 4096    // Maximum sector size (4 KB)
+	MinSectorSize  = 512     // Minimum sector size
 
 	// Data run constants
 	MaxDataRunHeaderSize = 9 // Maximum size of data run header (1 + 8)

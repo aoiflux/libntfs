@@ -3,9 +3,9 @@ package libntfs
 import "fmt"
 
 const (
-	// reparseHeaderSize is the fixed header every reparse buffer starts with:
+	// ReparseHeaderSize is the fixed header every reparse buffer starts with:
 	// tag, data length, reserved.
-	reparseHeaderSize = 8
+	ReparseHeaderSize = 8
 
 	// reparseGUIDSize is the owner GUID that follows the header on third-party
 	// reparse points. Microsoft-owned tags omit it.
@@ -20,8 +20,8 @@ const (
 	// unusual writer without letting a corrupt size drive the allocation.
 	maxReparseValueBytes = 64 << 10
 
-	// symlinkFlagRelative marks a symbolic link whose target is relative.
-	symlinkFlagRelative = 0x00000001
+	// SymlinkFlagRelative marks a symbolic link whose target is relative.
+	SymlinkFlagRelative = 0x00000001
 
 	// lxSymlinkHeaderSize is the version field preceding a WSL symlink's UTF-8
 	// target path.
@@ -58,9 +58,9 @@ var reparseTagNames = map[uint32]string{
 // It needs no Volume, so it works on attribute bytes carved out of a standalone
 // $MFT.
 func ParseReparsePoint(buf []byte) (*ReparsePoint, error) {
-	if len(buf) < reparseHeaderSize {
+	if len(buf) < ReparseHeaderSize {
 		return nil, fmt.Errorf("%w: buffer is %d bytes, need %d for a header",
-			ErrInvalidReparsePoint, len(buf), reparseHeaderSize)
+			ErrInvalidReparsePoint, len(buf), ReparseHeaderSize)
 	}
 
 	reparse := &ReparsePoint{
@@ -69,15 +69,15 @@ func ParseReparsePoint(buf []byte) (*ReparsePoint, error) {
 		Reserved:    ReadUint16LE(buf, 6),
 	}
 
-	dataStart := reparseHeaderSize
+	dataStart := ReparseHeaderSize
 	if !reparse.IsMicrosoft() {
-		if len(buf) < reparseHeaderSize+reparseGUIDSize {
+		if len(buf) < ReparseHeaderSize+reparseGUIDSize {
 			return nil, fmt.Errorf(
 				"%w: third-party tag 0x%08X needs a %d byte GUID, only %d bytes remain",
 				ErrInvalidReparsePoint, reparse.ReparseType, reparseGUIDSize,
-				len(buf)-reparseHeaderSize)
+				len(buf)-ReparseHeaderSize)
 		}
-		copy(reparse.GUID[:], buf[reparseHeaderSize:reparseHeaderSize+reparseGUIDSize])
+		copy(reparse.GUID[:], buf[ReparseHeaderSize:ReparseHeaderSize+reparseGUIDSize])
 		dataStart += reparseGUIDSize
 	}
 
@@ -119,7 +119,7 @@ func (r *ReparsePoint) IsRelative() bool {
 	if r == nil || r.ReparseType != ReparsePointSymlink || len(r.Data) < 12 {
 		return false
 	}
-	return ReadUint32LE(r.Data, 8)&symlinkFlagRelative != 0
+	return ReadUint32LE(r.Data, 8)&SymlinkFlagRelative != 0
 }
 
 // Target returns the path a reparse point redirects to.
@@ -194,6 +194,80 @@ func utf16SliceString(buf []byte, offset, length int) (string, bool) {
 	}
 
 	return value, true
+}
+
+// maxReparseBufferSize is the largest reparse buffer Windows accepts
+// (MAXIMUM_REPARSE_DATA_BUFFER_SIZE), header included.
+const maxReparseBufferSize = 16 << 10
+
+// EncodeSymlinkReparse builds the $REPARSE_POINT value of a symbolic link, the
+// buffer [ParseReparsePoint] and [ReparsePoint.Target] decode.
+//
+// substitute is the target as the object manager resolves it (\??\C:\dir for
+// an absolute path); print is the form shown to a user. relative sets
+// SymlinkFlagRelative, which Windows sets when substitute is a path relative to
+// the link's directory. The path buffer holds the print name and then the
+// substitute name, neither NUL-terminated, which is the layout
+// CreateSymbolicLinkW writes.
+//
+// It returns an error wrapping ErrInvalidReparsePoint when the buffer would
+// exceed the 16 KiB Windows allows.
+func EncodeSymlinkReparse(substitute, print string, relative bool) ([]byte, error) {
+	sub, prn := utf16LE(substitute), utf16LE(print)
+	var flags uint32
+	if relative {
+		flags = SymlinkFlagRelative
+	}
+	buf, err := reparseHeader(ReparsePointSymlink, 12+len(prn)+len(sub))
+	if err != nil {
+		return nil, err
+	}
+	buf = appendUint16LE(buf, uint16(len(prn))) // SubstituteNameOffset
+	buf = appendUint16LE(buf, uint16(len(sub))) // SubstituteNameLength
+	buf = appendUint16LE(buf, 0)                // PrintNameOffset
+	buf = appendUint16LE(buf, uint16(len(prn))) // PrintNameLength
+	buf = appendUint32LE(buf, flags)
+	buf = append(buf, prn...)
+	return append(buf, sub...), nil
+}
+
+// EncodeMountPointReparse builds the $REPARSE_POINT value of a mount point (a
+// junction), the buffer [ParseReparsePoint] and [ReparsePoint.Target] decode.
+//
+// substitute is the NT path of the target (\??\C:\dir, or \??\Volume{guid}\
+// for a volume mount point); print is the form shown to a user. The path
+// buffer holds the substitute name and then the print name, each followed by a
+// NUL that the recorded lengths leave out, which is the layout mklink /J
+// writes.
+//
+// It returns an error wrapping ErrInvalidReparsePoint when the buffer would
+// exceed the 16 KiB Windows allows.
+func EncodeMountPointReparse(substitute, print string) ([]byte, error) {
+	sub, prn := utf16LE(substitute), utf16LE(print)
+	buf, err := reparseHeader(ReparsePointMountPoint, 8+len(sub)+2+len(prn)+2)
+	if err != nil {
+		return nil, err
+	}
+	buf = appendUint16LE(buf, 0)                  // SubstituteNameOffset
+	buf = appendUint16LE(buf, uint16(len(sub)))   // SubstituteNameLength
+	buf = appendUint16LE(buf, uint16(len(sub)+2)) // PrintNameOffset
+	buf = appendUint16LE(buf, uint16(len(prn)))   // PrintNameLength
+	buf = append(buf, sub...)
+	buf = append(buf, 0, 0)
+	buf = append(buf, prn...)
+	return append(buf, 0, 0), nil
+}
+
+// reparseHeader starts a Microsoft-tag reparse buffer of dataLen data bytes.
+func reparseHeader(tag uint32, dataLen int) ([]byte, error) {
+	if ReparseHeaderSize+dataLen > maxReparseBufferSize {
+		return nil, fmt.Errorf("%w: %d byte buffer exceeds the %d bytes Windows allows",
+			ErrInvalidReparsePoint, ReparseHeaderSize+dataLen, maxReparseBufferSize)
+	}
+	buf := make([]byte, 0, ReparseHeaderSize+dataLen)
+	buf = appendUint32LE(buf, tag)
+	buf = appendUint16LE(buf, uint16(dataLen))
+	return appendUint16LE(buf, 0), nil
 }
 
 // ReparsePoint returns the file's reparse point, or nil when it has none.

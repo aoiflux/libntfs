@@ -2,6 +2,7 @@ package libntfs
 
 import (
 	"fmt"
+	"math"
 	"unicode/utf8"
 )
 
@@ -140,7 +141,7 @@ func parseNonResidentAttribute(buf []byte, header *AttributeHeader) (*NonResiden
 
 	// Parse data runs
 	if int(nonRes.DataRunOffset) < len(buf) {
-		runs, err := parseDataRuns(buf[nonRes.DataRunOffset:])
+		runs, err := DecodeRunlist(buf[nonRes.DataRunOffset:])
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse data runs: %w", err)
 		}
@@ -150,8 +151,17 @@ func parseNonResidentAttribute(buf []byte, header *AttributeHeader) (*NonResiden
 	return nonRes, nil
 }
 
-// parseDataRuns parses a sequence of data runs.
-func parseDataRuns(buf []byte) ([]DataRun, error) {
+// DecodeRunlist decodes a runlist (the mapping pairs of a non-resident
+// attribute) into data runs.
+//
+// Each run's offset is a signed delta from the previous run's start, and
+// StartCluster is the resulting absolute LCN. A run with no offset field is
+// sparse. Decoding stops at the 0x00 terminator or the end of buf. A header
+// declaring a length field of zero or more than eight bytes, or a run that
+// extends past buf, is an error wrapping ErrInvalidDataRun.
+//
+// [EncodeRunlist] is the inverse.
+func DecodeRunlist(buf []byte) ([]DataRun, error) {
 	var runs []DataRun
 	offset := 0
 	prevCluster := int64(0)
@@ -237,6 +247,56 @@ func readVariableInt(buf []byte, size int, signed bool) int64 {
 	return val
 }
 
+// EncodeRunlist encodes data runs as a runlist, the inverse of [DecodeRunlist].
+//
+// StartCluster is read as an absolute LCN and stored as a delta from the
+// previous non-sparse run; a sparse run is stored with no offset field. Each
+// length and delta takes the fewest bytes that hold it as a signed
+// little-endian value, as Windows and mkntfs write them, so a length of 0x80
+// takes two bytes. A length above math.MaxInt64 takes eight. The list ends with
+// a 0x00 byte.
+func EncodeRunlist(runs []DataRun) []byte {
+	var out []byte
+	last := int64(0)
+	for _, run := range runs {
+		lengthBytes := 8
+		if run.LengthClusters <= math.MaxInt64 {
+			lengthBytes = runlistFieldWidth(int64(run.LengthClusters))
+		}
+		offsetBytes := 0
+		delta := run.StartCluster - last
+		if !run.IsSparse {
+			offsetBytes = runlistFieldWidth(delta)
+		}
+
+		out = append(out, byte(offsetBytes<<4|lengthBytes))
+		for i := range lengthBytes {
+			out = append(out, byte(run.LengthClusters>>(8*i)))
+		}
+		if !run.IsSparse {
+			for i := range offsetBytes {
+				out = append(out, byte(delta>>(8*i)))
+			}
+			last = run.StartCluster
+		}
+	}
+	return append(out, 0)
+}
+
+// runlistFieldWidth returns the fewest bytes that hold n as a signed
+// little-endian value.
+func runlistFieldWidth(n int64) int {
+	if n < 0 {
+		n = ^n
+	}
+	width := 1
+	for n >= 0x80 {
+		n >>= 8
+		width++
+	}
+	return width
+}
+
 // parseStandardInformationAttribute parses a $STANDARD_INFORMATION attribute.
 func parseStandardInformationAttribute(data []byte) (*StandardInformation, error) {
 	if len(data) < 48 {
@@ -266,8 +326,13 @@ func parseStandardInformationAttribute(data []byte) (*StandardInformation, error
 	return si, nil
 }
 
-// parseFileNameAttribute parses a $FILE_NAME attribute.
-func parseFileNameAttribute(data []byte) (*FileName, error) {
+// ParseFileName parses a $FILE_NAME attribute value, as stored in a resident
+// $FILE_NAME attribute and as the key of an $I30 index entry.
+//
+// data must hold the 66-byte fixed part and the name it declares; anything
+// after the name is ignored. Times are converted with [NTFSTimeToTime], so a
+// zero FILETIME is the zero time.Time.
+func ParseFileName(data []byte) (*FileName, error) {
 	if len(data) < 66 {
 		return nil, ErrInvalidAttribute
 	}
@@ -283,8 +348,8 @@ func parseFileNameAttribute(data []byte) (*FileName, error) {
 	fn.AccessTime, _ = r.ReadNTFSTime()
 	fn.AllocatedSize, _ = r.ReadUint64()
 	fn.RealSize, _ = r.ReadUint64()
-	fileAttrs, _ := r.ReadUint64()
-	fn.FileAttributes = fileAttrs
+	fn.FileAttributes, _ = r.ReadUint32()
+	fn.ReparseValue, _ = r.ReadUint32()
 	fn.NameLength, _ = r.ReadUint8()
 	fn.Namespace, _ = r.ReadUint8()
 
@@ -381,10 +446,11 @@ func parseIndexEntries(data []byte) ([]IndexEntry, error) {
 			if streamEnd <= int(entry.EntryLength) {
 				entry.Stream = make([]byte, entry.StreamLength)
 				copy(entry.Stream, data[offset+streamStart:offset+streamEnd])
+				entry.Key = entry.Stream
 
 				// Try to parse as FileName
 				if len(entry.Stream) >= 66 {
-					fn, err := parseFileNameAttribute(entry.Stream)
+					fn, err := ParseFileName(entry.Stream)
 					if err == nil {
 						entry.FileName = fn
 					}
@@ -429,7 +495,7 @@ func parseDeletedFileNameFromIndexSlack(data []byte, offset int) (*FileName, int
 		return nil, 0
 	}
 
-	fn, err := parseFileNameAttribute(data[streamStart:nameEnd])
+	fn, err := ParseFileName(data[streamStart:nameEnd])
 	if err != nil || fn.Name == "" {
 		return nil, 0
 	}
@@ -545,9 +611,10 @@ func parseIndexEntriesRecoverDeleted(data []byte, usedLen int) ([]IndexEntry, er
 			streamEnd := streamStart + int(entry.StreamLength)
 			entry.Stream = make([]byte, entry.StreamLength)
 			copy(entry.Stream, data[streamStart:streamEnd])
+			entry.Key = entry.Stream
 
 			if len(entry.Stream) >= 66 {
-				fn, err := parseFileNameAttribute(entry.Stream)
+				fn, err := ParseFileName(entry.Stream)
 				if err == nil {
 					entry.FileName = fn
 				}
