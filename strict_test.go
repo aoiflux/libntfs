@@ -3,6 +3,7 @@ package libntfs
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -281,5 +282,40 @@ func TestStrictOpenPathFailsOnPartialDirectory(t *testing.T) {
 	}
 	if _, err := openTestVolume(t, image, Options{}).OpenPath("/a.txt"); err != nil {
 		t.Fatalf("default OpenPath = %v", err)
+	}
+}
+
+// TestDirectoryFlagWin32BitOnly covers NTFS-R4: an index key carrying only the
+// Win32 FILE_ATTRIBUTE_DIRECTORY bit (0x10) is a directory to the tolerant
+// ReadDir, but strict mode wants the 0x10000000 bit Windows and ntfs-3g write
+// into a directory's $FILE_NAME, and rejects it.
+func TestDirectoryFlagWin32BitOnly(t *testing.T) {
+	parts := goodStrictParts(t)
+	parts.blocks[0] = testIndexBlock(t, strictBlockSize, 0, false,
+		testIndexEntry(30, 1, testFileNameKey(strictDir, "a.txt", FileAttrDirectory), noSubNode),
+		testIndexEnd(noSubNode))
+	parts.records[30] = buildTestMFTRecord(t, testRecordOpts{
+		flags: MFTFlagInUse | MFTFlagDirectory, sequenceNum: 1, name: "a.txt", namespace: NamespaceWin32,
+		parentRef: strictDir, parentSeq: 1,
+		extraAttrs: [][]byte{buildNamedResidentAttr(AttrTypeIndexRoot, 2, "$I30",
+			testIndexRoot(AttrTypeFileName, CollationFileName, strictBlockSize, false, testIndexEnd(noSubNode)))},
+	})
+	image := parts.image(t)
+
+	entries, err := listDir(t, openTestVolume(t, image, Options{}), strictDir)
+	if err != nil {
+		t.Fatalf("default ReadDir: %v", err)
+	}
+	if a := dirEntriesByName(entries)["a.txt"]; !a.IsDirectory {
+		t.Fatalf("default ReadDir: a.txt = %+v, want a directory", a)
+	}
+
+	_, err = listDir(t, openTestVolume(t, image, Options{Strict: true}), strictDir)
+	var se *StrictError
+	if !errors.As(err, &se) || se.Check != "directory-flag" {
+		t.Fatalf("strict ReadDir = %v, want check directory-flag", err)
+	}
+	if !strings.Contains(err.Error(), "lacks 0x10000000") {
+		t.Fatalf("strict error %q does not name the missing 0x10000000 bit", err)
 	}
 }

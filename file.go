@@ -98,6 +98,10 @@ func resolveDirEntryIsDirectory(idxEntry IndexEntry, resolveType dirTypeResolver
 // FileAttrDirectory bit clear, so the former is what an index entry actually
 // carries. The Win32 bit is accepted as well, since tools that synthesise NTFS
 // structures from a Win32 view do set it, and accepting both costs nothing.
+//
+// Strict mode is deliberately narrower: its directory-flag check (see
+// verifyDirEntry) requires FileAttrDupFileNameIndexPresent, so a key with only
+// the Win32 bit lists as a directory here and fails under Options.Strict.
 func isDirectoryFileAttributes(attributes uint32) bool {
 	const directoryBits = uint32(FileAttrDupFileNameIndexPresent) | uint32(FileAttrDirectory)
 	return attributes&directoryBits != 0
@@ -694,6 +698,11 @@ func (f *File) ReadAll() ([]byte, error) {
 // ReadDir reads the directory entries.
 // Only valid for directories.
 //
+// Entries recovered from index slack, and every entry of an INDX block that is
+// not live, come back with Deleted set. A block is live, as NTFS has it, when
+// the B-tree reaches it from $INDEX_ROOT and $BITMAP:$I30 marks it in use; see
+// readIndexAllocation for how a damaged tree falls back to the bitmap.
+//
 // On a damaged volume ReadDir returns the entries it could parse together with
 // a *PartialDirError, so both return values can be non-nil. A caller walking a
 // whole volume can then record the loss and descend into what survived instead
@@ -800,11 +809,20 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 // readIndexAllocation merges the entries of the $INDEX_ALLOCATION attribute
 // into acc.
 //
-// Block i of the allocation sits at i*indexRecordSize and is in use when bit i
-// of $BITMAP:$I30 is set. The entries of a block whose bit is clear are merged
-// as Deleted: the directory released the block, so its names are history. A
-// directory with no $BITMAP:$I30 at all is damaged; every block is then read as
-// in use, which is what ReadDir did before it consulted the bitmap.
+// Block i of the allocation sits at i*indexRecordSize. As in NTFS, a block is
+// live when the B-tree reaches it from $INDEX_ROOT through sub-node VCNs and
+// bit i of $BITMAP:$I30 is set. Every block is still scanned in physical
+// order, and the entries of a block that is not live are merged as Deleted:
+// either the directory released it (its bit is clear) or a merge left it
+// behind with its bit set but nothing pointing at it. Its names are history,
+// kept for recovery. A directory with no $BITMAP:$I30 at all is damaged;
+// reachability alone then decides.
+//
+// The walk is tolerant. When it cannot read part of the tree -- an unreadable
+// block, a cycle, a reachable block free in the bitmap -- a block it did not
+// reach may sit below the damage, so such a block falls back to its bitmap
+// bit alone (live when set, or when there is no $BITMAP), as before the walk
+// was consulted. Strict mode reports all of these as faults instead.
 //
 // It returns the number of index records it had to skip. A skipped record is
 // not fatal on its own -- a directory whose INDX blocks are partly damaged
@@ -838,9 +856,13 @@ func (f *File) readIndexAllocation(attr *NonResidentAttribute, indexRecordSize i
 		return 0, err
 	}
 
+	// The walk parses copies, so it runs before the scan below applies each
+	// block's update sequence in place.
+	reached, complete := f.reachableIndexBlocks("$I30", data, indexRecordSize)
+
 	var skipped int
 	for offset, block := 0, 0; offset+indexRecordSize <= len(data); offset, block = offset+indexRecordSize, block+1 {
-		inUse := bitmap == nil || bitmapBit(bitmap, block)
+		inUse := (bitmap == nil || bitmapBit(bitmap, block)) && (reached[block] || !complete)
 
 		idxEntries, err := parseIndexRecord(data[offset : offset+indexRecordSize])
 		if err != nil {

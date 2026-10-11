@@ -1,6 +1,10 @@
 package libntfs
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"testing"
+)
 
 // The boot sector's sectors-per-cluster byte is a count up to 0x80 and, above
 // that, a negative power of two: 0xF8 is 2^8 sectors and 0xF4 is 2^12. NTFS
@@ -106,6 +110,46 @@ func TestReadDirOnLargeClusters(t *testing.T) {
 	for _, name := range []string{"a.txt", "m.txt", "z.txt"} {
 		if e, ok := byName[name]; !ok || e.Deleted {
 			t.Fatalf("%s = %+v (present %v), want live", name, e, ok)
+		}
+	}
+}
+
+// TestOpenRejectsClusterSizeOverflow covers NTFS-R1: a sector size times a
+// large negative-shift sector count reaches 2^32, which wrapped the uint32
+// cluster size to 0 and divided the volume size by it.
+func TestOpenRejectsClusterSizeOverflow(t *testing.T) {
+	cases := []struct {
+		bytesPerSector uint16
+		spc            uint8
+	}{
+		{512, 0xEB},  // 2^21 sectors, 1 GiB clusters
+		{2048, 0xEB}, // 2^32 bytes, wraps to 0
+		{4096, 0xEC}, // 2^32 bytes, wraps to 0
+		{4096, 0xEB}, // 2^33 bytes, wraps to 0
+		{4096, 0xF4}, // 16 MiB, past MaxClusterSize
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%d/%#x", tc.bytesPerSector, tc.spc), func(t *testing.T) {
+			image := buildTestNTFSImageAt(t, nil)
+			WriteUint16LE(image, 11, tc.bytesPerSector)
+			image[13] = tc.spc
+			_, err := Open(&mockReaderAt{data: image})
+			if !errors.Is(err, ErrInvalidBootSector) {
+				t.Fatalf("Open = %v, want ErrInvalidBootSector", err)
+			}
+		})
+	}
+}
+
+// TestOpenRejectsBadSectorSize: a sector is a power of two from 256 to 4096
+// bytes.
+func TestOpenRejectsBadSectorSize(t *testing.T) {
+	for _, size := range []uint16{0, 128, 1000, 3072, 8192} {
+		image := buildTestNTFSImageAt(t, nil)
+		WriteUint16LE(image, 11, size)
+		image[13] = 1
+		if _, err := Open(&mockReaderAt{data: image}); !errors.Is(err, ErrInvalidBootSector) {
+			t.Errorf("BytesPerSector %d: Open = %v, want ErrInvalidBootSector", size, err)
 		}
 	}
 }

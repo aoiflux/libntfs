@@ -679,3 +679,30 @@ func FuzzParseIndexNode(f *testing.F) {
 		}
 	})
 }
+
+// FuzzParseBootSector feeds parseBootSector arbitrary sector-zero bytes. The
+// seeds include the sector size and sectors-per-cluster pairs whose product
+// reaches 2^32 and once wrapped the cluster size to 0 (NTFS-R1).
+func FuzzParseBootSector(f *testing.F) {
+	f.Add(buildTestBootSector(512, 8, 1<<20, 4))
+	f.Add(buildTestBootSector(512, 0xF4, 1<<20, 1))
+	for _, seed := range []struct {
+		bytesPerSector uint16
+		spc            uint8
+	}{{512, 0xEB}, {2048, 0xEB}, {4096, 0xEC}, {4096, 0xEB}, {4096, 0xF4}} {
+		f.Add(buildTestBootSector(seed.bytesPerSector, seed.spc, 1<<20, 4))
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		boot := make([]byte, BootSectorSize)
+		copy(boot, data)
+		v := &Volume{reader: &mockReaderAt{data: boot}}
+		if err := v.parseBootSector(); err != nil {
+			return
+		}
+		if v.bytesPerCluster == 0 || v.bytesPerCluster > MaxClusterSize ||
+			v.bytesPerCluster != v.bytesPerSector*v.sectorsPerCluster {
+			t.Fatalf("accepted cluster size %d (%d x %d)", v.bytesPerCluster, v.bytesPerSector, v.sectorsPerCluster)
+		}
+	})
+}

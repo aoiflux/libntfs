@@ -121,10 +121,12 @@ func splitIndexDirectoryImage(t testing.TB) []byte {
 		return buildFileNameAttrValue(dirEntry, 1, name, namespace, 4096, 1024, 0x20)
 	}
 
-	// $INDEX_ROOT: the 8.3 names, at positions 0 and 1.
-	root := buildIndexRootValue(indexRecordSize,
+	// $INDEX_ROOT: the 8.3 names, at positions 0 and 1, and an end entry
+	// pointing at the INDX block, which is what makes the block's names live.
+	root := testIndexRoot(AttrTypeFileName, CollationFileName, indexRecordSize, true,
 		buildIndexEntry(30, 1, fileName("AAAAAA~1.TXT", NamespaceDOS)),
 		buildIndexEntry(31, 1, fileName("BBBBBB~1.TXT", NamespaceDOS)),
+		testIndexEnd(0),
 	)
 
 	// $INDEX_ALLOCATION: the matching long names, in reverse order so the
@@ -182,6 +184,9 @@ func TestReadDirMergesNamesSplitAcrossRootAndAllocation(t *testing.T) {
 			t.Fatalf("entry %d listed twice: %q and %q", entry.EntryNum, existing, entry.Name)
 		}
 		byRef[entry.EntryNum] = entry.Name
+		if entry.Deleted {
+			t.Errorf("entry %d %q is Deleted, want live", entry.EntryNum, entry.Name)
+		}
 	}
 
 	want := map[uint64]string{
@@ -343,10 +348,11 @@ func corruptSubtreeImage(t testing.TB) []byte {
 		extraAttrs:  [][]byte{buildNamedResidentAttr(AttrTypeIndexRoot, 2, "$I30", rootIndex)},
 	})
 
-	// "partial": one name in $INDEX_ROOT, and an INDX block that will be
-	// corrupted below.
-	partialIndex := buildIndexRootValue(indexRecordSize,
+	// "partial": one name in $INDEX_ROOT, and an INDX block, reached from
+	// the root's end entry, that will be corrupted below.
+	partialIndex := testIndexRoot(AttrTypeFileName, CollationFileName, indexRecordSize, true,
 		buildIndexEntry(9, 1, buildFileNameAttrValue(6, 1, "survivor.txt", NamespaceWin32, 4096, 1024, 0x20)),
+		testIndexEnd(0),
 	)
 	partial := buildTestMFTRecord(t, testRecordOpts{
 		flags:       MFTFlagInUse | MFTFlagDirectory,

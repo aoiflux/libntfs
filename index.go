@@ -356,6 +356,7 @@ type indexWalker struct {
 	blockSize int
 	collate   func(a, b []byte) int // nil when the collation is not checked
 
+	data      []byte // the whole $INDEX_ALLOCATION, already read; nil reads each block from disk
 	visited   map[int64]bool
 	prev      []byte
 	havePrev  bool
@@ -370,6 +371,12 @@ func (f *File) walkIndex(name string, strict bool, fn func(e IndexEntry, depth i
 		return ErrVolumeClosed
 	}
 	w := &indexWalker{f: f, name: name, strict: strict, fn: fn, visited: make(map[int64]bool)}
+	return w.run()
+}
+
+// run walks the whole index from its root.
+func (w *indexWalker) run() error {
+	f, name, strict := w.f, w.name, w.strict
 
 	root, err := f.ReadIndexRoot(name)
 	if err != nil {
@@ -476,7 +483,7 @@ func (w *indexWalker) descend(vcn int64, depth int) error {
 		return w.fault("bitmap-clear", vcn, 0, fmt.Errorf("%w: reachable block is free in $BITMAP", ErrCorruptIndex), false)
 	}
 
-	block, err := w.f.readIndexBlock(w.alloc, w.root.AttributeType, w.blockSize, vcn)
+	block, err := w.readBlock(vcn, offset)
 	if err != nil {
 		return w.fault("block", vcn, 0, err, false)
 	}
@@ -484,6 +491,45 @@ func (w *indexWalker) descend(vcn int64, depth int) error {
 		return w.fault("vcn", vcn, 0, fmt.Errorf("%w: block at VCN %d records VCN %d", ErrCorruptIndex, vcn, block.VCN), false)
 	}
 	return w.walkNode(block.Entries, block.IsNode, depth, vcn)
+}
+
+// readBlock reads and parses the block at vcn, which sits at offset in the
+// allocation: from w.data when the caller has already read the allocation,
+// and from disk otherwise.
+func (w *indexWalker) readBlock(vcn, offset int64) (*IndexBlock, error) {
+	if w.data == nil {
+		return w.f.readIndexBlock(w.alloc, w.root.AttributeType, w.blockSize, vcn)
+	}
+	if offset > int64(len(w.data)-w.blockSize) {
+		return nil, fmt.Errorf("%w: VCN %d is past the end of the %d byte allocation",
+			ErrCorruptIndex, vcn, len(w.data))
+	}
+	return parseIndexBlock(bytes.Clone(w.data[offset:offset+int64(w.blockSize)]), w.root.AttributeType)
+}
+
+// reachableIndexBlocks walks the index named name tolerantly over data, its
+// $INDEX_ALLOCATION as already read, and returns the numbers of the blocks the
+// B-tree's sub-node pointers reach, block i being the one at byte offset i
+// times blockSize. A block the tree points at counts as reached even when it
+// is unreadable or free in $BITMAP.
+//
+// complete is false when the walk could not cover the whole tree -- an
+// unreadable root, an unreadable or free block, a cycle -- since a block it
+// did not reach may then sit below the damage rather than outside the tree.
+func (f *File) reachableIndexBlocks(name string, data []byte, blockSize int) (reached map[int]bool, complete bool) {
+	w := &indexWalker{
+		f: f, name: name, data: data, visited: make(map[int64]bool),
+		fn: func(IndexEntry, int, int64) error { return nil },
+	}
+	err := w.run()
+	reached = make(map[int]bool, len(w.visited))
+	for vcn := range w.visited {
+		offset, oerr := f.volume.indexBlockOffset(vcn, blockSize)
+		if oerr == nil && offset%int64(blockSize) == 0 && offset/int64(blockSize) <= math.MaxInt32 {
+			reached[int(offset/int64(blockSize))] = true
+		}
+	}
+	return reached, err == nil
 }
 
 // checkBitmapCoverage checks that the blocks $BITMAP marks in use are exactly

@@ -1,6 +1,10 @@
 package libntfs
 
-import "testing"
+import (
+	"errors"
+	"slices"
+	"testing"
+)
 
 // Builders for multi-level indexes: a node $INDEX_ROOT, INDX blocks that are
 // themselves nodes, $BITMAP attributes, and arbitrary keys, so the tests can
@@ -298,5 +302,78 @@ func TestReadDirReadsAllocatedIndexBlocksLive(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("got %d entries, want 2: %+v", len(entries), entries)
+	}
+}
+
+// orphanBlockParts is goodStrictParts with a third block that the bitmap
+// marks in use but no entry of the tree points at: what NTFS can leave behind
+// after merging two nodes.
+func orphanBlockParts(t testing.TB) *strictParts {
+	parts := goodStrictParts(t)
+	parts.blocks = append(parts.blocks, testIndexBlock(t, strictBlockSize, 2, false,
+		testIndexEntry(34, 1, strictKey("orphan.txt"), noSubNode),
+		testIndexEnd(noSubNode)))
+	parts.bitmap = []byte{0x07}
+	return parts
+}
+
+// TestReadDirMarksUnreachableIndexBlocksDeleted covers NTFS-R3: a block is
+// live only when the B-tree reaches it and $BITMAP marks it in use, so the
+// names in an orphaned block are Deleted even though its bit is set.
+func TestReadDirMarksUnreachableIndexBlocksDeleted(t *testing.T) {
+	image := orphanBlockParts(t).image(t)
+
+	entries, err := listDir(t, openTestVolume(t, image, Options{}), strictDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if got := liveNames(entries); !slices.Equal(got, strictGoodNames) {
+		t.Fatalf("live names = %q, want %q", got, strictGoodNames)
+	}
+	if e, ok := dirEntriesByName(entries)["orphan.txt"]; !ok || !e.Deleted {
+		t.Fatalf("orphan.txt = %+v (present %v), want Deleted", e, ok)
+	}
+
+	_, err = listDir(t, openTestVolume(t, image, Options{Strict: true}), strictDir)
+	var se *StrictError
+	if !errors.As(err, &se) || se.Check != "bitmap-unreachable" {
+		t.Fatalf("strict ReadDir = %v, want check bitmap-unreachable", err)
+	}
+}
+
+// TestReadDirWithoutBitmapUsesReachability: with no $BITMAP, reachability
+// alone decides.
+func TestReadDirWithoutBitmapUsesReachability(t *testing.T) {
+	parts := orphanBlockParts(t)
+	parts.bitmap = nil
+
+	entries, err := listDir(t, openTestVolume(t, parts.image(t), Options{}), strictDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if got := liveNames(entries); !slices.Equal(got, strictGoodNames) {
+		t.Fatalf("live names = %q, want %q", got, strictGoodNames)
+	}
+	if e, ok := dirEntriesByName(entries)["orphan.txt"]; !ok || !e.Deleted {
+		t.Fatalf("orphan.txt = %+v (present %v), want Deleted", e, ok)
+	}
+}
+
+// TestReadDirFallsBackToBitmapOnBrokenTree: when the walk cannot read part of
+// the tree, a block it did not reach may sit below the damage, so it is
+// judged by its bit alone rather than called Deleted.
+func TestReadDirFallsBackToBitmapOnBrokenTree(t *testing.T) {
+	parts := orphanBlockParts(t)
+	parts.blocks[0] = testIndexBlock(t, strictBlockSize, 0, false,
+		testIndexEntry(30, 1, strictKey("a.txt"), noSubNode),
+		testIndexEnd(noSubNode))
+	WriteUint16LE(parts.blocks[0], UpdateSequenceStride-2, 0xFFFF)
+
+	entries, err := listDir(t, openTestVolume(t, parts.image(t), Options{}), strictDir)
+	if !isPartialDirError(err) {
+		t.Fatalf("ReadDir = %v, want a *PartialDirError", err)
+	}
+	if got, want := liveNames(entries), []string{"b.txt", "c.txt", "d.txt", "orphan.txt"}; !slices.Equal(got, want) {
+		t.Fatalf("live names = %q, want %q", got, want)
 	}
 }

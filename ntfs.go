@@ -229,7 +229,7 @@ package libntfs
 // It is maintained by hand and is only as accurate as the last person to bump
 // it; nothing here can check it against the git tag. It is recorded on
 // [NTFSReport] so a document can say what produced it.
-const Version = "v0.3.4"
+const Version = "v0.3.5"
 
 // ReportSchemaVersion is the schema [NTFSReport] documents are written against,
 // and the value of their SchemaVersion field.

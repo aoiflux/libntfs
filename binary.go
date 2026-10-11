@@ -246,6 +246,9 @@ func FiletimeToTime(v uint64) time.Time {
 // Sub-100ns precision is truncated. A time before 1601-01-01 clamps to 0 and
 // one past the end of the uint64 range clamps to math.MaxUint64.
 func TimeToFiletime(t time.Time) uint64 {
+	if t.Unix() > math.MaxInt64-filetimeEpochSeconds {
+		return math.MaxUint64
+	}
 	seconds := t.Unix() + filetimeEpochSeconds
 	if seconds < 0 {
 		return 0

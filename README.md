@@ -353,8 +353,14 @@ Attribute-level:
 - (*Attribute).ReadSupport() FileReadSupport
 
 `ReadDir` returns both allocated and recoverable deleted names. Use
-`DirEntry.Deleted` to distinguish deleted entries. Names still sitting in an INDX
-block that the directory's `$BITMAP:$I30` marks free come back `Deleted` too.
+`DirEntry.Deleted` to distinguish deleted entries. An INDX block is live, as
+NTFS has it, only when the B-tree reaches it from `$INDEX_ROOT` and the
+directory's `$BITMAP:$I30` marks it in use (with no `$BITMAP`, reachability
+alone decides). Names still sitting in a block that is not live -- one the
+bitmap marks free, or one a merge left with its bit set but nothing pointing at
+it -- come back `Deleted` too. When part of the tree cannot be read, a block the
+walk did not reach may sit below the damage, so it is judged by its bitmap bit
+alone.
 
 A `DirEntry`'s times, sizes and attributes come from the copy of `$FILE_NAME` the
 directory index keeps, which NTFS updates only when the name changes, so they can
@@ -411,7 +417,10 @@ index and the INDX block VCN, and matching `ErrStrictViolation`:
   partial listing is an error rather than a `*PartialDirError`.
 - `ReadDir` checks each live entry against its record: in use, matching sequence
   number, a `$FILE_NAME` with the same parent and name, and the record's directory
-  flag, `$I30` index and the entry's directory attribute in agreement.
+  flag, `$I30` index and the entry's directory attribute in agreement. The
+  directory attribute is `0x10000000` (`FileAttrDupFileNameIndexPresent`), which
+  Windows and ntfs-3g write; a key with only the Win32 `0x10` bit lists as a
+  directory by default but fails this check.
 - `(*Volume).Open` checks that every non-resident `$DATA`'s runs cover exactly its
   allocated size, with the real size inside it.
 

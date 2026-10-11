@@ -331,3 +331,135 @@ func TestVerifyReparseIndex(t *testing.T) {
 		})
 	}
 }
+
+// TestWalkIndexDepthTwo walks a three-level $I30: the root points at block 0,
+// itself a node over blocks 2 and 3, and at leaf block 1. Every sub-node comes
+// out before the entry that points at it, with its own depth and VCN.
+func TestWalkIndexDepthTwo(t *testing.T) {
+	parts := goodStrictParts(t)
+	parts.rootEntries = [][]byte{
+		testIndexEntry(36, 1, strictKey("m.txt"), 0),
+		testIndexEnd(1),
+	}
+	parts.blocks = [][]byte{
+		testIndexBlock(t, strictBlockSize, 0, true,
+			testIndexEntry(32, 1, strictKey("c.txt"), 2),
+			testIndexEnd(3)),
+		testIndexBlock(t, strictBlockSize, 1, false,
+			testIndexEntry(37, 1, strictKey("x.txt"), noSubNode),
+			testIndexEntry(38, 1, strictKey("z.txt"), noSubNode),
+			testIndexEnd(noSubNode)),
+		testIndexBlock(t, strictBlockSize, 2, false,
+			testIndexEntry(30, 1, strictKey("a.txt"), noSubNode),
+			testIndexEntry(31, 1, strictKey("b.txt"), noSubNode),
+			testIndexEnd(noSubNode)),
+		testIndexBlock(t, strictBlockSize, 3, false,
+			testIndexEntry(33, 1, strictKey("d.txt"), noSubNode),
+			testIndexEnd(noSubNode)),
+	}
+	parts.bitmap = []byte{0x0F}
+	image := parts.image(t)
+
+	want := []walked{
+		{"a.txt", 2, 2}, {"b.txt", 2, 2}, {"c.txt", 1, 0}, {"d.txt", 2, 3},
+		{"m.txt", 0, -1}, {"x.txt", 1, 1}, {"z.txt", 1, 1},
+	}
+	for _, opts := range []Options{{}, {Strict: true}} {
+		dir, err := openTestVolume(t, image, opts).Open(strictDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := walkNames(t, dir, "$I30")
+		if err != nil {
+			t.Fatalf("WalkIndex (strict %v): %v", opts.Strict, err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("WalkIndex (strict %v) = %+v, want %+v", opts.Strict, got, want)
+		}
+	}
+}
+
+// TestWalkIndexSkipsFreedBlock: a block whose bit is clear and which no entry
+// points at is history, so the walk never visits it, in either mode.
+func TestWalkIndexSkipsFreedBlock(t *testing.T) {
+	parts := goodStrictParts(t)
+	parts.blocks = append(parts.blocks, testIndexBlock(t, strictBlockSize, 2, false,
+		testIndexEntry(34, 1, strictKey("freed.txt"), noSubNode),
+		testIndexEnd(noSubNode)))
+	parts.bitmap = []byte{0x03}
+	image := parts.image(t)
+
+	want := []walked{{"a.txt", 1, 0}, {"b.txt", 0, -1}, {"c.txt", 1, 1}, {"d.txt", 1, 1}}
+	for _, opts := range []Options{{}, {Strict: true}} {
+		dir, err := openTestVolume(t, image, opts).Open(strictDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := walkNames(t, dir, "$I30")
+		if err != nil {
+			t.Fatalf("WalkIndex (strict %v): %v", opts.Strict, err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("WalkIndex (strict %v) = %+v, want %+v", opts.Strict, got, want)
+		}
+	}
+}
+
+// TestWalkIndexReparseView walks a two-level $R, which collates by ULONGS
+// (the tag, then each half of the file reference), and gets back the raw
+// 12-byte keys in that order.
+func TestWalkIndexReparseView(t *testing.T) {
+	const (
+		reparseEntry = 6
+		blockSize    = 4096
+		cluster      = 8
+	)
+	keys := [][]byte{
+		reparseKey(ReparsePointMountPoint, 41),
+		reparseKey(ReparsePointSymlink, 40),
+		reparseKey(ReparsePointSymlink, 45),
+	}
+	root := testIndexRoot(0, CollationULongs, blockSize, true,
+		testViewIndexEntry(keys[1], nil, 0),
+		testIndexEnd(1))
+	left := testIndexBlock(t, blockSize, 0, false,
+		testViewIndexEntry(keys[0], nil, noSubNode),
+		testIndexEnd(noSubNode))
+	right := testIndexBlock(t, blockSize, 1, false,
+		testViewIndexEntry(keys[2], nil, noSubNode),
+		testIndexEnd(noSubNode))
+	record := buildTestMFTRecord(t, testRecordOpts{
+		flags: MFTFlagInUse | MFTFlagViewIndex, sequenceNum: 1, name: "$Reparse", namespace: NamespaceWin32,
+		extraAttrs: [][]byte{
+			buildNamedResidentAttr(AttrTypeIndexRoot, 2, "$R", root),
+			testNamedIndexAllocationAttr(t, 3, "$R", cluster, 2, blockSize),
+			testBitmapAttr(4, "$R", 0x03),
+		},
+	})
+	image := testImageWithBlocks(t, map[uint64][]byte{reparseEntry: record},
+		map[int][]byte{cluster: left, cluster + 1: right})
+
+	for _, opts := range []Options{{}, {Strict: true}} {
+		f, err := openTestVolume(t, image, opts).Open(reparseEntry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got [][]byte
+		var depths []int
+		err = f.WalkIndex("$R", func(e IndexEntry, depth int, _ int64) error {
+			if e.FileName != nil {
+				t.Errorf("$R entry carries a FileName: %+v", e.FileName)
+			}
+			got = append(got, e.Key)
+			depths = append(depths, depth)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("WalkIndex($R) (strict %v): %v", opts.Strict, err)
+		}
+		if !slices.EqualFunc(got, keys, bytes.Equal) || !slices.Equal(depths, []int{1, 0, 1}) {
+			t.Fatalf("WalkIndex($R) (strict %v) = keys %x depths %v, want keys %x depths [1 0 1]",
+				opts.Strict, got, depths, keys)
+		}
+	}
+}

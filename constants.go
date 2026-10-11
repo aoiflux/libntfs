@@ -51,6 +51,10 @@ const (
 	MaxSectorSize  = 4096    // Maximum sector size (4 KB)
 	MinSectorSize  = 512     // Minimum sector size
 
+	// minBootSectorSize is the smallest sector size the boot sector may
+	// declare. NTFS defines 256-byte sectors although no disk uses them.
+	minBootSectorSize = 256
+
 	// Data run constants
 	MaxDataRunHeaderSize = 9 // Maximum size of data run header (1 + 8)
 

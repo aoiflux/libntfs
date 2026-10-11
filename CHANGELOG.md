@@ -2,6 +2,55 @@
 
 All notable changes to libntfs are recorded here. Versions follow the git tags.
 
+## v0.3.5
+
+Follow-up fixes to v0.3.4.
+
+### Fixed
+
+- **NTFS-R1.** `Open` panicked with an integer divide by zero on some boot
+  sectors: a 4096-byte sector with a sectors-per-cluster byte of 0xEC or 0xEB,
+  or a 2048-byte sector with 0xEB. The cluster size was multiplied in 32 bits,
+  so it wrapped to 0 at 2^32 before the volume size was divided by it. It is
+  now computed in 64 bits and rejected with `ErrInvalidBootSector` when it is 0
+  or above `MaxClusterSize`, before anything uses it. A sector size that is not
+  a power of two from 256 to 4096 is rejected too.
+- **NTFS-R2.** `TimeToFiletime` returned 0 instead of clamping to
+  `math.MaxUint64` for a Unix time within 11644473600 seconds of
+  `math.MaxInt64`, where adding the 1601 epoch offset overflowed.
+
+### Changed
+
+- **NTFS-R3.** `ReadDir` now decides whether an INDX block is live the way NTFS
+  does: the B-tree must reach it from `$INDEX_ROOT` through sub-node VCNs, and
+  `$BITMAP:$I30` must mark it in use. The entries of a block whose bit is set
+  but which no node points at, as a merge can leave behind, now come back
+  `Deleted`; they used to be listed as live, and only strict mode reported the
+  block (`bitmap-unreachable`). Blocks are still scanned in physical order, so
+  their names stay available for recovery. With no `$BITMAP`, reachability
+  alone decides, so a directory whose root reaches no INDX block now lists that
+  block's names as `Deleted` rather than live. When the walk cannot read part
+  of the tree, a block it did not reach is judged by its bitmap bit alone, as
+  before.
+- **NTFS-R4.** The tolerant `ReadDir` takes either `0x10` or `0x10000000` in an
+  index key as marking a directory, while strict mode's `directory-flag` check
+  takes only `0x10000000` (`FileAttrDupFileNameIndexPresent`), which Windows and
+  ntfs-3g write in a directory's `$FILE_NAME`. The difference is deliberate; it
+  is now documented on both, and the strict error says `directory $FILE_NAME
+  lacks 0x10000000`.
+
+### Tests
+
+- **NTFS-T1.** `WalkIndex` is now tested over a depth-2 tree (collation order,
+  sub-nodes before their parent entry, depth and VCN of each entry), over a
+  freed block that nothing reaches (skipped), and over a two-level `$R` view
+  index in ULONGS order (raw 12-byte keys).
+- Tests for R1 to R4, and the fuzz target `FuzzParseBootSector`.
+- The fixtures behind `TestReadDirMergesNamesSplitAcrossRootAndAllocation`,
+  `TestReadDirReportsPartialOnCorruptIndexRecord` and
+  `TestRecursiveWalkSurvivesCorruptSubtree` had a leaf `$INDEX_ROOT` that never
+  pointed at their INDX block; their roots now point at it.
+
 ## v0.3.4
 
 This release readies libntfs to be the reader behind fsagen, which generates

@@ -37,6 +37,12 @@ func (f *File) verifyDirectory() error {
 }
 
 // verifyDirEntry checks one live $I30 entry against the record it names.
+//
+// The directory-flag check takes only FileAttrDupFileNameIndexPresent
+// (0x10000000) in the entry's key as marking a directory, since that is the bit
+// Windows and ntfs-3g write into a directory's $FILE_NAME. The tolerant
+// isDirectoryFileAttributes also accepts the Win32 FileAttrDirectory bit
+// (0x10); a key carrying only that bit lists as a directory but fails here.
 func (f *File) verifyDirEntry(e IndexEntry, vcn int64) error {
 	fail := func(check string, format string, args ...any) error {
 		return &StrictError{
@@ -74,6 +80,10 @@ func (f *File) verifyDirEntry(e IndexEntry, vcn int64) error {
 	isDir := target.Flags&MFTFlagDirectory != 0
 	hasI30 := target.FindAttribute(AttrTypeIndexRoot, "$I30") != nil
 	keyDir := key.FileAttributes&FileAttrDupFileNameIndexPresent != 0
+	if isDir && hasI30 && !keyDir {
+		return fail("directory-flag", "directory $FILE_NAME lacks 0x10000000 (FileAttrDupFileNameIndexPresent), attributes 0x%08X",
+			key.FileAttributes)
+	}
 	if isDir != hasI30 || isDir != keyDir {
 		return fail("directory-flag", "record directory flag %v, $I30 present %v, entry directory attribute %v",
 			isDir, hasI30, keyDir)

@@ -431,7 +431,9 @@ func (v *Volume) parseBootSector() error {
 		return fmt.Errorf("%w: invalid end marker 0x%X", ErrInvalidBootSector, bs.EndMarker)
 	}
 
-	if bs.BytesPerSector == 0 || bs.BytesPerSector > MaxSectorSize {
+	// NTFS sectors are a power of two from 256 to 4096 bytes.
+	if bs.BytesPerSector < minBootSectorSize || bs.BytesPerSector > MaxSectorSize ||
+		bs.BytesPerSector&(bs.BytesPerSector-1) != 0 {
 		return fmt.Errorf("%w: invalid sector size %d", ErrInvalidBootSector, bs.BytesPerSector)
 	}
 
@@ -440,11 +442,19 @@ func (v *Volume) parseBootSector() error {
 		return fmt.Errorf("%w: invalid sectors per cluster %d", ErrInvalidBootSector, bs.SectorsPerCluster)
 	}
 
+	// The product is taken in 64 bits: a 4 KiB sector times 2^20 sectors is
+	// 2^32, which a uint32 wraps to 0 and the volume size is divided by below.
+	bytesPerCluster := uint64(bs.BytesPerSector) * uint64(sectorsPerCluster)
+	if bytesPerCluster == 0 || bytesPerCluster > MaxClusterSize {
+		return fmt.Errorf("%w: invalid cluster size %d (%d bytes per sector, sectors per cluster byte 0x%02X)",
+			ErrInvalidBootSector, bytesPerCluster, bs.BytesPerSector, bs.SectorsPerCluster)
+	}
+
 	// Calculate derived values
 	v.bootSector = bs
 	v.bytesPerSector = uint32(bs.BytesPerSector)
 	v.sectorsPerCluster = sectorsPerCluster
-	v.bytesPerCluster = v.bytesPerSector * v.sectorsPerCluster
+	v.bytesPerCluster = uint32(bytesPerCluster)
 	v.mftCluster = bs.MFTCluster
 	v.volumeSize = bs.TotalSectors * uint64(bs.BytesPerSector)
 	v.clusterCount = v.volumeSize / uint64(v.bytesPerCluster)
@@ -487,10 +497,6 @@ func (v *Volume) parseBootSector() error {
 			ErrInvalidBootSector, v.indexRecordSize, bs.ClustersPerIndexRecord)
 	}
 
-	if v.bytesPerCluster > MaxClusterSize {
-		return fmt.Errorf("%w: invalid cluster size %d", ErrInvalidBootSector, v.bytesPerCluster)
-	}
-
 	return nil
 }
 
@@ -500,7 +506,8 @@ func (v *Volume) parseBootSector() error {
 // exponent: the count is 2^(256-b), so 0xF8 is 256 sectors and 0xF4 is 4096.
 // That encoding is how Windows formats clusters larger than 64 KiB. A shift too
 // large to describe a cluster NTFS supports is rejected here; the resulting
-// cluster size is checked against MaxClusterSize by the caller.
+// cluster size, which can still reach 2^33 bytes, is checked against
+// MaxClusterSize by the caller in 64-bit arithmetic.
 func decodeSectorsPerCluster(b uint8) (uint32, bool) {
 	switch {
 	case b == 0:

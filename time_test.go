@@ -64,3 +64,14 @@ func TestFiletimeZeroAndClamp(t *testing.T) {
 		t.Fatalf("TimeToFiletime(FiletimeToTime(MaxUint64)) = %#x", got)
 	}
 }
+
+// TestTimeToFiletimeClampsUnixOverflow covers NTFS-R2: adding the 1601 epoch
+// offset to a Unix time near MaxInt64 overflowed to a negative number, which
+// clamped to 0 instead of MaxUint64.
+func TestTimeToFiletimeClampsUnixOverflow(t *testing.T) {
+	for _, sec := range []int64{math.MaxInt64 - 5, math.MaxInt64 - filetimeEpochSeconds + 1} {
+		if got := TimeToFiletime(time.Unix(sec, 0)); got != math.MaxUint64 {
+			t.Errorf("TimeToFiletime(time.Unix(%d, 0)) = %#x, want MaxUint64", sec, got)
+		}
+	}
+}
