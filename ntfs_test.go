@@ -467,7 +467,7 @@ func TestFileReadAtCompressedNonResident(t *testing.T) {
 	attr := &Attribute{
 		Header: AttributeHeader{Flags: AttrFlagCompressed},
 		NonResident: &NonResidentAttribute{
-			CompressionUnit: 2,
+			CompressionUnit: 1,
 			RealSize:        3,
 			DataRuns: []DataRun{
 				{LengthClusters: 1, StartCluster: 1, IsSparse: false},

@@ -201,10 +201,10 @@ func (v *Volume) readCompressedData(attr *NonResidentAttribute, offset int64, ou
 		return 0, fmt.Errorf("missing non-resident attribute")
 	}
 
-	compUnitClusters := int(attr.CompressionUnit)
-	if compUnitClusters <= 0 {
+	if attr.CompressionUnit == 0 || attr.CompressionUnit > 16 {
 		return 0, ErrCompressedData
 	}
+	compUnitClusters := 1 << attr.CompressionUnit
 
 	unitSizeBytes := int64(compUnitClusters) * int64(v.bytesPerCluster)
 	if unitSizeBytes <= 0 {
