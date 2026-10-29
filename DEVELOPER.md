@@ -4,7 +4,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/libntfs
+git clone https://github.com/aoiflux/libntfs
 cd libntfs
 
 # Run tests

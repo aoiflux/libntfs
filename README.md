@@ -145,7 +145,8 @@ Implemented:
   reported offset includes
 - Capability introspection, separating what NTFS cannot record from what this
   volume happens not to have
-- NTFS boot sector parsing and validation, for clusters from 512 bytes to 2 MiB
+- NTFS boot sector parsing and validation, for sectors from 256 to 4096 bytes
+  and clusters up to 2 MiB
 - MFT parsing with cache-backed entry lookup, and a `$MFT` run list checked
   against the volume so a damaged one cannot report more records than the disk
   holds
@@ -159,8 +160,9 @@ Implemented:
 - Data run parsing and sparse run handling
 - File and directory access by MFT entry and path
 - Directory index parsing ($INDEX_ROOT and $INDEX_ALLOCATION), honouring
-  $BITMAP:$I30
-- Deleted directory entry recovery from index slack and from freed INDX blocks
+  B-tree reachability and $BITMAP:$I30
+- Deleted directory entry recovery from index slack and from freed or
+  unreachable INDX blocks
   (flagged via DirEntry.Deleted)
 - Node-by-node access to any index B-tree: $I30 and the view indexes ($R, $SII,
   $SDH, $O, $Q)
@@ -222,7 +224,7 @@ Volume-level:
 - (*Volume).IsReadOnly() bool
 - (*Volume).IsWritable() bool
 - (*Volume).Open(entryNum uint64) (*File, error)
-- (*Volume).OpenPath(path string) (*File, error)
+- (*Volume).OpenPath(filePath string) (*File, error)
 - (*Volume).GetRootDirectory() (*File, error)
 - (*Volume).IsStrict() bool
 - (*Volume).UpCase() (UpCase, error)
@@ -250,7 +252,7 @@ Path- and walk-level:
 File-level:
 
 - (*File).Read(p []byte) (int, error)
-- (*File).ReadAt(p []byte, off int64) (int, error)
+- (*File).ReadAt(p []byte, offset int64) (int, error)
 - (*File).ReadAll() ([]byte, error)
 - (*File).ReadDir() ([]DirEntry, error)
 - (*File).ReadSupport() FileReadSupport
@@ -293,9 +295,9 @@ Identity-level:
 Write-level (requires a volume opened writable):
 
 - (*File).Write(p []byte) (int, error)
-- (*File).WriteAt(p []byte, off int64) (int, error)
-- (*Volume).WriteAt(p []byte, off int64) (int, error)
-- (*Volume).WriteDataRuns(runs []DataRun, off int64, p []byte) (int, error)
+- (*File).WriteAt(p []byte, offset int64) (int, error)
+- (*Volume).WriteAt(p []byte, offset int64) (int, error)
+- (*Volume).WriteDataRuns(runs []DataRun, offset int64, buf []byte) (int, error)
 
 Stream-level:
 
@@ -357,7 +359,7 @@ Security-level:
 - ParseSecurityDescriptor(buf []byte) (*SecurityDescriptor, error)
 - (*File).SecurityDescriptor() (*SecurityDescriptor, error)
 - (*Volume).SecurityDescriptorByID(securityID uint32) (*SecurityDescriptor, error)
-- (*Volume).EachSecurityDescriptor(fn func(uint32, *SecurityDescriptor) error) error
+- (*Volume).EachSecurityDescriptor(fn func(securityID uint32, sd *SecurityDescriptor) error) error
 
 Attribute-level:
 
@@ -430,13 +432,15 @@ index and the INDX block VCN, and matching `ErrStrictViolation`:
   number, a `$FILE_NAME` with the same parent and name, and the record's directory
   flag, `$I30` index and the entry's directory attribute in agreement. The
   directory attribute is `0x10000000` (`FileAttrDupFileNameIndexPresent`), which
-  Windows and ntfs-3g write; a key with only the Win32 `0x10` bit lists as a
-  directory by default but fails this check.
+  Windows and ntfs-3g write. A key with only the Win32 `0x10` bit lists as a
+  directory by default but fails this check, whether the record it names is a
+  directory or a file.
 - `(*Volume).Open` checks that every non-resident `$DATA`'s runs cover exactly its
   allocated size, with the real size inside it.
 - `OpenWithOptions` checks that the `$MFT`'s own run list lies inside the volume
-  (check `mft-runs`). By default the record count is capped instead and
-  `(*Volume).MFTDataRunsError` reports it.
+  (check `mft-runs`). By default the volume opens anyway and
+  `(*Volume).MFTDataRunsError` reports it; `MFTEntryCount` never exceeds what
+  the volume could hold.
 - Reading a compressed stream requires compression unit 4
   (`StandardCompressionUnit`), as the Linux driver does (check
   `compression-unit`). `ReadSupport` and `Streams` report the same verdict.
@@ -460,8 +464,10 @@ Neither path changes a file's length, and a resident value cannot grow, since
 that would mean resizing the attribute and shifting every attribute after it in
 the record.
 
-Use `(*Attribute).ReadSupport()` for alternate or named `$DATA` streams when you
-are inspecting attributes directly.
+For alternate or named `$DATA` streams, use `Streams()` or
+`OpenStream(name)` and its `ReadSupport()`. `(*Attribute).ReadSupport()` reports
+only what the attribute can say for itself: it does not apply the
+compression-unit, strict-mode or WOF verdicts, which need the volume.
 
 ## Paths, Walks, and Reports
 
@@ -1104,6 +1110,8 @@ volume without asking.
 - examples/usnjrnl: USN change journal timeline from a volume or an extracted $J
 - examples/logdump: $LogFile transaction log from a volume or an extracted
   $LogFile, with operation filtering, LSN sorting, and transaction grouping
+- examples/report: JSON report of the volume's files, optionally limited to
+  the first N
 
 Run one example:
 
@@ -1137,8 +1145,11 @@ go test -run '^$' -fuzz FuzzParseDataRuns -fuzztime 60s
 ```
 
 Twenty-seven targets cover every parser fed image bytes; `go test -list 'Fuzz.*' .`
-lists them. CI runs a 20-second smoke pass of each on every change and ten
-minutes per target nightly, carrying the generated corpus between runs.
+lists them. CI replays every seed and every committed crasher under
+`testdata/fuzz` as ordinary subtests on each push, on Linux, Windows and macOS.
+The Fuzz workflow (`.github/workflows/fuzz.yml`) fuzzes every target, 10 minutes
+each by default, when run by hand, and carries the generated corpus between
+runs.
 
 The directory-listing path is covered end to end, since a panic anywhere along
 it ends a whole-volume walk: `FuzzParseMFTRecord` and

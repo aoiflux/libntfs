@@ -722,8 +722,15 @@ func (a *Attribute) IsSparse() bool {
 	return a.Header.Flags&AttrFlagSparse != 0
 }
 
-// ReadSupport reports whether this attribute's content is readable by libntfs.
-// It is intended primarily for $DATA streams, including named streams.
+// ReadSupport reports whether this attribute's content is readable by libntfs,
+// as far as the attribute can say for itself: resident or not, sparse,
+// compressed, encrypted. It is intended primarily for $DATA streams, including
+// named streams.
+//
+// It cannot apply the verdicts that need the volume: a compression unit the
+// volume cannot decode or that Options.Strict refuses, and Windows Overlay
+// Filter compression. [File.ReadSupport] and [File.Streams] apply them, so
+// prefer those, or OpenStream(name).ReadSupport() for a named stream.
 func (a *Attribute) ReadSupport() FileReadSupport {
 	support := FileReadSupport{}
 	if a == nil {

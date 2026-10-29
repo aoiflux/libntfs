@@ -123,8 +123,8 @@
 //
 // The MFT — [Volume.GetMFTEntry], [Volume.EachMFTEntry], [Volume.MFTEntryCount],
 // and [ParseMFTRecord] for a standalone $MFT extracted with KAPE or FTK Imager.
-// [Volume.MFTDataRunsError] says when a damaged $MFT run list made
-// MFTEntryCount a ceiling rather than the figure on disk.
+// [Volume.MFTDataRunsError] reports a $MFT run list that does not lie inside
+// the volume; MFTEntryCount never exceeds what the volume could hold.
 // [MFTEntry.FileNames] returns every hard link's $FILE_NAME.
 //
 // Indexes — [File.ReadIndexRoot], [File.ReadIndexBlock], [File.IndexBitmap]

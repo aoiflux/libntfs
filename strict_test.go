@@ -319,3 +319,28 @@ func TestDirectoryFlagWin32BitOnly(t *testing.T) {
 		t.Fatalf("strict error %q does not name the missing 0x10000000 bit", err)
 	}
 }
+
+// TestDirectoryFlagWin32BitOnFileRecord is the other half: a key that carries
+// only the Win32 0x10 bit lists as a directory by default, so strict mode has
+// to refuse it when the record it names is a plain file.
+func TestDirectoryFlagWin32BitOnFileRecord(t *testing.T) {
+	parts := goodStrictParts(t)
+	parts.blocks[0] = testIndexBlock(t, strictBlockSize, 0, false,
+		testIndexEntry(30, 1, testFileNameKey(strictDir, "a.txt", FileAttrDirectory), noSubNode),
+		testIndexEnd(noSubNode))
+	image := parts.image(t)
+
+	entries, err := listDir(t, openTestVolume(t, image, Options{}), strictDir)
+	if err != nil {
+		t.Fatalf("default ReadDir: %v", err)
+	}
+	if a := dirEntriesByName(entries)["a.txt"]; !a.IsDirectory {
+		t.Fatalf("default ReadDir: a.txt = %+v, want it listed as a directory", a)
+	}
+
+	_, err = listDir(t, openTestVolume(t, image, Options{Strict: true}), strictDir)
+	var se *StrictError
+	if !errors.As(err, &se) || se.Check != "directory-flag" || se.Entry != 30 {
+		t.Fatalf("strict ReadDir = %v, want check directory-flag on entry 30", err)
+	}
+}

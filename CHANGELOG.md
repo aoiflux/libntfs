@@ -28,8 +28,9 @@ records than the disk holds.
   records than the volume holds, or wrap to a small count and hide the table.
   The arithmetic is now checked, and the count is capped at volume bytes over
   record size. The run list is checked against the volume during `Open`; when
-  it fails, the volume still opens, and the new `(*Volume).MFTDataRunsError`
-  returns an error matching the new `ErrInvalidMFTRuns`. The cumulative run
+  it does not lie inside the volume, the volume still opens and the new
+  `(*Volume).MFTDataRunsError` returns an error matching the new
+  `ErrInvalidMFTRuns`. The cumulative run
   index that every MFT lookup uses saturates rather than wraps.
 - A boot sector whose total sectors times bytes per sector overflows 64 bits
   is rejected with `ErrInvalidBootSector` instead of wrapping to a tiny
@@ -38,14 +39,18 @@ records than the disk holds.
 ### Changed
 
 - `Options.Strict` adds two checks, both failing with a `*StrictError` like
-  every other strict check: `mft-runs`, where `Open` refuses a volume whose
-  `$MFT` run list lies outside it, and `compression-unit`, where reading a
-  compressed stream refuses any compression unit but 4, as the Linux driver
-  does.
+  every other strict check: `mft-runs`, where `OpenWithOptions` refuses a
+  volume whose `$MFT` run list lies outside it, and `compression-unit`, where
+  reading a compressed stream refuses any compression unit but 4, as the Linux
+  driver does.
+- The strict `directory-flag` check also refuses an index key that carries
+  only the Win32 `0x10` bit when the record it names is a file. Default
+  `ReadDir` lists such an entry as a directory, so strict mode used to let a
+  file listed as a directory through.
 - `ReadSupport` and `Streams` now report a compressed stream unreadable when
   `ReadAt` would refuse its compression unit, with that error as
   `BlockingError`. They used to call it readable.
-- The `Streams` entries of an `NTFSReport` carry `wof_compressed`. Adding a
+- The `Streams` entries of an `NTFSReport` carry `support.wof_compressed`. Adding a
   field leaves `ReportSchemaVersion` at 1.
 
 ### Added
@@ -62,11 +67,21 @@ records than the disk holds.
   `MaxCompressionBufferSize` keep their values (16 and 65536) and are now
   derived from it.
 
+### Documented
+
+- `(*Attribute).ReadSupport` reports only what the attribute can say for
+  itself; `(*File).ReadSupport` and `Streams` also apply the compression-unit,
+  strict-mode and WOF verdicts.
+- The README's account of CI fuzzing now matches the workflows, and the
+  minimum sector size is given as 256 bytes, which the boot-sector check
+  accepts.
+
 ### Tests
 
 - Compression-unit decoding over a full and a short final unit, out-of-range
   units, the strict check, and agreement between `ReadAt`, `ReadSupport` and
   `Streams`.
+- Strict `directory-flag` on a file record whose key carries only `0x10`.
 - WOF detection, the read error, listing, the readable `WofCompressedData`
   stream, damaged reparse data, and unaffected symlinks and plain files.
 - `$MFT` run-list bounds: the capped and overflowing counts, walks over a

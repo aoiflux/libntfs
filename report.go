@@ -124,7 +124,7 @@ type NTFSTimestamps struct {
 // sturdier than the path string. Errors from individual MFT entries are silently
 // skipped so a partial result is always returned.
 //
-// It reads nothing but the volume and writes nothing to it. Use [ReportContext]
+// It reads nothing but the volume and writes nothing to it. Use [Volume.ReportContext]
 // to cancel a report over a large volume.
 func (v *Volume) Report() (*NTFSReport, error) {
 	return v.ReportContext(context.Background())

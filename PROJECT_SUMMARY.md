@@ -24,13 +24,13 @@ Implemented:
 - Data run parsing with sparse run support
 - Path-based and entry-based open operations
 - Directory index parsing ($INDEX_ROOT and $INDEX_ALLOCATION), honouring
-  $BITMAP:$I30
+  B-tree reachability and $BITMAP:$I30
 - Index B-tree access for $I30 and view indexes, with $UpCase collation
 - LZNT1-compressed stream decoding
 - $MFT run list checked against the volume; record count capped when damaged
 - Opt-in strict mode (Options.Strict) and $Reparse:$R verification
 - Pure codecs: fixups, runlists, FILETIME, reparse buffers, $UpCase
-- Clusters from 512 bytes to 2 MiB
+- Sectors from 256 to 4096 bytes, clusters up to 2 MiB
 - Update sequence (fixup) validation
 - File name namespace handling (DOS, Win32, WinDOS, POSIX)
 - Typed error model with context wrappers (including path traversal context)
@@ -92,38 +92,24 @@ errors.As.
 
 ```text
 libntfs/
-|- README.md
-|- PROJECT_SUMMARY.md
-|- DEVELOPER.md
-|- go.mod
-|- ntfs.go
-|- types.go
-|- constants.go
-|- errors.go
-|- binary.go
-|- volume.go
-|- mft.go
-|- attributes.go
-|- file.go
-|- ntfs_test.go
-|- examples/
-|  |- basic/
-|  |- traverse/
-|  |- extract/
-|  \- windows_drive/
-\- cppcode/
+|- README.md, CHANGELOG.md, PROJECT_SUMMARY.md, DEVELOPER.md
+|- go.mod                 (no dependencies, no go.sum)
+|- *.go                   (one file per area; see Architecture Snapshot)
+|- *_test.go              (unit tests, fuzz targets, benchmarks)
+|- testdata/              (fuzz corpus, report golden file, corpus builder)
+|- examples/              (13 example programs; see README)
+\- .github/workflows/     (ci.yml, fuzz.yml)
 ```
 
 ## Examples Included
 
-- basic: open a volume/image, print volume metadata, list root directory
-- traverse: recursively walk a directory subtree with summary stats
-- extract: copy a file from NTFS to a local output path
-- windows_drive: Windows-specific raw-drive workflow
+The README's Examples section lists all 13: basic, traverse, extract,
+windows_drive, bench, finfo, attrinfo, overwrite, mftdump, streams, usnjrnl,
+logdump and report.
 
 ## Validation and Quality
 
-- Unit tests and benchmarks in ntfs_test.go
+- Unit tests, fuzz targets and benchmarks in the *_test.go files
 - Continuous local checks expected via:
   - go test ./...
   - go vet ./...

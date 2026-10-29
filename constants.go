@@ -49,7 +49,7 @@ const (
 	// Cluster and sector limits
 	MaxClusterSize = 2 << 20 // Maximum cluster size (2 MiB, Windows 10 1709 and later)
 	MaxSectorSize  = 4096    // Maximum sector size (4 KB)
-	MinSectorSize  = 512     // Minimum sector size
+	MinSectorSize  = 512     // Smallest sector size disks use; the boot sector may declare 256
 
 	// minBootSectorSize is the smallest sector size the boot sector may
 	// declare. NTFS defines 256-byte sectors although no disk uses them.

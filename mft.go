@@ -81,8 +81,8 @@ func (v *Volume) cacheMFTEntry(entryNum uint64, entry *MFTEntry) {
 //
 // The count is capped at the records the volume itself could hold, that is
 // volume bytes over record size, so a damaged $MFT run list cannot report an
-// MFT larger than the disk. [Volume.MFTDataRunsError] reports when that cap
-// applied.
+// MFT larger than the disk. [Volume.MFTDataRunsError] reports a run list that
+// does not lie inside the volume.
 //
 // It returns an error only when the volume is closed or its MFT is not
 // initialized; otherwise it always succeeds.
@@ -103,10 +103,12 @@ func (v *Volume) MFTEntryCount() (uint64, error) {
 // to cause.
 //
 // nil means the run list checked out against the volume's cluster count. A
-// non-nil error matches [ErrInvalidMFTRuns] and means [Volume.MFTEntryCount]
-// was capped at volume bytes over record size: the volume is still readable,
-// and the records it really holds are still reachable, but the count is the
-// library's ceiling rather than the figure on disk. A volume opened with
+// non-nil error matches [ErrInvalidMFTRuns]: a run reaches past the last
+// cluster, or the runs total more clusters than the volume has. The volume is
+// still readable and the records it really holds are still reachable, but the
+// run list is not to be trusted. [Volume.MFTEntryCount] is at most volume bytes
+// over record size whether or not this is set, so on such a volume it may be
+// that ceiling rather than the figure on disk. A volume opened with
 // Options.Strict fails to open in this case instead, with a [*StrictError]
 // (check "mft-runs"), so this is always nil there.
 func (v *Volume) MFTDataRunsError() error {

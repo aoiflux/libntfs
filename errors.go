@@ -51,16 +51,19 @@ var (
 	// describe a region inside the volume: a run reaches past the last cluster,
 	// or the run lengths total more clusters than the volume has.
 	//
-	// The default, tolerant reader caps the record count at volume bytes over
-	// record size and reports this from [Volume.MFTDataRunsError], so a damaged
-	// volume stays readable. Options.Strict refuses to open it instead, with a
+	// The default, tolerant reader opens such a volume, reports this from
+	// [Volume.MFTDataRunsError], and never counts more records than volume
+	// bytes over record size, so a damaged volume stays readable. Options.Strict refuses to open it instead, with a
 	// [*StrictError] (check "mft-runs", record 0) wrapping this.
 	//
 	// It wraps ErrInvalidDataRun, so a caller already matching that keeps
 	// matching.
 	ErrInvalidMFTRuns = fmt.Errorf("%w: invalid $MFT data runs", ErrInvalidDataRun)
 
-	// ErrCompressedData indicates data is compressed (not yet supported).
+	// ErrCompressedData indicates compressed data libntfs cannot decode or
+	// write here: a compressed metadata attribute, a write to a compressed
+	// stream, or, through [ErrInvalidCompressionUnit], a compression unit it
+	// refuses. LZNT1-compressed $DATA streams are decoded.
 	ErrCompressedData = errors.New("compressed data not supported")
 
 	// ErrInvalidCompressionUnit indicates a compressed non-resident attribute's
@@ -82,10 +85,10 @@ var (
 	// Filter, which Windows calls CompactOS, whose content libntfs cannot
 	// produce from this volume.
 	//
-	// The unnamed $DATA stream of such a file is sparse and holds nothing; the
+	// The unnamed $DATA stream of such a file holds none of its content; the
 	// content is compressed in the WofCompressedData named stream, which
 	// [File.OpenStream] still reaches. Reading the unnamed stream returns this
-	// rather than the zeros that stream really contains, and
+	// rather than the zeros or stub that stream really contains, and
 	// [File.ReadSupport] reports Readable false with this as its
 	// BlockingError.
 	ErrWOFCompressed = errors.New("WOF-compressed content is not in the unnamed $DATA stream")

@@ -4,8 +4,9 @@ import "runtime"
 
 // Tunables for concurrent work.
 //
-// These are the defaults [WalkConfig.normalize] applies; a caller who needs
-// different behaviour sets the field rather than editing these.
+// These are the defaults and limits a [WalkConfig] is normalised against before
+// a walk starts; a caller who needs different behaviour sets the field rather
+// than editing these.
 const (
 	// WorkersSequential runs the walk on the calling goroutine with no workers
 	// at all. It is the zero value's meaning and what every concurrent path here

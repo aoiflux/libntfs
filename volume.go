@@ -32,9 +32,9 @@ type Volume struct {
 
 	// mftRunsErr records that the $MFT's own $DATA run list does not describe a
 	// region inside this volume. It is set once during Open, like readOnly and
-	// strict, and read without a lock. The record count is capped when it is
-	// set, so a damaged volume stays readable; MFTDataRunsError is how a caller
-	// learns the count was capped.
+	// strict, and read without a lock. A damaged volume stays readable, with a
+	// record count that never exceeds what the volume could hold;
+	// MFTDataRunsError is how a caller learns the run list was bad.
 	mftRunsErr error
 
 	// Caching and synchronization
@@ -167,8 +167,8 @@ type Options struct {
 	//   - [Volume.Open] checks that the runs of every non-resident $DATA cover
 	//     exactly its allocated size, and that its real size fits inside it.
 	//   - [OpenWithOptions] checks that the $MFT's own run list lies inside the
-	//     volume (check "mft-runs"), where the tolerant reader caps the record
-	//     count and reports [Volume.MFTDataRunsError].
+	//     volume (check "mft-runs"), where the tolerant reader opens the volume
+	//     and reports [Volume.MFTDataRunsError].
 	//   - Reading a compressed stream, and [File.ReadSupport] and
 	//     [File.Streams] describing one, require the compression unit
 	//     [StandardCompressionUnit] (check "compression-unit"), as the Linux

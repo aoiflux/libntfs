@@ -48,7 +48,7 @@ type FileReadSupport struct {
 	Encrypted   bool `json:"encrypted"`
 
 	// WOFCompressed marks the unnamed $DATA stream of a file compacted by the
-	// Windows Overlay Filter. That stream is sparse and holds nothing: the
+	// Windows Overlay Filter. That stream holds none of the file's content: the
 	// content is compressed in the WofCompressedData stream, so the stream this
 	// describes is not the file's content and reading it would yield zeros.
 	WOFCompressed bool `json:"wof_compressed"`
@@ -117,8 +117,10 @@ func resolveDirEntryIsDirectory(idxEntry IndexEntry, resolveType dirTypeResolver
 // structures from a Win32 view do set it, and accepting both costs nothing.
 //
 // Strict mode is deliberately narrower: its directory-flag check (see
-// verifyDirEntry) requires FileAttrDupFileNameIndexPresent, so a key with only
-// the Win32 bit lists as a directory here and fails under Options.Strict.
+// verifyDirEntry) requires FileAttrDupFileNameIndexPresent on an entry naming a
+// directory, and rejects a directory bit on an entry naming a file, so a key
+// with only the Win32 bit lists as a directory here and fails under
+// Options.Strict.
 func isDirectoryFileAttributes(attributes uint32) bool {
 	const directoryBits = uint32(FileAttrDupFileNameIndexPresent) | uint32(FileAttrDirectory)
 	return attributes&directoryBits != 0
@@ -689,7 +691,7 @@ func (f *File) ReadAt(p []byte, offset int64) (int, error) {
 		return 0, io.EOF
 	}
 
-	// A WOF-compacted file's unnamed $DATA is sparse and holds nothing, so
+	// A WOF-compacted file's unnamed $DATA holds none of its content, so
 	// every branch below would read zeros and report them as content. This is
 	// checked before them all, and ahead of the resident branch too, since a
 	// compacted file can carry a resident stub.
