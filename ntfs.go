@@ -123,6 +123,8 @@
 //
 // The MFT — [Volume.GetMFTEntry], [Volume.EachMFTEntry], [Volume.MFTEntryCount],
 // and [ParseMFTRecord] for a standalone $MFT extracted with KAPE or FTK Imager.
+// [Volume.MFTDataRunsError] says when a damaged $MFT run list made
+// MFTEntryCount a ceiling rather than the figure on disk.
 // [MFTEntry.FileNames] returns every hard link's $FILE_NAME.
 //
 // Indexes — [File.ReadIndexRoot], [File.ReadIndexBlock], [File.IndexBitmap]
@@ -149,7 +151,8 @@
 // extracted from an image by another tool: [ParseMFTRecord], [ParseUSNRecord],
 // [EachUSNRecord], [ParseLogRestartPage], [ParseLogRecord], [EachLogRecord],
 // [ParseSecurityDescriptor], [ParseExtendedAttributes], [ParseReparsePoint],
-// [ParseLinuxAttributes], [ParseLinuxExtendedAttributes], and [ParseFileName].
+// [ParseLinuxAttributes], [ParseLinuxExtendedAttributes], [ParseWOFExternalInfo],
+// and [ParseFileName].
 //
 // A few pure codecs run in both directions, for tools that generate images and
 // check them with this reader: [ApplyFixup] and [ProtectFixup],
@@ -196,7 +199,10 @@
 // # What this library does not do
 //
 // Encrypted file content is detected, not decrypted: a read returns
-// [ErrEncryptedData]. The transaction log is read, not replayed — records are
+// [ErrEncryptedData]. Windows Overlay Filter (CompactOS) content is detected,
+// not decoded: a read of the unnamed stream returns [ErrWOFCompressed], and
+// the compressed bytes stay readable through the WofCompressedData stream.
+// The transaction log is read, not replayed — records are
 // decoded and handed over, but reconstructing file content from redo data and
 // undoing to a consistent state are out of scope. Nothing here mounts, repairs,
 // or allocates: write support is in-place overwrites of the same length and
@@ -229,7 +235,7 @@ package libntfs
 // It is maintained by hand and is only as accurate as the last person to bump
 // it; nothing here can check it against the git tag. It is recorded on
 // [NTFSReport] so a document can say what produced it.
-const Version = "v0.3.5"
+const Version = "v0.3.6"
 
 // ReportSchemaVersion is the schema [NTFSReport] documents are written against,
 // and the value of their SchemaVersion field.

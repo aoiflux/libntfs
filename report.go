@@ -211,7 +211,7 @@ func (v *Volume) describeEntry(entryNum uint64, meta pathMeta, idx *pathIndex, e
 		ParentSequence:  meta.parentSeq,
 		IsDeleted:       !entry.IsInUse(),
 		HardLinkCount:   entry.HardLinkCount,
-		Streams:         streamsFromEntry(entry),
+		Streams:         v.streamsFromEntry(entryNum, entry, v.resolveWOF(entry)),
 	}
 
 	// A record with no readable $STANDARD_INFORMATION still belongs in the

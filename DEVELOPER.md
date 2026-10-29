@@ -74,9 +74,19 @@ go build
 
 9. **Strict mode** (`strict.go`)
    - Checks run only when `Options.Strict` is set, plus `VerifyReparseIndex`
-   - Every failure is a `*StrictError` naming record, index and VCN
+   - Every failure is a `*StrictError` naming record, index and VCN, including
+     the `$MFT` run-list check in `volume.go` and the compression-unit check in
+     `compression.go`
 
-10. **Writes** (`write.go`)
+10. **Compression** (`compression.go`, `wof.go`)
+   - LZNT1 decoding per compression unit; the unit field is a log2 shift,
+     bounded before it is taken
+   - `compressionUnitError` is the one verdict `ReadAt`, `ReadSupport` and
+     `Streams` share
+   - WOF (CompactOS) is detected from the reparse point and blocks the unnamed
+     stream only; `WofCompressedData` stays readable
+
+11. **Writes** (`write.go`)
    - The only file that can modify a volume
    - Every entry point passes through `checkWritable`, so read-only mode and a
      non-writable handle are refused in one place

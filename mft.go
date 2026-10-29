@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"sort"
 )
 
@@ -77,6 +79,11 @@ func (v *Volume) cacheMFTEntry(entryNum uint64, entry *MFTEntry) {
 // per-entry errors to skip rather than a reason to stop. Entry numbers at or
 // above count are out of range.
 //
+// The count is capped at the records the volume itself could hold, that is
+// volume bytes over record size, so a damaged $MFT run list cannot report an
+// MFT larger than the disk. [Volume.MFTDataRunsError] reports when that cap
+// applied.
+//
 // It returns an error only when the volume is closed or its MFT is not
 // initialized; otherwise it always succeeds.
 func (v *Volume) MFTEntryCount() (uint64, error) {
@@ -89,6 +96,21 @@ func (v *Volume) MFTEntryCount() (uint64, error) {
 	}
 
 	return v.maxMFTEntries(), nil
+}
+
+// MFTDataRunsError reports that the $MFT's own $DATA run list does not describe
+// a region inside this volume, which one flipped byte in the run list is enough
+// to cause.
+//
+// nil means the run list checked out against the volume's cluster count. A
+// non-nil error matches [ErrInvalidMFTRuns] and means [Volume.MFTEntryCount]
+// was capped at volume bytes over record size: the volume is still readable,
+// and the records it really holds are still reachable, but the count is the
+// library's ceiling rather than the figure on disk. A volume opened with
+// Options.Strict fails to open in this case instead, with a [*StrictError]
+// (check "mft-runs"), so this is always nil there.
+func (v *Volume) MFTDataRunsError() error {
+	return v.mftRunsErr
 }
 
 // EachMFTEntry calls fn for every parsable MFT record on the volume, in entry
@@ -161,11 +183,23 @@ func buildRunEnds(runs []DataRun, bytesPerCluster uint32) []uint64 {
 		return nil
 	}
 
+	// Every MFT lookup consults this index, so a cumulative that wrapped would
+	// alias a huge entry number onto a small, valid offset and read the wrong
+	// record. It saturates instead: a lookup past the real table then fails to
+	// find a run rather than finding the wrong one.
 	runEnds := make([]uint64, len(runs))
 	var cumulative uint64
 	for i, run := range runs {
-		runBytes := run.LengthClusters * uint64(bytesPerCluster)
-		cumulative += runBytes
+		hi, runBytes := bits.Mul64(run.LengthClusters, uint64(bytesPerCluster))
+		sum, carry := bits.Add64(cumulative, runBytes, 0)
+		if hi != 0 || carry != 0 {
+			for ; i < len(runs); i++ {
+				runEnds[i] = math.MaxUint64
+			}
+			return runEnds
+		}
+
+		cumulative = sum
 		runEnds[i] = cumulative
 	}
 

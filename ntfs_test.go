@@ -467,7 +467,7 @@ func TestFileReadAtCompressedNonResident(t *testing.T) {
 	attr := &Attribute{
 		Header: AttributeHeader{Flags: AttrFlagCompressed},
 		NonResident: &NonResidentAttribute{
-			CompressionUnit: 1,
+			CompressionUnit: 1, // log2: 1<<1 = 2 clusters per unit
 			RealSize:        3,
 			DataRuns: []DataRun{
 				{LengthClusters: 1, StartCluster: 1, IsSparse: false},
@@ -558,9 +558,10 @@ func TestFileReadSupport(t *testing.T) {
 
 	t.Run("compressed non-resident readable", func(t *testing.T) {
 		f := &File{
+			volume: &Volume{bytesPerCluster: 4096},
 			dataAttr: &Attribute{
 				Header:      AttributeHeader{Flags: AttrFlagCompressed},
-				NonResident: &NonResidentAttribute{},
+				NonResident: &NonResidentAttribute{CompressionUnit: StandardCompressionUnit},
 			},
 		}
 

@@ -47,11 +47,48 @@ var (
 	// ErrInvalidDataRun indicates a data run is malformed.
 	ErrInvalidDataRun = errors.New("invalid or malformed data run")
 
+	// ErrInvalidMFTRuns indicates the $MFT's own $DATA run list does not
+	// describe a region inside the volume: a run reaches past the last cluster,
+	// or the run lengths total more clusters than the volume has.
+	//
+	// The default, tolerant reader caps the record count at volume bytes over
+	// record size and reports this from [Volume.MFTDataRunsError], so a damaged
+	// volume stays readable. Options.Strict refuses to open it instead, with a
+	// [*StrictError] (check "mft-runs", record 0) wrapping this.
+	//
+	// It wraps ErrInvalidDataRun, so a caller already matching that keeps
+	// matching.
+	ErrInvalidMFTRuns = fmt.Errorf("%w: invalid $MFT data runs", ErrInvalidDataRun)
+
 	// ErrCompressedData indicates data is compressed (not yet supported).
 	ErrCompressedData = errors.New("compressed data not supported")
 
+	// ErrInvalidCompressionUnit indicates a compressed non-resident attribute's
+	// compression-unit field is outside the range NTFS can mean. The field is
+	// log2 of the clusters per unit, so a damaged value would otherwise
+	// overflow the shift or size a unit buffer no volume could hold. Under
+	// Options.Strict any value but [StandardCompressionUnit] is refused too,
+	// with a [*StrictError] (check "compression-unit") wrapping this.
+	//
+	// It wraps ErrCompressedData, so a caller already matching that keeps
+	// matching; match this one to tell a field libntfs refuses apart from a
+	// stream it cannot decode.
+	ErrInvalidCompressionUnit = fmt.Errorf("%w: invalid compression unit", ErrCompressedData)
+
 	// ErrEncryptedData indicates data is encrypted (not yet supported).
 	ErrEncryptedData = errors.New("encrypted data not supported")
+
+	// ErrWOFCompressed indicates a file compacted by the Windows Overlay
+	// Filter, which Windows calls CompactOS, whose content libntfs cannot
+	// produce from this volume.
+	//
+	// The unnamed $DATA stream of such a file is sparse and holds nothing; the
+	// content is compressed in the WofCompressedData named stream, which
+	// [File.OpenStream] still reaches. Reading the unnamed stream returns this
+	// rather than the zeros that stream really contains, and
+	// [File.ReadSupport] reports Readable false with this as its
+	// BlockingError.
+	ErrWOFCompressed = errors.New("WOF-compressed content is not in the unnamed $DATA stream")
 
 	// ErrSparseData indicates data is sparse.
 	ErrSparseData = errors.New("sparse data encountered")

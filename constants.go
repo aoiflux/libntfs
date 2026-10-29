@@ -69,8 +69,31 @@ const (
 	MaxPathLength         = 32767   // Maximum path length
 
 	// Compression constants
-	CompressionUnitSize      = 16    // Clusters per compression unit
-	MaxCompressionBufferSize = 65536 // Maximum compression buffer size
+
+	// StandardCompressionUnit is the compression-unit field Windows and ntfs-3g
+	// write into a compressed non-resident attribute header. The field is log2
+	// of the clusters per unit, so 4 means 1<<4 = CompressionUnitSize clusters.
+	// The Linux driver refuses any other value on a compressed attribute, and
+	// Options.Strict does the same.
+	StandardCompressionUnit = 4
+
+	// CompressionUnitSize is the clusters per compression unit NTFS uses, which
+	// is 64 KiB at the usual 4 KiB cluster.
+	CompressionUnitSize = 1 << StandardCompressionUnit
+
+	// MaxCompressionBufferSize is the byte size of that unit at a 4 KiB
+	// cluster, the only combination Windows writes.
+	MaxCompressionBufferSize = CompressionUnitSize * 4096
+
+	// maxCompressionUnitShift bounds the compression-unit field before it is
+	// shifted, so a damaged value can neither overflow the shift nor stand for
+	// a cluster count no volume could hold.
+	maxCompressionUnitShift = 16
+
+	// maxCompressionUnitBytes bounds the unit buffer a compression unit sizes.
+	// NTFS itself never exceeds 64 KiB; the margin leaves room for a large
+	// cluster without letting a damaged field drive the allocation.
+	maxCompressionUnitBytes = 1 << 20
 )
 
 // AttributeTypeNames maps attribute type codes to human-readable names.

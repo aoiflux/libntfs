@@ -26,6 +26,8 @@ Implemented:
 - Directory index parsing ($INDEX_ROOT and $INDEX_ALLOCATION), honouring
   $BITMAP:$I30
 - Index B-tree access for $I30 and view indexes, with $UpCase collation
+- LZNT1-compressed stream decoding
+- $MFT run list checked against the volume; record count capped when damaged
 - Opt-in strict mode (Options.Strict) and $Reparse:$R verification
 - Pure codecs: fixups, runlists, FILETIME, reparse buffers, $UpCase
 - Clusters from 512 bytes to 2 MiB
@@ -35,7 +37,8 @@ Implemented:
 
 Current limitations:
 
-- Compressed data: detected but not decoded (ErrCompressedData)
+- WOF-compacted (CompactOS) content: detected but not decoded
+  (ErrWOFCompressed)
 - Encrypted data: detected but not decoded (ErrEncryptedData)
 
 ## Architecture Snapshot
@@ -56,6 +59,8 @@ The implementation is organized in layers:
 - Index B-tree access: index.go
 - $UpCase table and collation: upcase.go
 - Reparse point parsing and encoding: reparse.go
+- LZNT1 decompression: compression.go
+- WOF (CompactOS) detection: wof.go
 - Strict-mode checks: strict.go
 - Error model: errors.go
 
@@ -128,9 +133,7 @@ libntfs/
 
 Potential future directions:
 
-- Compression decoding support
 - Encryption-related metadata support
-- Alternate data stream (ADS) enumeration
 - Security descriptor parsing improvements
 - Additional NTFS metadata stream support
 
