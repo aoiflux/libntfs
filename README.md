@@ -146,7 +146,13 @@ Implemented:
 - Capability introspection, separating what NTFS cannot record from what this
   volume happens not to have
 - NTFS boot sector parsing and validation, for clusters from 512 bytes to 2 MiB
-- MFT parsing with cache-backed entry lookup
+- MFT parsing with cache-backed entry lookup, and a `$MFT` run list checked
+  against the volume so a damaged one cannot report more records than the disk
+  holds
+- LZNT1-compressed stream decoding, with the compression unit read as the log2
+  shift NTFS stores
+- Windows Overlay Filter (CompactOS) detection: the unnamed stream of a
+  compacted file is reported unreadable rather than read as zeros
 - Path reconstruction from an MFT record, including for deleted and orphaned
   entries, and a whole-volume walk that carries paths and parent references
 - Resident and non-resident attribute parsing
@@ -186,6 +192,9 @@ Implemented:
 Current limitations:
 
 - Encrypted file data: detection only (returns ErrEncryptedData)
+- WOF-compacted file content: detection only. Reading the unnamed stream returns
+  ErrWOFCompressed; the compressed bytes are readable through the
+  WofCompressedData stream, but not decoded
 - $LogFile is read, not replayed: records are decoded and handed over, but
   reconstructing file content from redo data, undoing to a consistent state, and
   replaying transactions are out of scope
@@ -225,6 +234,7 @@ MFT-level:
 - ParseMFTRecordInto(entry *MFTEntry, buf []byte, entryNum uint64, recordSize uint32) error
 - (*Volume).GetMFTEntry(entryNum uint64) (*MFTEntry, error)
 - (*Volume).MFTEntryCount() (uint64, error)
+- (*Volume).MFTDataRunsError() error
 - (*Volume).EachMFTEntry(fn func(entryNum uint64, e *MFTEntry) error) error
 - (*Volume).EachMFTEntryContext(ctx context.Context, fn func(entryNum uint64, e *MFTEntry) error) error
 - (*MFTEntry).FileNames() ([]*FileName, error)
@@ -309,6 +319,7 @@ Metadata-level:
 - ParseReparsePoint(buf []byte) (*ReparsePoint, error)
 - (*File).ReparsePoint() (*ReparsePoint, error)
 - (*ReparsePoint).Target() (substituteName, printName string, ok bool)
+- ParseWOFExternalInfo(data []byte) (WOFInfo, error)
 - ParseLinuxAttributes(buf []byte) (*LinuxAttributes, error)
 - (*File).LinuxAttributes() (*LinuxAttributes, error)
 - ParseLinuxExtendedAttributes(buf []byte) ([]LinuxExtendedAttribute, error)
@@ -423,14 +434,23 @@ index and the INDX block VCN, and matching `ErrStrictViolation`:
   directory by default but fails this check.
 - `(*Volume).Open` checks that every non-resident `$DATA`'s runs cover exactly its
   allocated size, with the real size inside it.
+- `OpenWithOptions` checks that the `$MFT`'s own run list lies inside the volume
+  (check `mft-runs`). By default the record count is capped instead and
+  `(*Volume).MFTDataRunsError` reports it.
+- Reading a compressed stream requires compression unit 4
+  (`StandardCompressionUnit`), as the Linux driver does (check
+  `compression-unit`). `ReadSupport` and `Streams` report the same verdict.
 
 `(*Volume).VerifyReparseIndex` runs the same checks over `$Extend\$Reparse:$R`
 and compares its keys with every reparse point on the volume, whatever `Strict`
 says.
 
 Use `ReadSupport` to check whether the primary `$DATA` stream is readable, and
-whether it is resident, sparse, compressed, or encrypted, before calling `Read`,
-`ReadAt`, or `ReadAll`.
+whether it is resident, sparse, compressed, encrypted, or WOF-compacted, before
+calling `Read`, `ReadAt`, or `ReadAll`. `Readable` is false, with the error a
+read would return in `BlockingError`, for an encrypted stream, a compressed one
+whose compression unit cannot be decoded, and the unnamed stream of a
+WOF-compacted file.
 
 `WriteAt` needs a volume opened writable and overwrites both non-resident and
 resident streams in place. A non-resident stream is written to its clusters; a
@@ -1116,7 +1136,7 @@ go test -run '^$' -fuzz FuzzParseReparsePoint -fuzztime 60s
 go test -run '^$' -fuzz FuzzParseDataRuns -fuzztime 60s
 ```
 
-Twenty-one targets cover every parser fed image bytes; `go test -list 'Fuzz.*' .`
+Twenty-seven targets cover every parser fed image bytes; `go test -list 'Fuzz.*' .`
 lists them. CI runs a 20-second smoke pass of each on every change and ten
 minutes per target nightly, carrying the generated corpus between runs.
 

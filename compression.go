@@ -192,6 +192,72 @@ func ntfsDecompressCompressionUnit(compData []byte, unitSize int) ([]byte, error
 	return out, nil
 }
 
+// compressionUnitBytes returns the byte size of a compression unit of attr on
+// this volume, or an error wrapping ErrInvalidCompressionUnit when the field is
+// outside the range NTFS can mean.
+//
+// The compression-unit field is log2 of the clusters per unit, not the count:
+// Windows writes 4, meaning 1<<4 = 16 clusters, which is 64 KiB at the usual
+// 4 KiB cluster. The shift is bounded before it is taken, so a damaged field
+// can neither overflow it nor size a unit buffer no volume could hold.
+func (v *Volume) compressionUnitBytes(attr *NonResidentAttribute) (int64, error) {
+	if cu := attr.CompressionUnit; cu == 0 || cu > maxCompressionUnitShift {
+		return 0, fmt.Errorf("%w: compression unit 2^%d clusters",
+			ErrInvalidCompressionUnit, cu)
+	}
+
+	compUnitClusters := 1 << attr.CompressionUnit
+
+	unitSizeBytes := int64(compUnitClusters) * int64(v.bytesPerCluster)
+	if unitSizeBytes <= 0 || unitSizeBytes > maxCompressionUnitBytes {
+		return 0, fmt.Errorf("%w: unit of %d clusters of %d bytes exceeds %d",
+			ErrInvalidCompressionUnit, compUnitClusters, v.bytesPerCluster,
+			maxCompressionUnitBytes)
+	}
+
+	return unitSizeBytes, nil
+}
+
+// compressionUnitError reports why the compressed stream attr of record
+// entryNum cannot be read on this volume, or nil when it can.
+//
+// The tolerant reader takes any compression unit that sizes a unit it can
+// hold. The Linux driver refuses any value but 4 on a compressed attribute,
+// and Options.Strict does the same, with a [*StrictError]. File.ReadAt,
+// File.ReadSupport and File.Streams all ask this, so they agree.
+func (v *Volume) compressionUnitError(entryNum uint64, attr *NonResidentAttribute) error {
+	if _, err := v.compressionUnitBytes(attr); err != nil {
+		return err
+	}
+
+	if v.strict && attr.CompressionUnit != StandardCompressionUnit {
+		return &StrictError{
+			Record: entryNum, VCN: -1, Check: "compression-unit",
+			Err: fmt.Errorf("%w: compression unit %d, want %d",
+				ErrInvalidCompressionUnit, attr.CompressionUnit, StandardCompressionUnit),
+		}
+	}
+
+	return nil
+}
+
+// applyCompressionSupport marks a compressed stream unreadable when
+// compressionUnitError refuses it. A stream already unreadable for another
+// reason, such as encryption, keeps that reason.
+func (v *Volume) applyCompressionSupport(support *FileReadSupport, entryNum uint64, attr *Attribute) {
+	if !support.Readable || attr == nil || attr.NonResident == nil || !attr.IsCompressed() {
+		return
+	}
+
+	if err := v.compressionUnitError(entryNum, attr.NonResident); err != nil {
+		support.Readable = false
+		support.BlockingError = err
+	}
+}
+
+// readCompressedData decodes len(out) bytes of the compressed stream attr from
+// offset. It checks the compression unit's range itself; the strict check is
+// compressionUnitError's, which File.ReadAt applies before calling this.
 func (v *Volume) readCompressedData(attr *NonResidentAttribute, offset int64, out []byte) (int, error) {
 	if len(out) == 0 {
 		return 0, nil
@@ -201,15 +267,11 @@ func (v *Volume) readCompressedData(attr *NonResidentAttribute, offset int64, ou
 		return 0, fmt.Errorf("missing non-resident attribute")
 	}
 
-	compUnitClusters := int(attr.CompressionUnit)
-	if compUnitClusters <= 0 {
-		return 0, ErrCompressedData
+	unitSizeBytes, err := v.compressionUnitBytes(attr)
+	if err != nil {
+		return 0, err
 	}
-
-	unitSizeBytes := int64(compUnitClusters) * int64(v.bytesPerCluster)
-	if unitSizeBytes <= 0 {
-		return 0, fmt.Errorf("invalid compression unit byte size")
-	}
+	compUnitClusters := 1 << attr.CompressionUnit
 
 	startUnit := offset / unitSizeBytes
 	endUnit := (offset + int64(len(out)) - 1) / unitSizeBytes

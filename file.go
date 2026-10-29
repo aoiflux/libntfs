@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"path"
 	"strings"
 	"sync"
@@ -20,8 +22,16 @@ type File struct {
 	isDir    bool
 	size     uint64
 	dataAttr *Attribute // Primary $DATA attribute
-	readMu   sync.Mutex
-	readPos  int64
+
+	// wof records a Windows Overlay Filter reparse point on this entry, and is
+	// nil for every file that has none. It is resolved where the File is built
+	// rather than per read, and it is set only on a handle that reads the
+	// unnamed stream: the WofCompressedData stream holds the compressed bytes
+	// and has to stay readable. See wof.go.
+	wof *wofState
+
+	readMu  sync.Mutex
+	readPos int64
 }
 
 // FileReadSupport summarizes whether and how this file's primary $DATA stream can be read.
@@ -30,12 +40,19 @@ type File struct {
 // from the JSON form, where an error marshals to nothing useful; the boolean
 // flags alongside it say which condition applies.
 type FileReadSupport struct {
-	HasData       bool  `json:"has_data"`
-	Resident      bool  `json:"resident"`
-	NonResident   bool  `json:"non_resident"`
-	Sparse        bool  `json:"sparse"`
-	Compressed    bool  `json:"compressed"`
-	Encrypted     bool  `json:"encrypted"`
+	HasData     bool `json:"has_data"`
+	Resident    bool `json:"resident"`
+	NonResident bool `json:"non_resident"`
+	Sparse      bool `json:"sparse"`
+	Compressed  bool `json:"compressed"`
+	Encrypted   bool `json:"encrypted"`
+
+	// WOFCompressed marks the unnamed $DATA stream of a file compacted by the
+	// Windows Overlay Filter. That stream is sparse and holds nothing: the
+	// content is compressed in the WofCompressedData stream, so the stream this
+	// describes is not the file's content and reading it would yield zeros.
+	WOFCompressed bool `json:"wof_compressed"`
+
 	Readable      bool  `json:"readable"`
 	BlockingError error `json:"-"`
 }
@@ -257,17 +274,61 @@ func mftParentLookupSequences(dirEntry *MFTEntry) []uint16 {
 	return seqs
 }
 
+// maxMFTEntries returns how many MFT records are addressable on this volume.
+//
+// The figure comes off disk, from the $MFT's own $DATA run list, so it is
+// bounded two ways. The arithmetic is checked, because a run length is an
+// unbounded uint64 and the product with the cluster size can wrap — to zero in
+// the worst case, which would hide the whole table rather than inflate it. And
+// the result is capped at the records the volume could physically hold, because
+// the $MFT cannot be larger than the disk it sits on, and every walk and every
+// caller allocation is sized by this.
 func (v *Volume) maxMFTEntries() uint64 {
 	if v.mftRecordSize == 0 {
 		return 0
 	}
 
-	var totalMFTBytes uint64
-	for _, run := range v.mftDataRuns {
-		totalMFTBytes += run.LengthClusters * uint64(v.bytesPerCluster)
+	// Open always records a volume size. A Volume assembled by other means may
+	// not have one, and then there is nothing to bound the run list against, so
+	// the checked arithmetic is the only limit.
+	ceiling := uint64(math.MaxUint64)
+	if v.volumeSize != 0 {
+		ceiling = v.volumeSize / uint64(v.mftRecordSize)
 	}
 
-	return totalMFTBytes / uint64(v.mftRecordSize)
+	var (
+		totalMFTBytes uint64
+		overflow      bool
+	)
+	for _, run := range v.mftDataRuns {
+		hi, runBytes := bits.Mul64(run.LengthClusters, uint64(v.bytesPerCluster))
+		if hi != 0 {
+			overflow = true
+			break
+		}
+
+		sum, carry := bits.Add64(totalMFTBytes, runBytes, 0)
+		if carry != 0 {
+			overflow = true
+			break
+		}
+		totalMFTBytes = sum
+	}
+
+	// A run list whose arithmetic overflows says nothing trustworthy about how
+	// large the table is, so the volume's own ceiling stands in rather than the
+	// wrapped figure — which would otherwise come out as zero and hide the whole
+	// table. With no volume size, the bytes counted before the overflow are the
+	// only bound left.
+	if overflow && v.volumeSize != 0 {
+		return ceiling
+	}
+
+	if entries := totalMFTBytes / uint64(v.mftRecordSize); entries < ceiling {
+		return entries
+	}
+
+	return ceiling
 }
 
 func (v *Volume) ensureMFTParentMap() {
@@ -394,6 +455,7 @@ func (v *Volume) Open(entryNum uint64) (*File, error) {
 		name:     fn.Name,
 		isDir:    entry.IsDirectory(),
 		dataAttr: dataAttr,
+		wof:      wofStateForStream(v.resolveWOF(entry), dataAttr),
 	}
 
 	// Get size from $DATA attribute or $FILE_NAME
@@ -565,6 +627,13 @@ func (f *File) IsSparse() bool {
 }
 
 // ReadSupport reports whether the primary $DATA stream is readable by libntfs.
+//
+// The attribute's own verdict covers what the attribute can say for itself:
+// whether it is resident, sparse, compressed or encrypted. Two verdicts need
+// the volume and are decided here instead: a compression unit this volume
+// cannot decode (or, under Options.Strict, one other than
+// StandardCompressionUnit), and Windows Overlay Filter compression, which is
+// recorded in a reparse point rather than on the $DATA attribute.
 func (f *File) ReadSupport() FileReadSupport {
 	support := FileReadSupport{
 		HasData:  f.dataAttr != nil,
@@ -580,7 +649,11 @@ func (f *File) ReadSupport() FileReadSupport {
 		return support
 	}
 
-	return f.dataAttr.ReadSupport()
+	support = f.dataAttr.ReadSupport()
+	f.volume.applyCompressionSupport(&support, f.entryNum, f.dataAttr)
+	applyWOFSupport(&support, f.wof)
+
+	return support
 }
 
 // Read reads up to len(p) bytes from the file.
@@ -616,6 +689,14 @@ func (f *File) ReadAt(p []byte, offset int64) (int, error) {
 		return 0, io.EOF
 	}
 
+	// A WOF-compacted file's unnamed $DATA is sparse and holds nothing, so
+	// every branch below would read zeros and report them as content. This is
+	// checked before them all, and ahead of the resident branch too, since a
+	// compacted file can carry a resident stub.
+	if err := f.wof.blockingError(); err != nil {
+		return 0, err
+	}
+
 	// Handle resident data
 	if f.dataAttr.Resident != nil {
 		data := f.dataAttr.Resident.Value
@@ -647,6 +728,9 @@ func (f *File) ReadAt(p []byte, offset int64) (int, error) {
 		}
 
 		if f.dataAttr.IsCompressed() {
+			if err := f.volume.compressionUnitError(f.entryNum, f.dataAttr.NonResident); err != nil {
+				return 0, err
+			}
 			n, err := f.volume.readCompressedData(f.dataAttr.NonResident, offset, p[:bytesToRead])
 			if err != nil {
 				return n, err

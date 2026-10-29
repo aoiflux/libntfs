@@ -706,3 +706,117 @@ func FuzzParseBootSector(f *testing.F) {
 		}
 	})
 }
+
+// FuzzMFTEntryCount fuzzes the $MFT's own $DATA run list, which is where the
+// record count comes from and so what sizes every MFT walk and every caller
+// allocation made from the count. One flipped byte there used to report an MFT
+// far larger than the disk, or — once the arithmetic wrapped — none at all.
+//
+// The invariant is the one the fix establishes: whatever the run list says, the
+// count never exceeds the records the volume could physically hold, and the
+// walk over it terminates.
+func FuzzMFTEntryCount(f *testing.F) {
+	f.Add(EncodeRunlist(soundMFTRuns()))
+	f.Add(EncodeRunlist([]DataRun{{StartCluster: 4, LengthClusters: 1 << 40}}))
+	f.Add(EncodeRunlist([]DataRun{{StartCluster: 4, LengthClusters: 1 << 62}}))
+	f.Add(EncodeRunlist([]DataRun{{StartCluster: 1 << 30, LengthClusters: 1}}))
+	f.Add([]byte{0x00})
+	f.Add([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+
+	f.Fuzz(func(t *testing.T, runlist []byte) {
+		runs, err := DecodeRunlist(runlist)
+		if err != nil || len(runs) == 0 {
+			return
+		}
+
+		// The forged $DATA has to fit in a 1024-byte MFT record beside the
+		// $STANDARD_INFORMATION and $FILE_NAME the fixture builds. A longer run
+		// list is a limit of the fixture, not of the bound under test.
+		if len(runlist) > 128 {
+			return
+		}
+
+		vol, err := Open(&mockReaderAt{data: buildForgedMFTImage(t, runs)})
+		if err != nil {
+			return
+		}
+		defer vol.Close()
+
+		count, err := vol.MFTEntryCount()
+		if err != nil {
+			return
+		}
+
+		ceiling := vol.VolumeSize() / uint64(vol.MFTRecordSize())
+		if count > ceiling {
+			t.Fatalf("run list %x reports %d records, past the %d the %d byte volume holds",
+				runlist, count, ceiling, vol.VolumeSize())
+		}
+
+		// A count inside the ceiling is small enough to walk, so the walk is
+		// part of the invariant rather than a separate target.
+		if err := vol.EachMFTEntry(func(uint64, *MFTEntry) error { return nil }); err != nil {
+			t.Fatalf("walking %d records failed: %v", count, err)
+		}
+	})
+}
+
+// FuzzReadCompressedData fuzzes an LZNT1 compression unit together with the
+// field that sizes it. The compression-unit field is log2 of the clusters per
+// unit, so a damaged value either overflows the shift or asks for a unit buffer
+// no volume could hold; the cluster bytes behind it are an arbitrary LZNT1
+// stream.
+//
+// The invariant is that a read terminates, does not panic, and never reports
+// more bytes than the caller asked for.
+func FuzzReadCompressedData(f *testing.F) {
+	const clusterSize = 512
+
+	seed := func(compressionUnit uint16, plain []byte) {
+		f.Add(compressionUnit, uint16(clusterSize), lznt1Compress(plain), int64(0), uint16(len(plain)))
+	}
+	seed(4, repeating(8192))
+	seed(4, incompressible(8192))
+	seed(1, repeating(1024))
+	seed(0, repeating(512))
+	seed(17, repeating(512))
+	f.Add(uint16(4), uint16(clusterSize), []byte{0x00, 0x00}, int64(0), uint16(64))
+	f.Add(uint16(4), uint16(clusterSize), []byte{0xFF, 0xBF}, int64(1), uint16(8192))
+
+	f.Fuzz(func(t *testing.T, compressionUnit, clusterBytes uint16, compressed []byte, offset int64, want uint16) {
+		// Keep the geometry to shapes a volume could have; the point of the
+		// target is the compression unit and the stream, not the boot sector.
+		if clusterBytes < 256 || clusterBytes > 4096 || clusterBytes&(clusterBytes-1) != 0 {
+			return
+		}
+		if offset < 0 || len(compressed) > 1<<20 {
+			return
+		}
+
+		clusters := (len(compressed) + int(clusterBytes) - 1) / int(clusterBytes)
+		disk := make([]byte, (clusters+2)*int(clusterBytes))
+		copy(disk[int(clusterBytes):], compressed)
+
+		vol := &Volume{
+			reader:          &mockReaderAt{data: disk},
+			bytesPerCluster: uint32(clusterBytes),
+			clusterCount:    uint64(len(disk)) / uint64(clusterBytes),
+		}
+
+		runs := []DataRun{{StartCluster: 1, LengthClusters: uint64(clusters)}}
+		if sparse := (1 << (compressionUnit % 17)) - clusters; sparse > 0 {
+			runs = append(runs, DataRun{LengthClusters: uint64(sparse), IsSparse: true})
+		}
+
+		out := make([]byte, want)
+		n, err := vol.readCompressedData(&NonResidentAttribute{
+			CompressionUnit: compressionUnit,
+			DataRuns:        runs,
+			RealSize:        uint64(want),
+		}, offset, out)
+
+		if n < 0 || n > len(out) {
+			t.Fatalf("read reported %d bytes into a %d byte buffer (err %v)", n, len(out), err)
+		}
+	})
+}

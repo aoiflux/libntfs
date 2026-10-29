@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/bits"
 	"sync"
 	"sync/atomic"
 )
@@ -28,6 +29,13 @@ type Volume struct {
 	// MFT information
 	mftDataRuns    []DataRun
 	mftDataRunEnds []uint64 // cumulative byte ends for mftDataRuns
+
+	// mftRunsErr records that the $MFT's own $DATA run list does not describe a
+	// region inside this volume. It is set once during Open, like readOnly and
+	// strict, and read without a lock. The record count is capped when it is
+	// set, so a damaged volume stays readable; MFTDataRunsError is how a caller
+	// learns the count was capped.
+	mftRunsErr error
 
 	// Caching and synchronization
 	mu         sync.RWMutex         // Protects the entire volume
@@ -158,6 +166,13 @@ type Options struct {
 	//     agree.
 	//   - [Volume.Open] checks that the runs of every non-resident $DATA cover
 	//     exactly its allocated size, and that its real size fits inside it.
+	//   - [OpenWithOptions] checks that the $MFT's own run list lies inside the
+	//     volume (check "mft-runs"), where the tolerant reader caps the record
+	//     count and reports [Volume.MFTDataRunsError].
+	//   - Reading a compressed stream, and [File.ReadSupport] and
+	//     [File.Streams] describing one, require the compression unit
+	//     [StandardCompressionUnit] (check "compression-unit"), as the Linux
+	//     driver does.
 	//
 	// [Volume.VerifyReparseIndex] applies the same checks to $Reparse:$R
 	// whatever this setting.
@@ -456,7 +471,17 @@ func (v *Volume) parseBootSector() error {
 	v.sectorsPerCluster = sectorsPerCluster
 	v.bytesPerCluster = uint32(bytesPerCluster)
 	v.mftCluster = bs.MFTCluster
-	v.volumeSize = bs.TotalSectors * uint64(bs.BytesPerSector)
+
+	// Total sectors comes off disk unbounded, and the volume size is what every
+	// later bound divides by — the MFT record ceiling included. A product that
+	// wraps would make the volume look tiny, or zero, so it is taken in 128 bits
+	// and refused rather than wrapped.
+	hi, volumeSize := bits.Mul64(bs.TotalSectors, uint64(bs.BytesPerSector))
+	if hi != 0 {
+		return fmt.Errorf("%w: %d sectors of %d bytes overflows a 64-bit volume size",
+			ErrInvalidBootSector, bs.TotalSectors, bs.BytesPerSector)
+	}
+	v.volumeSize = volumeSize
 	v.clusterCount = v.volumeSize / uint64(v.bytesPerCluster)
 
 	// Calculate MFT record size
@@ -551,6 +576,62 @@ func (v *Volume) initializeMFT() error {
 	// Store the data runs for future MFT entry lookups
 	v.mftDataRuns = dataAttr.NonResident.DataRuns
 	v.rebuildMFTRunIndex()
+
+	// The run list is what sizes every MFT walk, so check it against the volume
+	// before anything trusts it. A volume that fails stays open and readable
+	// with a capped record count, since reading damaged volumes is the point;
+	// strict mode refuses it instead.
+	v.mftRunsErr = v.validateMFTRuns(v.mftDataRuns)
+	if v.strict && v.mftRunsErr != nil {
+		return &StrictError{Record: MFTEntryMFT, VCN: -1, Check: "mft-runs", Err: v.mftRunsErr}
+	}
+
+	return nil
+}
+
+// validateMFTRuns checks the $MFT's own $DATA run list against the volume: no
+// run may reach past the last cluster, and the lengths may not total more
+// clusters than the volume has.
+//
+// One flipped byte in a run-list length or offset is enough to fail this, and
+// the consequence of not checking is an MFT record count far beyond the disk,
+// which a caller sizes an allocation by and a walk iterates.
+func (v *Volume) validateMFTRuns(runs []DataRun) error {
+	if v.clusterCount == 0 {
+		return fmt.Errorf("%w: volume reports no clusters", ErrInvalidMFTRuns)
+	}
+
+	var clusters uint64
+	for i, run := range runs {
+		sum, carry := bits.Add64(clusters, run.LengthClusters, 0)
+		if carry != 0 {
+			return fmt.Errorf("%w: run lengths overflow a 64-bit cluster count",
+				ErrInvalidMFTRuns)
+		}
+		clusters = sum
+
+		// A sparse run occupies no clusters, so it has no LCN to bound. NTFS
+		// does not store the $MFT sparse, but a damaged run list can say so.
+		if run.IsSparse {
+			continue
+		}
+
+		if run.StartCluster < 0 {
+			return fmt.Errorf("%w: run %d starts at cluster %d",
+				ErrInvalidMFTRuns, i, run.StartCluster)
+		}
+
+		end, carry := bits.Add64(uint64(run.StartCluster), run.LengthClusters, 0)
+		if carry != 0 || end > v.clusterCount {
+			return fmt.Errorf("%w: run %d covers clusters %d to %d, past the %d the volume holds",
+				ErrInvalidMFTRuns, i, run.StartCluster, end, v.clusterCount)
+		}
+	}
+
+	if clusters > v.clusterCount {
+		return fmt.Errorf("%w: runs total %d clusters, more than the %d the volume holds",
+			ErrInvalidMFTRuns, clusters, v.clusterCount)
+	}
 
 	return nil
 }

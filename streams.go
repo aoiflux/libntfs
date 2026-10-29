@@ -34,12 +34,18 @@ func (e *MFTEntry) DataStreams() []*Attribute {
 
 // Streams lists the file's $DATA streams, unnamed first when present.
 func (f *File) Streams() []StreamInfo {
-	return streamsFromEntry(f.entry)
+	return f.volume.streamsFromEntry(f.entryNum, f.entry, f.volume.resolveWOF(f.entry))
 }
 
 // streamsFromEntry describes an entry's $DATA streams without needing a File,
 // so a report over the whole MFT can list streams without opening every record.
-func streamsFromEntry(e *MFTEntry) []StreamInfo {
+//
+// wof is the entry's Windows Overlay Filter reparse point, or nil when it has
+// none. It is passed in rather than resolved here so that this and
+// [File.ReadSupport] cannot disagree about whether a stream holds content: the
+// unnamed stream of a compacted file is listed unreadable in both. A
+// compressed stream is judged by the same compressionUnitError as a read.
+func (v *Volume) streamsFromEntry(entryNum uint64, e *MFTEntry, wof *wofState) []StreamInfo {
 	if e == nil {
 		return nil
 	}
@@ -53,6 +59,8 @@ func streamsFromEntry(e *MFTEntry) []StreamInfo {
 			Resident: attr.Resident != nil,
 			Support:  attr.ReadSupport(),
 		}
+		v.applyCompressionSupport(&info.Support, entryNum, attr)
+		applyWOFSupport(&info.Support, wofStateForStream(wof, attr))
 
 		if attr.Resident != nil {
 			info.Size = uint64(len(attr.Resident.Value))
@@ -98,6 +106,9 @@ func (f *File) OpenStream(name string) (*File, error) {
 			isDir:    f.isDir,
 			size:     f.size,
 			dataAttr: f.dataAttr,
+			// The unnamed stream is the content stream, so a WOF reparse point
+			// applies to this handle exactly as it does to the file.
+			wof: f.wof,
 		}, nil
 	}
 
@@ -116,6 +127,9 @@ func (f *File) OpenStream(name string) (*File, error) {
 		// directory, so it must not inherit the directory's read block.
 		isDir:    false,
 		dataAttr: attr,
+		// wof is deliberately left nil. A named stream is not what WOF
+		// redirects: WofCompressedData holds the compressed bytes, and a caller
+		// decoding them itself has to be able to read it.
 	}
 
 	if attr.Resident != nil {

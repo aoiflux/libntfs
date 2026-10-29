@@ -2,6 +2,78 @@
 
 All notable changes to libntfs are recorded here. Versions follow the git tags.
 
+## v0.3.6
+
+Compressed streams decode at the right unit size, WOF-compacted files stop
+reading as zeros, and a damaged `$MFT` run list can no longer report more
+records than the disk holds.
+
+### Fixed
+
+- Compressed streams were decoded with the wrong unit size. The
+  compression-unit field in a non-resident attribute header is log2 of the
+  clusters per unit (Windows writes 4, meaning 16 clusters), but it was read
+  as the count itself, so each unit was decoded at a quarter of its size and
+  the run list was split at the wrong cluster. The field is now read as a
+  shift, bounded first: 0 or above 16, or a unit larger than 1 MiB, fails with
+  the new `ErrInvalidCompressionUnit`, which wraps `ErrCompressedData`.
+- A file compacted by the Windows Overlay Filter (CompactOS,
+  `compact /exe:`) read as zeros of its full size with no error, because its
+  unnamed `$DATA` stream is sparse and the content sits compressed in the
+  `WofCompressedData` stream (NTFS-U1). Reading the unnamed stream now fails
+  with the new `ErrWOFCompressed`, naming the algorithm. `ReadSupport` and
+  `Streams` report it unreadable with the new `WOFCompressed` flag, and
+  `WofCompressedData` stays readable through `OpenStream`.
+- A damaged `$MFT` run list could make `MFTEntryCount` report far more
+  records than the volume holds, or wrap to a small count and hide the table.
+  The arithmetic is now checked, and the count is capped at volume bytes over
+  record size. The run list is checked against the volume during `Open`; when
+  it fails, the volume still opens, and the new `(*Volume).MFTDataRunsError`
+  returns an error matching the new `ErrInvalidMFTRuns`. The cumulative run
+  index that every MFT lookup uses saturates rather than wraps.
+- A boot sector whose total sectors times bytes per sector overflows 64 bits
+  is rejected with `ErrInvalidBootSector` instead of wrapping to a tiny
+  volume size.
+
+### Changed
+
+- `Options.Strict` adds two checks, both failing with a `*StrictError` like
+  every other strict check: `mft-runs`, where `Open` refuses a volume whose
+  `$MFT` run list lies outside it, and `compression-unit`, where reading a
+  compressed stream refuses any compression unit but 4, as the Linux driver
+  does.
+- `ReadSupport` and `Streams` now report a compressed stream unreadable when
+  `ReadAt` would refuse its compression unit, with that error as
+  `BlockingError`. They used to call it readable.
+- The `Streams` entries of an `NTFSReport` carry `wof_compressed`. Adding a
+  field leaves `ReportSchemaVersion` at 1.
+
+### Added
+
+- `ParseWOFExternalInfo`, `WOFInfo`, `WOFAlgorithm` (with `String` and
+  `ChunkSize`), and the constants `WOFCompressedDataStream`,
+  `WOFCurrentVersion`, `WOFProviderWIM`, `WOFProviderFile`,
+  `WOFFileProviderCurrentVersion`, `WOFXpress4K`, `WOFLZX`, `WOFXpress8K` and
+  `WOFXpress16K`.
+- `FileReadSupport.WOFCompressed`.
+- `(*Volume).MFTDataRunsError`, `ErrInvalidMFTRuns` (wraps
+  `ErrInvalidDataRun`), `ErrInvalidCompressionUnit` and `ErrWOFCompressed`.
+- `StandardCompressionUnit` (4). `CompressionUnitSize` and
+  `MaxCompressionBufferSize` keep their values (16 and 65536) and are now
+  derived from it.
+
+### Tests
+
+- Compression-unit decoding over a full and a short final unit, out-of-range
+  units, the strict check, and agreement between `ReadAt`, `ReadSupport` and
+  `Streams`.
+- WOF detection, the read error, listing, the readable `WofCompressedData`
+  stream, damaged reparse data, and unaffected symlinks and plain files.
+- `$MFT` run-list bounds: the capped and overflowing counts, walks over a
+  forged run list, `MFTDataRunsError`, strict refusal, the saturating run
+  index, and the wrapping volume size.
+- Fuzz targets `FuzzMFTEntryCount` and `FuzzReadCompressedData`.
+
 ## v0.3.5
 
 Follow-up fixes to v0.3.4.
